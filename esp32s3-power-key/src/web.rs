@@ -124,10 +124,46 @@ fn hex_val(c: u8) -> Option<u8> {
 }
 
 /// 处理 /save：解出 ssid / 密码 → 写 flash → 通知 wifi_task 去连
-async fn handle_save(path: &[u8]) -> bool {
+/// 解析 /save-blinker?dev=..&iot=..&token=..，写进 flash。
+async fn handle_save_blinker(path: &[u8]) -> bool {
     let query = match find_seq(path, b"?") {
         Some(i) => &path[i + 1..],
         None => return false,
+    };
+
+    let mut raw = [0u8; 128];
+    let mut c = store::BlinkerCreds::new();
+
+    for (key, slot) in [(b"dev".as_slice(), 0u8), (b"iot".as_slice(), 1), (b"token".as_slice(), 2)] {
+        let v = query_value(query, key).unwrap_or(b"");
+        let n = urldecode(v, &mut raw);
+        let s = match str::from_utf8(&raw[..n]) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let ok = match slot {
+            0 => c.device.push_str(s).is_ok(),
+            1 => c.iot_id.push_str(s).is_ok(),
+            _ => c.token.push_str(s).is_ok(),
+        };
+        if !ok {
+            return false;
+        }
+    }
+
+    if !c.is_set() {
+        return false;
+    }
+    log::info!("[web] 保存 Blinker 凭据: {}", c.device);
+    crate::save_blinker_cfg(c).await
+}
+
+/// 解析 /save?ssid=..&pass=..，落盘，然后**只返回**解析出来的凭据。
+/// 通知 wifi_task 的活儿交给调用方，必须在 HTTP 响应发完之后再做。
+async fn handle_save(path: &[u8]) -> Option<store::Creds> {
+    let query = match find_seq(path, b"?") {
+        Some(i) => &path[i + 1..],
+        None => return None,
     };
 
     let mut raw = [0u8; 256];
@@ -138,7 +174,7 @@ async fn handle_save(path: &[u8]) -> bool {
         let n = urldecode(v, &mut raw);
         let s = match str::from_utf8(&raw[..n]) {
             Ok(s) => s,
-            Err(_) => return false,
+            Err(_) => return None,
         };
         let ok = if is_ssid {
             creds.ssid.push_str(s).is_ok()
@@ -146,12 +182,12 @@ async fn handle_save(path: &[u8]) -> bool {
             creds.pass.push_str(s).is_ok()
         };
         if !ok {
-            return false;
+            return None;
         }
     }
 
     if !creds.is_set() {
-        return false;
+        return None;
     }
 
     // flash 在 main 手里，锁一下拿出来用
@@ -167,9 +203,11 @@ async fn handle_save(path: &[u8]) -> bool {
 
     if ok {
         log::info!("[web] 已保存 WiFi: {}", creds.ssid);
-        crate::NEW_CREDS.signal(creds);
+    } else {
+        // 存不住也让这次先连上，至少能用
+        log::warn!("[web] WiFi 没写进 flash，本次仍然尝试连接: {}", creds.ssid);
     }
-    true
+    Some(creds)
 }
 
 /// 处理一条 TCP 连接
@@ -182,17 +220,64 @@ pub async fn serve_once(socket: &mut TcpSocket<'_>) {
     let req = &buf[..n];
     let path = request_path(req);
 
+    // ---- 保存 Blinker 凭据 ----
+    // 必须排在 /save 之前：find_seq 是子串匹配，"/save-blinker" 里也含 "/save"。
+    if find_seq(path, b"/save-blinker").is_some() {
+        let ok = handle_save_blinker(path).await;
+        if ok {
+            let _ = write_html(socket, BLINKER_SAVED).await;
+            // 凭据是任务启动时读的，改完重启一次最省事（也保证 topic 一起换）
+            embassy_time::Timer::after(embassy_time::Duration::from_millis(700)).await;
+            esp_hal::system::software_reset();
+        } else {
+            let _ = write_html(socket, SAVED_FAIL).await;
+        }
+        return;
+    }
+
     // ---- 保存账号密码 ----
+    // 顺序很关键：**先把响应发回去，再通知 wifi_task 去连**。
+    // 反过来的话，射频重配/重连会把这半截 HTTP 掐断，手机页面就一直转圈。
     if find_seq(path, b"/save").is_some() {
-        let ok = handle_save(path).await;
-        let body = if ok { SAVED_OK } else { SAVED_FAIL };
-        let _ = write_html(socket, body).await;
+        match handle_save(path).await {
+            Some(creds) => {
+                let _ = write_html(socket, SAVED_OK).await;
+                // 给协议栈一点时间把数据和 FIN 真正发出去
+                embassy_time::Timer::after(embassy_time::Duration::from_millis(400)).await;
+                crate::NEW_CREDS.signal(creds);
+            }
+            None => {
+                let _ = write_html(socket, SAVED_FAIL).await;
+            }
+        }
         return;
     }
 
     // ---- 状态查询（配网页轮询用）----
     if find_seq(path, b"/status").is_some() {
         let _ = write_status(socket).await;
+        return;
+    }
+
+    // ---- 诊断日志（USB 唤醒排查用）----
+    if find_seq(path, b"/log").is_some() {
+        let _ = write_log(socket).await;
+        return;
+    }
+
+    // ---- 电源控制：唤醒 / 睡眠（热点侧、局域网侧共用）----
+    if find_seq(path, b"/wake").is_some() {
+        log::info!("[web] 收到唤醒请求");
+        // 先把响应发回去，再去拉总线：唤醒后如果主机重新枚举，这条连接会断，
+        // 没发完的话手机上会看到"发送失败"，体验上像没成功。
+        let _ = write_html(socket, WAKE_SENT).await;
+        crate::request_wake().await;
+        return;
+    }
+    if find_seq(path, b"/sleep").is_some() {
+        log::info!("[web] 收到睡眠请求");
+        let _ = write_html(socket, SLEEP_SENT).await;
+        crate::request_sleep().await;
         return;
     }
 
@@ -211,6 +296,16 @@ pub async fn serve_once(socket: &mut TcpSocket<'_>) {
     // ---- 其它一切路径都返回配网页 ----
     let _ = write_html(socket, SETUP_PAGE).await;
 }
+
+const WAKE_SENT: &str = "已发送唤醒指令";
+const SLEEP_SENT: &str = "已发送睡眠指令";
+
+const BLINKER_SAVED: &str = "<!doctype html><meta charset=utf-8>\
+<meta name=viewport content='width=device-width,initial-scale=1'>\
+<title>Blinker 已保存</title><body style='font:16px system-ui;background:#0c1016;color:#e8eef7;padding:24px'>\
+<h2 style='color:#3ad06a'>Blinker 凭据已保存，设备正在重启…</h2>\
+<p>约 8 秒后重新连上热点 <b>ESP32-POWER</b>，再打开 <a href='/' style='color:#40c8e0'>控制页</a> 即可。</p>\
+<p style='color:#889099'>重启后会自动用新凭据连 Blinker，App 里应能看到设备在线。</p>";
 
 const SAVED_OK: &str = "<!doctype html><meta charset=utf-8>\
 <meta name=viewport content='width=device-width,initial-scale=1'>\
@@ -236,7 +331,7 @@ const RESET_OK: &str = "<!doctype html><meta charset=utf-8>\
 
 /// 当前网络状态 JSON，配网页轮询它来判断有没有连上
 async fn write_status(socket: &mut TcpSocket<'_>) -> Result<(), ()> {
-    let mut body: String<160> = String::new();
+    let mut body: String<220> = String::new();
     {
         let info = crate::NET.lock().await;
         let state = match info.state {
@@ -257,9 +352,77 @@ async fn write_status(socket: &mut TcpSocket<'_>) -> Result<(), ()> {
                 let _ = core::fmt::Write::write_fmt(&mut body, format_args!(",\"ip\":\"\""));
             }
         }
-        let _ = core::fmt::Write::write_fmt(&mut body, format_args!("}}"));
+        // 连接失败的原因，页面上直接显示（转义一下引号，别把 JSON 拆坏）
+        let _ = core::fmt::Write::write_fmt(&mut body, format_args!(",\"err\":\""));
+        for ch in info.err.chars() {
+            let c = if ch == '"' { '\'' } else { ch };
+            let _ = core::fmt::Write::write_char(&mut body, c);
+        }
+        let _ = core::fmt::Write::write_fmt(&mut body, format_args!("\""));
+    }
+    // 当前生效的 Blinker 设备名（flash 里存过就是那个，否则是固件内置的）
+    {
+        let b = crate::BLINKER_CFG.lock().await;
+        let _ = core::fmt::Write::write_fmt(&mut body, format_args!(",\"bdev\":\""));
+        if b.is_set() {
+            for ch in b.device.chars() {
+                let c = if ch == '"' { '\'' } else { ch };
+                let _ = core::fmt::Write::write_char(&mut body, c);
+            }
+        } else {
+            let _ = core::fmt::Write::write_fmt(&mut body, format_args!("（固件内置）"));
+        }
+        let _ = core::fmt::Write::write_fmt(&mut body, format_args!("\"}}"));
     }
     write_html(socket, &body).await
+}
+
+/// 把 main.rs 里的诊断环形缓冲以纯文本吐出来。
+///
+/// 注意：必须带 Content-Length。之前这版没写长度、想靠"关连接表示结束"，
+/// 结果手机浏览器一直等 EOF、服务端在等下一个 accept，互相等死，
+/// 整个网页服务都被堵住了。
+async fn write_log(socket: &mut TcpSocket<'_>) -> Result<(), ()> {
+    let g = crate::LOGS.lock().await;
+    let (start, count) = g.order();
+
+    // 先算正文长度（每行后面补一个 '\n'）
+    let mut total = 0usize;
+    for i in 0..count {
+        let n = g.len[(start + i) % crate::LOG_LINES] as usize;
+        if n > 0 {
+            total += n + 1;
+        }
+    }
+
+    let mut head = [0u8; 160];
+    let hdr = {
+        let mut w = Cursor {
+            buf: &mut head,
+            pos: 0,
+        };
+        w.push(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ");
+        let mut num = [0u8; 12];
+        let s = itoa(total, &mut num);
+        w.push(s);
+        w.push(b"\r\nConnection: close\r\n\r\n");
+        w.done().len()
+    };
+    socket.write_all(&mut head[..hdr]).await.map_err(|_| ())?;
+
+    for i in 0..count {
+        let idx = (start + i) % crate::LOG_LINES;
+        let n = g.len[idx] as usize;
+        if n == 0 {
+            continue;
+        }
+        socket.write_all(&g.buf[idx][..n]).await.map_err(|_| ())?;
+        socket.write_all(b"\n").await.map_err(|_| ())?;
+    }
+    drop(g);
+
+    let _ = socket.flush().await;
+    Ok(())
 }
 
 /// 返回一段 HTML。/status 也走这个（内容是 JSON，前端用 fetch 解析纯文本）。

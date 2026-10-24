@@ -41,6 +41,23 @@
     <div class="row"><span>联网(STA)</span><span id="s-state" class="dim">查询中…</span></div>
     <div class="row"><span>局域网 IP</span><span id="s-ip" class="dim">-</span></div>
     <div class="row"><span>热点(AP)</span><span class="ok">192.168.4.1</span></div>
+    <div id="s-err-row" class="row" style="display:none">
+      <span>失败原因</span><span id="s-err" class="bad" style="font-size:12.5px"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="font-size:14px;font-weight:500;margin-bottom:10px">电源控制</div>
+    <div style="display:flex;gap:10px">
+      <button type="button" style="margin-top:0;flex:1" onclick="act('wake')">唤醒电脑</button>
+      <button type="button" style="margin-top:0;flex:1;background:#2a1416;color:#f09595;border:1px solid #7a2f2f"
+              onclick="act('sleep')">睡眠</button>
+    </div>
+    <div id="act-msg" class="tip" style="margin-top:10px;min-height:20px"></div>
+    <div class="tip" style="margin-top:0">
+      唤醒走 USB 远程唤醒，电脑睡眠时也能用。<br>
+      这条链路不依赖外网，热点侧（192.168.4.1）和局域网侧都能用。
+    </div>
   </div>
 
   <div class="card">
@@ -49,9 +66,39 @@
       <input id="ssid" name="ssid" placeholder="例如 MyHomeWiFi" required maxlength="32">
 
       <label for="pass">WiFi 密码</label>
-      <input id="pass" name="pass" type="password" placeholder="没有密码就留空" maxlength="64">
+      <div style="position:relative">
+        <input id="pass" name="pass" type="password" placeholder="没有密码就留空" maxlength="64"
+               style="padding-right:74px">
+        <button type="button" id="eye" onclick="togglePass()"
+                style="position:absolute;right:6px;top:50%;transform:translateY(-50%);width:auto;
+                       margin:0;padding:6px 12px;font-size:13px;font-weight:500;
+                       background:#22303f;color:#9fb3c8;border:1px solid #2f4054">明文</button>
+      </div>
 
       <button type="submit">保存并连接</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <div style="font-size:14px;font-weight:500;margin-bottom:6px">Blinker 凭据</div>
+    <div class="row" style="padding-top:0"><span>当前设备</span><span id="s-bdev" class="dim">查询中…</span></div>
+    <div class="tip" style="margin-top:6px;margin-bottom:12px">
+      浏览器打开下面这个地址（把 authKey 换成你的），把返回 JSON 里的三个值填进来。
+      保存后设备会重启一次，之后就不用再动固件了。<br>
+      <span style="word-break:break-all;font-family:ui-monospace,Consolas,monospace;font-size:11.5px;color:#7f8c9b">
+        iot.diandeng.tech/api/v1/user/device/diy/auth?authKey=你的key&amp;protocol=mqtt</span>
+    </div>
+    <form action="/save-blinker" method="get" autocomplete="off">
+      <label for="dev">deviceName（设备名，也是 MQTT clientId）</label>
+      <input id="dev" name="dev" placeholder="例如 110C67F2RW4MXTEHG29MQ8YZ" required maxlength="40">
+
+      <label for="iot">iotId（MQTT 用户名）</label>
+      <input id="iot" name="iot" placeholder="一般和 deviceName 相同" required maxlength="40">
+
+      <label for="tok">iotToken（MQTT 密码）</label>
+      <input id="tok" name="tok" placeholder="JSON 里最长的那串" required maxlength="72">
+
+      <button type="submit">保存 Blinker 凭据（会重启）</button>
     </form>
   </div>
 
@@ -87,10 +134,39 @@ function refresh(){
     var ip = document.getElementById('s-ip');
     ip.textContent = d.ip || '-';
     ip.className = d.ip ? 'ok' : 'dim';
+    var er = document.getElementById('s-err-row');
+    var et = document.getElementById('s-err');
+    if (d.err) { et.textContent = d.err; er.style.display = 'flex'; }
+    else { er.style.display = 'none'; }
+    var bd = document.getElementById('s-bdev');
+    if (d.bdev) { bd.textContent = d.bdev; bd.className = 'ok'; }
   }).catch(function(){});
 }
 refresh();
 setInterval(refresh, 3000);
+
+// WiFi 密码明文/隐藏切换
+function togglePass(){
+  var p = document.getElementById('pass');
+  var b = document.getElementById('eye');
+  if (p.type === 'password') { p.type = 'text'; b.textContent = '隐藏'; }
+  else { p.type = 'password'; b.textContent = '明文'; }
+}
+
+// 唤醒 / 睡眠。唤醒后如果主机重新枚举 USB，这条 HTTP 可能来不及收完整，
+// 所以失败也当成"已发出"处理。
+function act(a){
+  var m = document.getElementById('act-msg');
+  m.textContent = '发送中…';
+  m.className = 'tip';
+  fetch('/' + a).then(function(r){ return r.text() }).then(function(t){
+    m.textContent = t || '已发送';
+    m.className = 'tip ok';
+  }).catch(function(){
+    if (a === 'wake') { m.textContent = '唤醒指令已发出'; m.className = 'tip ok'; }
+    else { m.textContent = '发送失败，板子可能已被挂起或重启'; m.className = 'tip bad'; }
+  });
+}
 </script>
 </body>
 </html>

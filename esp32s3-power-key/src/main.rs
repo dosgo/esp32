@@ -54,6 +54,7 @@ use esp_hal_dhcp_server::{
     Ipv4Addr as DhcpIp, run_dhcp_server, simple_leaser::SimpleDhcpLeaser,
     structs::DhcpServerConfig,
 };
+use embassy_usb_synopsys_otg::otg_v1::Otg;
 use esp_println::println;
 use esp_radio::wifi::{
     AuthenticationMethod, Config as WifiConfig, ControllerConfig, Interface, WifiController,
@@ -72,13 +73,18 @@ esp_bootloader_esp_idf::esp_app_desc!();
 /// Blinker 设备凭据：浏览器打开
 /// https://iot.diandeng.tech/api/v1/user/device/diy/auth?authKey=你的authKey&protocol=mqtt
 /// 从返回的 JSON 里取 deviceName / iotId / iotToken 三个值填到这里
-const BLINKER_DEVICE_NAME: &str = "YOUR_DEVICE_NAME"; // deviceName，也是 MQTT clientId
-const BLINKER_IOT_ID: &str = "YOUR_IOT_ID"; // iotId，MQTT username
-const BLINKER_IOT_TOKEN: &str = "YOUR_IOT_TOKEN"; // iotToken，MQTT password
+const BLINKER_DEVICE_NAME: &str = "110C67F2RW4MXTEHG29MQ8YZ"; // deviceName，也是 MQTT clientId
+const BLINKER_IOT_ID: &str = "110C67F2RW4MXTEHG29MQ8YZ"; // iotId，MQTT username
+const BLINKER_IOT_TOKEN: &str = "mh5401ehl78TQnBkszzFuZNX50AzlLD"; // iotToken，MQTT password
 
-/// 电脑网卡 MAC，用于 WOL 魔术包唤醒（最可靠的唤醒方式）
-/// 填全 0 则只走 USB HID 唤醒
-const PC_MAC: [u8; 6] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+/// 电脑网卡 MAC，用于 WOL 魔术包唤醒。
+/// 本机 WiFi 网卡 Intel AX210：28-0C-50-F4-8C-9C
+/// 注意：现在走纯 USB 唤醒，`ENABLE_WOL = false`，这个值只备用。
+const PC_MAC: [u8; 6] = [0x28, 0x0C, 0x50, 0xF4, 0x8C, 0x9C];
+
+/// 要不要在唤醒时顺带发 WOL 魔术包。
+/// 关掉 = 纯 USB 唤醒（本机只用这个）。打开 = 多一条网络唤醒的后路。
+const ENABLE_WOL: bool = false;
 // ===========================================================
 
 const BROKER_HOST: &str = "broker.diandeng.tech";
@@ -125,22 +131,131 @@ pub enum PowerCmd {
 
 static CMD_CHAN: Channel<CriticalSectionRawMutex, PowerCmd, 8> = Channel::new();
 
+/// 唤醒请求：hid_task 收到 Wake 时先 signal 一下，让 usb_task 去把挂起的总线拉起来。
+/// 电脑睡（S0 低电量待机）之后 USB 总线是挂起状态，这时候直接 write 会超时，
+/// 必须先做 USB 远程唤醒（remote wakeup）把总线恢复到 active。
+static USB_WAKE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+// ================= 诊断日志：手机连热点打开 http://192.168.4.1/log 查看 =========
+//
+// 为什么需要：这块是 USB-A 直插的 dongle 板，只有一个 USB 口，OTG 一旦接管，
+// USB-Serial-JTAG 就没了，串口日志一个字节也看不到。但板子在电脑睡眠期间
+// 仍然有电、热点还在广播，所以把关键事件塞进环形缓冲，用手机就能读回来。
+
+pub const LOG_LINES: usize = 48;
+pub const LOG_LINE_LEN: usize = 96;
+
+pub struct LogRing {
+    pub buf: [[u8; LOG_LINE_LEN]; LOG_LINES],
+    pub len: [u8; LOG_LINES],
+    next: usize,
+    pub total: u32,
+}
+
+impl LogRing {
+    const fn new() -> Self {
+        Self {
+            buf: [[0u8; LOG_LINE_LEN]; LOG_LINES],
+            len: [0u8; LOG_LINES],
+            next: 0,
+            total: 0,
+        }
+    }
+
+    fn push(&mut self, s: &[u8]) {
+        let i = self.next;
+        let n = s.len().min(LOG_LINE_LEN);
+        self.buf[i][..n].copy_from_slice(&s[..n]);
+        self.len[i] = n as u8;
+        self.next = (i + 1) % LOG_LINES;
+        self.total = self.total.wrapping_add(1);
+    }
+
+    /// 返回 (起始下标, 有效行数)
+    pub fn order(&self) -> (usize, usize) {
+        let t = self.total as usize;
+        if t < LOG_LINES {
+            (0, t)
+        } else {
+            (self.next, LOG_LINES)
+        }
+    }
+}
+
+pub static LOGS: Mutex<CriticalSectionRawMutex, LogRing> = Mutex::new(LogRing::new());
+
+/// 写一行诊断日志。拿不到锁就丢弃 —— 绝不能因为写日志把 USB 关键路径卡住。
+pub fn push_log(args: core::fmt::Arguments<'_>) {
+    struct W<'a> {
+        s: &'a mut [u8],
+        n: usize,
+    }
+    impl core::fmt::Write for W<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let room = self.s.len() - self.n;
+            let sb = s.as_bytes();
+            let take = sb.len().min(room);
+            self.s[self.n..self.n + take].copy_from_slice(&sb[..take]);
+            self.n += take;
+            Ok(())
+        }
+    }
+    if let Ok(mut g) = LOGS.try_lock() {
+        let mut line = [0u8; LOG_LINE_LEN];
+        let mut w = W {
+            s: &mut line,
+            n: 0,
+        };
+        let _ = core::fmt::write(&mut w, args);
+        let n = w.n;
+        g.push(&line[..n]);
+    }
+}
+
+macro_rules! dlog {
+    ($($a:tt)*) => {
+        $crate::push_log(format_args!($($a)*))
+    };
+}
+
 /// 网络状态，给配网页的 /status 用
 pub struct NetInfo {
     /// 0=没配过 1=连接中 2=已连接 3=失败
     pub state: u8,
     /// STA 在局域网里拿到的地址
     pub ip: Option<[u8; 4]>,
+    /// 最近一次连接失败的原因，配网页上直接显示出来，省得来回猜
+    pub err: heapless::String<56>,
 }
 
 pub static NET: Mutex<CriticalSectionRawMutex, NetInfo> = Mutex::new(NetInfo {
     state: 0,
     ip: None,
+    err: heapless::String::new(),
 });
 
 /// flash 句柄（保存配网要写）。`FlashStorage::new` 只能调一次，又不能 clone，
 /// 所以丢进这个全局盒子给 web / 按键任务用。
 pub static FLASH: Mutex<CriticalSectionRawMutex, Option<FlashStorage<'static>>> = Mutex::new(None);
+
+/// 运行时生效的 Blinker 凭据。优先用 flash 里存的（网页可改），
+/// 没存过就回退到下面那几个编译期常量。
+pub static BLINKER_CFG: Mutex<CriticalSectionRawMutex, store::BlinkerCreds> =
+    Mutex::new(store::BlinkerCreds::new());
+
+/// 网页保存 Blinker 凭据：写 flash + 更新内存。调用方负责重启。
+pub async fn save_blinker_cfg(c: store::BlinkerCreds) -> bool {
+    let mut g = FLASH.lock().await;
+    let ok = match g.as_mut() {
+        Some(f) => store::save_blinker(f, &c),
+        None => false,
+    };
+    drop(g);
+    if ok {
+        *BLINKER_CFG.lock().await = c;
+    }
+    ok
+}
 
 /// 网页提交了新的 WiFi 账号密码 → 通知 wifi_task 去连
 pub static NEW_CREDS: Signal<CriticalSectionRawMutex, store::Creds> = Signal::new();
@@ -156,6 +271,46 @@ fn ap_config() -> AccessPointConfig {
         base.with_password(store::AP_PASSWORD.into())
             .with_auth_method(AuthenticationMethod::Wpa2Personal)
     }
+}
+
+/// 联网（STA）的配置：认证方式必须跟着密码走。
+///
+/// 坑：StationConfig 默认 auth_method = Wpa2Personal，如果密码是空的（没配过网、
+/// 或者用户填的是开放网络），esp_wifi_set_config 会返回 ESP_ERR_WIFI_PASSWORD，
+/// 整个 wifi::new 就失败了。所以空密码一律按开放网络（None）处理。
+fn sta_config(c: &store::Creds) -> StationConfig {
+    let sta = StationConfig::default().with_ssid(c.ssid.as_str());
+    if c.pass.is_empty() {
+        sta.with_auth_method(AuthenticationMethod::None)
+    } else {
+        sta.with_auth_method(AuthenticationMethod::Wpa2Personal)
+            .with_password(c.pass.as_str().into())
+    }
+}
+
+/// 还没配网时用的"占位" STA 配置，永远不会被真正去连。
+///
+/// 为什么要它：WiFi 模式从 AP 切成 APSTA 时，esp-radio 会 `stop()` 再 `start()`
+/// 整个射频，热点会瞬间消失 —— 手机正在提交配网表单，那条 HTTP 连接就被掐断，
+/// 页面一直转圈（这就是之前"保存卡住"的根因之一）。
+/// 开机就用 APSTA（哪怕 STA 是空的、不连），模式从头到尾不变，
+/// 后面配网时 `set_config` 只热更新参数，射频不重启，热点不断。
+fn placeholder_sta() -> StationConfig {
+    StationConfig::default()
+        .with_ssid("esp32-idle")
+        .with_auth_method(AuthenticationMethod::None)
+}
+
+/// 网页上点「唤醒」走这里。热点侧和局域网侧的 web 任务共用同一个通道。
+pub async fn request_wake() {
+    dlog!("[web] 请求 Wake");
+    CMD_CHAN.send(PowerCmd::Wake).await;
+}
+
+/// 网页上点「睡眠」走这里。
+pub async fn request_sleep() {
+    dlog!("[web] 请求 Sleep");
+    CMD_CHAN.send(PowerCmd::Sleep).await;
 }
 
 /// 恢复出厂：擦掉整个配置区（WiFi 账号密码 + 将来所有持久化设置）
@@ -185,36 +340,104 @@ impl MyDeviceHandler {
 impl Handler for MyDeviceHandler {
     fn enabled(&mut self, enabled: bool) {
         self.configured.store(false, Ordering::Relaxed);
-        let _ = enabled;
+        dlog!("[usb] enabled={enabled}");
         info!("USB enabled={enabled}");
     }
     fn reset(&mut self) {
         self.configured.store(false, Ordering::Relaxed);
+        dlog!("[usb] bus reset");
     }
     fn addressed(&mut self, addr: u8) {
         self.configured.store(false, Ordering::Relaxed);
-        let _ = addr;
+        dlog!("[usb] addressed={addr}");
     }
     fn configured(&mut self, configured: bool) {
         self.configured.store(configured, Ordering::Relaxed);
+        dlog!("[usb] configured={configured}");
         info!("USB configured={configured}");
+    }
+    /// 总线进/出挂起。电脑进睡眠时应该看到 suspended=true —— 没有就说明
+    /// 主机根本没挂起这根口，那 HID 报文本该能直接写进去。
+    fn suspended(&mut self, suspended: bool) {
+        dlog!("[usb] suspended={suspended}");
+    }
+    /// 主机是否允许本设备远程唤醒（对应 SET_FEATURE DEVICE_REMOTE_WAKEUP）。
+    /// 这个 false 的话 remote_wakeup() 一定失败。
+    fn remote_wakeup_enabled(&mut self, enabled: bool) {
+        dlog!("[usb] 远程唤醒允许={enabled}");
     }
 }
 
 #[embassy_executor::task]
 async fn usb_task(mut device: embassy_usb::UsbDevice<'static, Driver<'static>>) {
-    device.run().await;
+    // 不能只写 device.run().await —— 那样没机会调 remote_wakeup()。
+    // 这里用 select 把 run() 和"唤醒请求"并起来：收到请求就把 run() 的 future 丢掉，
+    // 拿回 &mut device 去做远程唤醒，然后重新进 run()。
+    loop {
+        match select(device.run(), USB_WAKE.wait()).await {
+            // run() 返回类型是 `!`，永远走不到这里
+            Either::First(_) => {}
+            Either::Second(()) => {
+                dlog!("[usb] 收到唤醒请求");
+                // 先走 embassy 的正规通道（同时会把内部 suspended 标记清掉）
+                match device.remote_wakeup().await {
+                    Ok(()) => {
+                        dlog!("[usb] 软唤醒 OK");
+                    }
+                    Err(e) => {
+                        // 常见是 InvalidState：要么总线没挂起，要么主机没发
+                        // SET_FEATURE(DEVICE_REMOTE_WAKEUP)。这时候库里什么都不做，
+                        // 必须自己打寄存器，否则一个字节都不会发到总线上。
+                        dlog!("[usb] 软唤醒失败 {e:?}，改为直接打 DCTL.RWUSIG");
+                        remote_wakeup_hw().await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 硬件级 USB 远程唤醒：直接把 OTG 的 `DCTL.RWUSIG` 拉高 10ms，
+/// 在 D+/D- 上打出 resume K 状态。这条路不看 embassy-usb 的
+/// `suspended / remote_wakeup_enabled` 门禁，也不看主机有没有发 SET_FEATURE。
+///
+/// USB 2.0 §7.1.7.7 规定 TDRSMUP 是 1~15ms，这里取 10ms。
+async fn remote_wakeup_hw() {
+    // 复用 esp-hal 的 USB0 基址，避免硬编码地址
+    let regs = unsafe { Otg::from_ptr(esp_hal::peripherals::USB0::PTR as *mut ()) };
+
+    // 挂起期间 PHY 时钟会被门控掉，先放出来，否则 RWUSIG 写进去也不动
+    regs.pcgcctl().modify(|w| {
+        w.set_stppclk(false);
+    });
+    regs.dctl().modify(|w| w.set_rwusig(true));
+    Timer::after(Duration::from_millis(10)).await;
+    regs.dctl().modify(|w| w.set_rwusig(false));
+    dlog!("[usb] 已发出 resume 信号（RWUSIG 10ms）");
 }
 
 #[embassy_executor::task]
-async fn hid_task(mut writer: HidWriter<'static, Driver<'static>, 9>) {
+async fn hid_task(mut writer: HidWriter<'static, Driver<'static>, 9>, stack: Stack<'static>) {
     info!("hid task started");
+    // socket 只建一次：mk_static! 是对 StaticCell 做 write，写第二次会 panic，
+    // 所以不能像原来那样放在 send_wol() 里面（每次唤醒都重新 mk_static）。
+    let mut wol = wol_socket(stack);
     loop {
         let cmd = CMD_CHAN.receive().await;
         info!("executing: {cmd:?}");
 
         match cmd {
             PowerCmd::Wake => {
+                dlog!("[hid] 收到 Wake");
+                // ① 可选：WOL 魔术包（本机默认关闭，走纯 USB）
+                if ENABLE_WOL {
+                    send_wol(&mut wol, stack).await;
+                }
+                // ② 让 usb_task 把总线拉起来（含硬件级 RWUSIG 兜底）
+                USB_WAKE.signal(());
+                // 主机恢复总线要几十毫秒，等一会儿再发 HID 报文，否则会写超时
+                Timer::after(Duration::from_millis(120)).await;
+                // ③ 发系统唤醒 + 一个空格键（S0 待机认键盘输入当用户活动）
                 send(&mut writer, &[2, 0x04]).await; // System Wake Up
                 send(&mut writer, &[2, 0x00]).await;
                 Timer::after(Duration::from_millis(60)).await;
@@ -241,6 +464,7 @@ async fn send(writer: &mut HidWriter<'static, Driver<'static>, 9>, data: &[u8]) 
         .await
         .is_err()
     {
+        dlog!("[hid] 写入超时 report={:02X?}", data);
         warn!("HID write timeout (host not enumerated?)");
     }
 }
@@ -276,6 +500,7 @@ async fn button_task(mut button: Input<'static>) {
             Timer::after(Duration::from_millis(400)).await;
             esp_hal::system::software_reset();
         } else {
+            dlog!("[boot] 短按 -> Wake");
             info!("BOOT 短按 -> 唤醒电脑");
             CMD_CHAN.send(PowerCmd::Wake).await;
             // 等松手再继续，免得一直重复触发
@@ -287,8 +512,20 @@ async fn button_task(mut button: Input<'static>) {
     }
 }
 
-/// WOL 魔术包：6 个 0xFF + MAC 重复 16 次，广播到 255.255.255.255:9
-async fn send_wol(stack: Stack<'static>) {
+/// 建一次 WOL 用的 UDP socket。缓冲必须是 static，所以只能建一次。
+fn wol_socket(stack: Stack<'static>) -> UdpSocket<'static> {
+    let rx_meta = mk_static!([PacketMetadata; 2], [PacketMetadata::EMPTY; 2]);
+    let rx_buf = mk_static!([u8; 128], [0u8; 128]);
+    let tx_meta = mk_static!([PacketMetadata; 2], [PacketMetadata::EMPTY; 2]);
+    let tx_buf = mk_static!([u8; 256], [0u8; 256]);
+    UdpSocket::new(stack, rx_meta, rx_buf, tx_meta, tx_buf)
+}
+
+/// WOL 魔术包：6 个 0xFF + MAC 重复 16 次。
+///
+/// 目的地址发两个：**子网广播**（很多路由器/AP 会吞掉 255.255.255.255）
+/// 和受限广播都补一发，哪个能到算哪个。
+async fn send_wol(sock: &mut UdpSocket<'static>, stack: Stack<'static>) {
     if PC_MAC == [0u8; 6] {
         return;
     }
@@ -297,111 +534,230 @@ async fn send_wol(stack: Stack<'static>) {
         packet[6 + i * 6..12 + i * 6].copy_from_slice(&PC_MAC);
     }
 
-    let rx_meta = mk_static!([PacketMetadata; 2], [PacketMetadata::EMPTY; 2]);
-    let rx_buf = mk_static!([u8; 128], [0u8; 128]);
-    let tx_meta = mk_static!([PacketMetadata; 2], [PacketMetadata::EMPTY; 2]);
-    let tx_buf = mk_static!([u8; 256], [0u8; 256]);
-    let mut socket = UdpSocket::new(stack, rx_meta, rx_buf, tx_meta, tx_buf);
-
-    if socket.bind(0).is_err() {
-        warn!("WOL: bind failed");
+    if !sock.is_open() && sock.bind(9).is_err() {
+        warn!("WOL: bind 失败");
         return;
     }
-    let bcast: IpAddress = IpAddress::Ipv4(Ipv4Address::new(255, 255, 255, 255));
-    match socket.send_to(&packet, (bcast, 9)).await {
-        Ok(()) => info!("WOL magic packet sent to {:02X?}", PC_MAC),
-        Err(e) => warn!("WOL send failed: {e:?}"),
+
+    let mut dsts = [Ipv4Address::new(255, 255, 255, 255); 2];
+    if let Some(cfg) = stack.config_v4() {
+        // 按当前前缀算子网广播地址，比如 192.168.88.160/24 -> 192.168.88.255
+        let ip = cfg.address.address().octets();
+        let pl = cfg.address.prefix_len();
+        let mut bcast = [0u8; 4];
+        for i in 0..4 {
+            let bits = (pl as i32 - (i as i32) * 8).clamp(0, 8) as u8;
+            let mask = if bits == 0 { 0u8 } else { 0xFFu8 << (8 - bits) };
+            bcast[i] = ip[i] | !mask;
+        }
+        dsts[0] = Ipv4Address::new(bcast[0], bcast[1], bcast[2], bcast[3]);
+    } else {
+        warn!("WOL: 联网侧还没拿到 IP，只发受限广播");
+        dsts[1] = Ipv4Address::new(255, 255, 255, 255);
     }
-    socket.close();
+
+    for d in dsts {
+        match sock.send_to(&packet, (IpAddress::Ipv4(d), 9)).await {
+            Ok(()) => info!("WOL 魔术包 -> {d} (MAC {:02X?})", PC_MAC),
+            Err(e) => warn!("WOL 发往 {d} 失败: {e:?}"),
+        }
+    }
 }
 
 /// Blinker：连 MQTT，订阅设备 topic，把指令转成电源动作
+/// 极简 JSON 字段提取：找 "key" 之后第一个冒号，再取引号里的字符串。
+/// 不够健壮，但只为从 Blinker 的心跳请求里抠出一个 id，够用了。
+fn json_str<'a>(s: &'a str, key: &str) -> Option<&'a str> {
+    let mut from = 0;
+    while let Some(p) = s[from..].find(key) {
+        let after = from + p + key.len();
+        // 注意：JSON 里键名是带引号的，所以 key 后面还跟着一个收尾的 `"`，
+        // 不能直接 expect 冒号。就是漏了这一步，之前一直取不到 fromDevice。
+        let rest = s[after..].trim_start();
+        let rest = rest.strip_prefix('"').unwrap_or(rest);
+        let rest = rest.trim_start();
+        if let Some(rest) = rest.strip_prefix(':') {
+            let rest = rest.trim_start();
+            if let Some(rest) = rest.strip_prefix('"') {
+                if let Some(e) = rest.find('"') {
+                    return Some(&rest[..e]);
+                }
+            }
+        }
+        from = after;
+    }
+    None
+}
+
 #[embassy_executor::task]
 async fn blinker_task(stack: Stack<'static>) {
     info!("blinker task started");
+
+    // 缓冲和 socket 只建一次，必须放在重连循环**外面**。
+    //
+    // 原来这几行写在循环里，而 `mk_static!` 是对 StaticCell 做 write、只能写一次，
+    // 所以只要第一次没连上（或中途掉线），第二圈就会 panic；而 esp-backtrace 的
+    // panic handler 是死循环 —— 整颗芯片停摆。表现就是：STA 明明连上了（路由器能看到），
+    // 几秒后 STA 和 AP 一起消失，而且再也回不来。
+    let rx = mk_static!([u8; 1024], [0u8; 1024]);
+    let tx = mk_static!([u8; 512], [0u8; 512]);
+    let mut socket = TcpSocket::new(stack, rx, tx);
+    socket.set_timeout(Some(Duration::from_secs(30)));
+
+    // 凭据：网页存过就用 flash 里的，否则用编译期常量
+    let mut bcfg: store::BlinkerCreds = BLINKER_CFG.lock().await.clone();
+    if !bcfg.is_set() {
+        let _ = bcfg.device.push_str(BLINKER_DEVICE_NAME);
+        let _ = bcfg.iot_id.push_str(BLINKER_IOT_ID);
+        let _ = bcfg.token.push_str(BLINKER_IOT_TOKEN);
+    }
+    dlog!("[mqtt] 设备名: {}", bcfg.device);
+
+    let mut topic: HString<96> = HString::new();
+    write!(topic, "/device/{}/r", bcfg.device.as_str()).ok();
+
+    // 设备上报 topic：心跳回复要发到这里
+    let mut stopic: HString<96> = HString::new();
+    write!(stopic, "/device/{}/s", bcfg.device.as_str()).ok();
+
+    let mut payload = [0u8; 512];
+
     loop {
         stack.wait_config_up().await;
         info!("network up, resolving {BROKER_HOST}");
 
         let addrs = match stack.dns_query(BROKER_HOST, DnsQueryType::A).await {
-            Ok(a) => a,
+            Ok(a) => {
+                dlog!("[mqtt] DNS 解析到 {} 个地址", a.len());
+                a
+            }
             Err(e) => {
+                dlog!("[mqtt] DNS 失败: {e:?}");
                 warn!("DNS failed: {e:?}");
                 Timer::after(Duration::from_secs(10)).await;
                 continue;
             }
         };
         let Some(addr) = addrs.first().copied() else {
+            dlog!("[mqtt] DNS 没返回地址");
             warn!("DNS returned no address");
             Timer::after(Duration::from_secs(10)).await;
             continue;
         };
 
-        let rx = mk_static!([u8; 1024], [0u8; 1024]);
-        let tx = mk_static!([u8; 512], [0u8; 512]);
-        let mut socket = TcpSocket::new(stack, rx, tx);
-        socket.set_timeout(Some(Duration::from_secs(30)));
-
         if let Err(e) = socket.connect((addr, BROKER_PORT)).await {
+            dlog!("[mqtt] TCP 连接 broker 失败: {e:?}");
             warn!("TCP connect failed: {e:?}");
-            socket.close();
+            socket.abort();
+            let _ = socket.flush().await;
             Timer::after(Duration::from_secs(10)).await;
             continue;
         }
+        dlog!("[mqtt] TCP 已连上 broker");
         info!("connected to {BROKER_HOST}");
 
-        let mut client = mqtt::MqttClient::new(socket, 60);
+        // 读超时必须明显大于心跳周期（30s）。
+        // 原来这里是 30s，和心跳撞在一起：每次都是"读超时 → Err(Socket) → 断开重连"，
+        // 表现就是 Blinker 上设备一直闪断、显示离线。
+        socket.set_timeout(Some(Duration::from_secs(120)));
 
-        let mut topic: HString<96> = HString::new();
-        write!(topic, "/device/{}/r", BLINKER_DEVICE_NAME).ok();
-
-        if let Err(e) = client
-            .connect(BLINKER_DEVICE_NAME, BLINKER_IOT_ID, BLINKER_IOT_TOKEN)
-            .await
+        // 用块把 client 对 socket 的可变借用限制住，出了块才能再操作 socket
+        let mut failed = false;
         {
-            warn!("MQTT connect failed: {e:?}");
-            client.close();
-            Timer::after(Duration::from_secs(10)).await;
-            continue;
-        }
-        info!("MQTT connected, subscribing {topic}");
+            // keepalive 给大一点（120s → broker 侧 180s 才判超时）。
+            // 我们不主动发 PINGREQ，靠"回心跳"当活动；App 关掉时连接会静默超时，
+            // 超时后自动重连（2 秒），不影响使用。
+            let mut client = mqtt::MqttClient::new(&mut socket, 120);
 
-        if let Err(e) = client.subscribe(&topic, 1).await {
-            warn!("MQTT subscribe failed: {e:?}");
-            client.close();
-            Timer::after(Duration::from_secs(10)).await;
-            continue;
-        }
-        info!("subscribed, waiting for commands");
+            if let Err(e) = client
+                .connect(bcfg.device.as_str(), bcfg.iot_id.as_str(), bcfg.token.as_str())
+                .await
+            {
+                dlog!("[mqtt] MQTT CONNECT 失败: {e:?}");
+                warn!("MQTT connect failed: {e:?}");
+                failed = true;
+            } else if let Err(e) = client.subscribe(&topic, 1).await {
+                dlog!("[mqtt] SUBSCRIBE 失败: {e:?}");
+                warn!("MQTT subscribe failed: {e:?}");
+                failed = true;
+            } else {
+                dlog!("[mqtt] 已连上 Blinker 并订阅成功");
+                info!("subscribed, waiting for commands");
+                // 注意：这里**不能**用 select(wait_publish, Timer) 来做"每 30 秒发 PINGREQ"。
+                // 那样每 30 秒会取消一次正在进行的 read，一旦正好读到半个报文，MQTT 流就错位，
+                // 接着就是断线重连 —— 表现就是 App 上设备反复在线/离线。
+                //
+                // 现在改成只等报文：因为收到心跳就会回一条 PUBLISH，那本身就是客户端活动，
+                // broker 的 keepalive 计时会被自然重置，不需要额外的 PINGREQ。
+                loop {
+                    match client.wait_publish(&mut payload).await {
+                        Ok(n) => {
+                            let msg = core::str::from_utf8(&payload[..n]).unwrap_or("");
+                            dlog!("[mqtt] recv: {msg}");
+                            info!("recv: {msg}");
 
-        let mut payload = [0u8; 512];
-        loop {
-            match client.wait_publish(&mut payload).await {
-                Ok(n) => {
-                    let msg = core::str::from_utf8(&payload[..n]).unwrap_or("");
-                    info!("recv: {msg}");
-                    // 宽容匹配：消息里含 wake / sleep / power 关键字即可
-                    let lower = msg.to_ascii_lowercase();
-                    if lower.contains("wake") {
-                        info!("-> WAKE");
-                        send_wol(stack).await;
-                        CMD_CHAN.send(PowerCmd::Wake).await;
-                    } else if lower.contains("sleep") {
-                        info!("-> SLEEP");
-                        CMD_CHAN.send(PowerCmd::Sleep).await;
-                    } else if lower.contains("power") {
-                        info!("-> POWER DOWN");
-                        CMD_CHAN.send(PowerCmd::PowerDown).await;
+                            // ---- Blinker 的"在线"心跳 ----
+                            //
+                            // App 发来的消息形如
+                            //   {"fromDevice":"a361c1b3...","data":{"get":"state"}}
+                            // 设备必须回一条（带 toDevice 指回 App）：
+                            //   {"toDevice":"a361c1b3...","data":{"state":"online","timer":"000","version":"0.1.0"}}
+                            // 发到 /device/<deviceName>/s。不回，App 就一直显示"离线"。
+                            //
+                            // 这里对**任何**带 fromDevice 的消息都回一次，不只是心跳请求，
+                            // 这样按完按钮在线状态也会顺带刷新。
+                            let is_heartbeat = msg.contains("get") && msg.contains("state");
+                            let mut out: HString<192> = HString::new();
+                            match json_str(msg, "fromDevice") {
+                                Some(app) => {
+                                    let _ = write!(
+                                        out,
+                                        "{{\"toDevice\":\"{app}\",\"data\":{{\"state\":\"online\",\"timer\":\"000\",\"version\":\"0.1.0\"}}}}"
+                                    );
+                                }
+                                None if is_heartbeat => {
+                                    let _ = write!(
+                                        out,
+                                        "{{\"data\":{{\"state\":\"online\",\"timer\":\"000\",\"version\":\"0.1.0\"}}}}"
+                                    );
+                                }
+                                None => {}
+                            }
+                            if !out.is_empty() {
+                                if client.publish(&stopic, out.as_bytes()).await.is_ok() {
+                                    dlog!("[mqtt] 已回心跳: {out}");
+                                } else {
+                                    dlog!("[mqtt] 心跳回复发送失败");
+                                }
+                            }
+
+                            // 宽容匹配：消息里含 wake / sleep / power 关键字即可
+                            let lower = msg.to_ascii_lowercase();
+                            if lower.contains("wake") {
+                                info!("-> WAKE");
+                                CMD_CHAN.send(PowerCmd::Wake).await;
+                            } else if lower.contains("sleep") {
+                                info!("-> SLEEP");
+                                CMD_CHAN.send(PowerCmd::Sleep).await;
+                            } else if lower.contains("power") {
+                                info!("-> POWER DOWN");
+                                CMD_CHAN.send(PowerCmd::PowerDown).await;
+                            }
+                        }
+                        Err(e) => {
+                            dlog!("[mqtt] 连接错误: {e:?}");
+                            warn!("MQTT error: {e:?}, reconnecting");
+                            break;
+                        }
                     }
-                }
-                Err(e) => {
-                    warn!("MQTT error: {e:?}, reconnecting");
-                    break;
                 }
             }
         }
-        client.close();
-        Timer::after(Duration::from_secs(5)).await;
+
+        // 立刻 RST 回到 Closed，下一轮 socket.connect 才不会报 InvalidState
+        socket.abort();
+        let _ = socket.flush().await;
+        Timer::after(Duration::from_secs(if failed { 10 } else { 2 })).await;
     }
 }
 
@@ -431,6 +787,10 @@ async fn main(spawner: Spawner) -> ! {
     usb_config.serial_number = Some("0001");
     usb_config.max_power = 100;
     usb_config.max_packet_size_0 = 64;
+    // 必须声明支持远程唤醒，否则配置描述符的 bmAttributes 不带 remote-wakeup 位，
+    // Windows 设备管理器里连"允许此设备唤醒计算机"这个勾都不会给，
+    // 电脑一睡总线就挂起，HID 报文永远发不出去。
+    usb_config.supports_remote_wakeup = true;
 
     let config_desc = mk_static!([u8; 256], [0u8; 256]);
     let bos_desc = mk_static!([u8; 256], [0u8; 256]);
@@ -462,8 +822,6 @@ async fn main(spawner: Spawner) -> ! {
 
     spawner
         .spawn(usb_task(device).expect("failed to spawn usb task"));
-    spawner
-        .spawn(hid_task(writer).expect("failed to spawn hid task"));
 
     let button = Input::new(
         peripherals.GPIO0,
@@ -471,6 +829,16 @@ async fn main(spawner: Spawner) -> ! {
     );
     spawner
         .spawn(button_task(button).expect("failed to spawn button task"));
+
+    // 关键：这里必须**真的让出足够时间**，不能只 yield 一下就继续。
+    //
+    // 原因：`builder.build()` 一返回，OTG 的 D+ 上拉就已经挂上去了，Windows 会立刻
+    // 开始枚举；而设备描述符这些控制传输是在**被轮询的控制任务**里回复的
+    // （esp-hal 的中断只把 SETUP 收下来，数据阶段要靠 poll）。
+    // 后面紧接着的 flash 读 + WiFi 射频校准是同步阻塞 1~2 秒，期间执行器回不到
+    // usb_task，Windows 拿不到描述符就报"设备描述符请求失败"。
+    // 之前用 yield_now() 只是运气好才枚举成功。
+    Timer::after(Duration::from_millis(800)).await;
 
     // ---------------- 读上次存的 WiFi 账号密码 ----------------
     let mut flash = FlashStorage::new(peripherals.FLASH).multicore_auto_park();
@@ -484,31 +852,56 @@ async fn main(spawner: Spawner) -> ! {
             None
         }
     };
+    // Blinker 凭据也顺手读一下（网页改过就用网页的，没改过就用固件内置的）
+    let bcred = store::load_blinker(&mut flash);
     FLASH.lock().await.replace(flash);
+    match bcred {
+        Some(b) => {
+            info!("[store] 已存 Blinker 设备: {}", b.device);
+            *BLINKER_CFG.lock().await = b;
+        }
+        None => info!("[store] 没配过 Blinker，用固件内置凭据"),
+    }
 
-    // ---------------- WiFi：AP + STA 同时开 ----------------
-    let initial = WifiConfig::AccessPointStation(
-        StationConfig::default()
-            .with_ssid(creds.as_ref().map(|c| c.ssid.as_str()).unwrap_or(""))
-            .with_password(
-                creds
-                    .as_ref()
-                    .map(|c| c.pass.as_str().into())
-                    .unwrap_or_default(),
-            ),
-        ap_config(),
-    );
+    // ---------------- WiFi：始终 APSTA，热点永远不断 ----------------
+    //
+    // 坑1：StationConfig::default() 的 auth_method 是 Wpa2Personal，而第一次上电
+    // 既没 SSID 也没密码，esp_wifi_set_config(WIFI_IF_STA) 会返回
+    // ESP_ERR_WIFI_PASSWORD，wifi::new 直接 Err —— 原来这里 .unwrap() 就 panic，
+    // 而 panic 发生在 main 第一次 await 之前，导致 usb_task 永远没被 poll，
+    // 现象就是"COM3 消失、HID 不出现"。
+    //
+    // 坑2：模式从 AP 变 APSTA 会让射频 stop/start，热点瞬断，正在提交配网表单的
+    // 手机连接被掐。所以没配网时也用 APSTA + 占位 STA，模式全程不变。
+    let initial = match creds.as_ref() {
+        Some(c) if c.is_set() => WifiConfig::AccessPointStation(sta_config(c), ap_config()),
+        _ => {
+            info!("[wifi] 还没配过网，APSTA + 占位 STA（热点 {}）", store::AP_SSID);
+            WifiConfig::AccessPointStation(placeholder_sta(), ap_config())
+        }
+    };
 
-    let (controller, interfaces) = esp_radio::wifi::new(
+    let (controller, interfaces) = match esp_radio::wifi::new(
         peripherals.WIFI,
         ControllerConfig::default().with_initial_config(initial),
-    )
-    .unwrap();
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            // WiFi 起不来也不能拖死 USB HID：HID / BOOT 键继续可用，只是没法远程控制
+            error!("[wifi] 初始化失败: {e:?}（USB HID 仍可用，远程控制不可用）");
+            loop {
+                Timer::after(Duration::from_secs(60)).await;
+            }
+        }
+    };
 
     let rng = Rng::new();
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
     let seed2 = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xA5A5_5A5A;
 
+    // socket 槽位要从宽：热点侧同时要 web(TCP) + DHCP(UDP) + DNS(UDP)，
+    // 联网侧要 web(TCP) + MQTT(TCP) + WOL(UDP) + DNS 查询(UDP) 共四个，
+    // 之前给 3 个不够，smoltcp 会直接 panic（adding a socket to a full SocketSet）。
     // 热点侧：ESP32 自己就是网关，地址固定
     let (ap_stack, ap_runner) = embassy_net::new(
         interfaces.access_point,
@@ -517,7 +910,7 @@ async fn main(spawner: Spawner) -> ! {
             gateway: None,
             dns_servers: heapless::Vec::new(),
         }),
-        mk_static!(StackResources<3>, StackResources::<3>::new()),
+        mk_static!(StackResources<6>, StackResources::<6>::new()),
         seed,
     );
 
@@ -534,7 +927,7 @@ async fn main(spawner: Spawner) -> ! {
     let (stack, sta_runner) = embassy_net::new(
         interfaces.station,
         sta_net_config,
-        mk_static!(StackResources<3>, StackResources::<3>::new()),
+        mk_static!(StackResources<6>, StackResources::<6>::new()),
         seed2,
     );
 
@@ -542,6 +935,9 @@ async fn main(spawner: Spawner) -> ! {
         .spawn(net_task(ap_runner).expect("failed to spawn ap net task"));
     spawner
         .spawn(net_task(sta_runner).expect("failed to spawn sta net task"));
+    // HID 任务要拿联网侧的 stack 发 WOL，所以挪到这里 spawn
+    spawner
+        .spawn(hid_task(writer, stack).expect("failed to spawn hid task"));
     spawner
         .spawn(ap_web_task(ap_stack).expect("failed to spawn ap web task"));
     spawner
@@ -646,37 +1042,54 @@ async fn connect_sta(controller: &mut WifiController<'static>, c: &store::Creds)
         return false;
     }
 
-    let cfg = WifiConfig::AccessPointStation(
-        StationConfig::default()
-            .with_ssid(c.ssid.as_str())
-            .with_password(c.pass.as_str().into()),
-        ap_config(),
-    );
+    let cfg = WifiConfig::AccessPointStation(sta_config(c), ap_config());
 
     if let Err(e) = controller.set_config(&cfg) {
         error!("[wifi] 设置 AP+STA 失败: {e:?}");
-        NET.lock().await.state = 3;
+        dlog!("[wifi] set_config 失败: {e:?}");
+        let mut n = NET.lock().await;
+        n.state = 3;
+        n.err.clear();
+        let _ = core::fmt::Write::write_fmt(&mut n.err, format_args!("set_config: {e:?}"));
         return false;
     }
 
     info!("[wifi] 连接 {}（最多等 {STA_CONNECT_TIMEOUT}s）", c.ssid);
-    NET.lock().await.state = 1;
+    dlog!("[wifi] 连接 {} …", c.ssid);
+    {
+        let mut n = NET.lock().await;
+        n.state = 1;
+        n.err.clear();
+    }
 
     match with_timeout(Duration::from_secs(STA_CONNECT_TIMEOUT), controller.connect_async()).await
     {
         Ok(Ok(_)) => {
             info!("[wifi] 已连上 {}", c.ssid);
+            dlog!("[wifi] 已连上 {}", c.ssid);
             NET.lock().await.state = 2;
             true
         }
         Ok(Err(e)) => {
             warn!("[wifi] 连接失败: {e:?}");
-            NET.lock().await.state = 3;
+            // 这句会显示在配网页上，是排查"连不上"的关键线索
+            dlog!("[wifi] 连接失败: {e:?}");
+            let mut n = NET.lock().await;
+            n.state = 3;
+            n.err.clear();
+            let _ = core::fmt::Write::write_fmt(&mut n.err, format_args!("{e:?}"));
             false
         }
         Err(_) => {
             warn!("[wifi] 连接超时（{STA_CONNECT_TIMEOUT}s）");
-            NET.lock().await.state = 3;
+            dlog!("[wifi] 连接超时");
+            let mut n = NET.lock().await;
+            n.state = 3;
+            n.err.clear();
+            let _ = core::fmt::Write::write_fmt(
+                &mut n.err,
+                format_args!("超时 {STA_CONNECT_TIMEOUT}s（密码错 / 只支持 5G / 信号弱）"),
+            );
             false
         }
     }
@@ -779,7 +1192,10 @@ async fn web_server(
     }
 }
 
-#[embassy_executor::task]
+// 坑：这个任务要被 spawn 两次（AP 一个、STA 一个），而 embassy-executor 的
+// #[task] 默认 pool_size = 1，第二个 spawn 会返回 SpawnError::Busy，
+// .expect() 直接 panic。必须显式开 2 个槽位。
+#[embassy_executor::task(pool_size = 2)]
 async fn net_task(mut runner: Runner<'static, Interface<'static>>) {
     runner.run().await
 }

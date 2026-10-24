@@ -57,13 +57,15 @@ fn push_str(buf: &mut [u8], pos: usize, s: &str) -> usize {
     pos + 2 + b.len()
 }
 
-pub struct MqttClient<'a> {
-    socket: TcpSocket<'a>,
+pub struct MqttClient<'a, 's> {
+    /// 借用而不是持有：socket 要跨重连循环复用，它的收发缓冲是 static 的，
+    /// `mk_static!` 只能 write 一次，所以不能每次重连都重建一个 socket。
+    socket: &'s mut TcpSocket<'a>,
     keepalive_secs: u16,
 }
 
-impl<'a> MqttClient<'a> {
-    pub fn new(socket: TcpSocket<'a>, keepalive_secs: u16) -> Self {
+impl<'a, 's> MqttClient<'a, 's> {
+    pub fn new(socket: &'s mut TcpSocket<'a>, keepalive_secs: u16) -> Self {
         Self {
             socket,
             keepalive_secs,
@@ -156,6 +158,29 @@ impl<'a> MqttClient<'a> {
     pub async fn ping(&mut self) -> Result<(), MqttError> {
         self.socket
             .write_all(&[PINGREQ << 4, 0])
+            .await
+            .map_err(|_| MqttError::Socket)?;
+        self.socket.flush().await.map_err(|_| MqttError::Socket)?;
+        Ok(())
+    }
+
+    /// 发一条 QoS0 PUBLISH。Blinker 的心跳回复要用它。
+    pub async fn publish(&mut self, topic: &str, payload: &[u8]) -> Result<(), MqttError> {
+        let mut p = [0u8; 512];
+        let mut n = push_str(&mut p, 0, topic);
+        if n + payload.len() > p.len() {
+            return Err(MqttError::BadPacket);
+        }
+        p[n..n + payload.len()].copy_from_slice(payload);
+        n += payload.len();
+
+        let mut pkt = [0u8; 520];
+        pkt[0] = PUBLISH << 4; // QoS 0，没有 packet id
+        let l = encode_len(&mut pkt[1..], n);
+        pkt[1 + l..1 + l + n].copy_from_slice(&p[..n]);
+
+        self.socket
+            .write_all(&pkt[..1 + l + n])
             .await
             .map_err(|_| MqttError::Socket)?;
         self.socket.flush().await.map_err(|_| MqttError::Socket)?;
