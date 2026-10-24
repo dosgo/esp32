@@ -192,10 +192,15 @@ espflash flash --monitor target\xtensa-esp32s3-none-elf\release\esp32s3-power-ke
 
 退出串口监视：`Ctrl + ]`
 
-已编译镜像在 `firmware-powerkey.bin`（约 604 KB），也可以直接烧：
+已编译好的镜像有两个（都是可直接烧的 flash 镜像）：
 
-```powershell
-espflash flash --chip esp32s3 firmware-powerkey.bin
+| 文件 | 说明 |
+|---|---|
+| `firmware-powerkey.bin`（约 676 KB） | **只有 USB**，不含蓝牙。稳定版，蓝牙出问题可以回滚到它 |
+| `firmware-ble-hid.bin`（约 1.0 MB） | USB + BLE HID（手机 / 平板当键鼠用），见第十节 |
+
+```bash
+espflash flash --chip esp32s3 firmware-ble-hid.bin
 ```
 
 ### 串口不见了怎么重烧
@@ -363,6 +368,8 @@ BOOT = wake
 | 功能              | 用的 crate                                                               |
 | --------------- | ---------------------------------------------------------------------- |
 | USB HID         | `esp-hal::otg_fs` + `embassy-usb` + `HidWriter`                        |
+| BLE HID         | `esp-radio` 的 `ble`+`coex` + `trouble-host 0.6`（bt-hci 0.8，带本地补丁），见第十节 |
+| 内存             | 内部堆 128KB + PSRAM（网页缓冲 32KB 放外部） |
 | WiFi（AP+STA 双开） | `esp-radio` 的 `Config::AccessPointStation` + `embassy-net`（两个独立 stack） |
 | 热点 DHCP / DNS   | `esp-hal-dhcp-server` + 手写迷你 DNS（`src/dns.rs`）                         |
 | 配网网页            | 手写极简 HTTP（`src/web.rs`）+ 内嵌 `setup.html`，不引框架                          |
@@ -373,3 +380,112 @@ BOOT = wake
 
 注意版本锁定：本工程用 **esp-hal 1.1.x 生态**（esp-radio 0.18 / esp-rtos 0.3 / esp-bootloader-esp-idf 0.5），  
 和 `esp32s3-hello` 的 esp-hal 1.2.x 是两套，互不干扰，别混着升级。
+
+---
+
+## 十、蓝牙 BLE HID（已实现 ✅ 手机/平板可直接当键鼠用）
+
+> 目标场景：手机 / 平板没有 USB host，只能走 BLE。
+
+### 一句话现状
+
+手机配对一次之后，**断开重连能用、板子断电重启后仍然能用**（bond 存在 flash 里）。
+电脑浏览器打开 `/kvm` 敲的字，会同时走 USB 和 BLE 两条路。
+
+### 依赖（版本必须锁死）
+
+```toml
+esp-radio = { version = "0.18.0", features = ["esp32s3", "wifi", "ble", "coex", "unstable"] }
+trouble-host = { version = "0.6.0", default-features = false, features = [
+    "peripheral", "gatt", "derive", "security", "log",
+    "default-packet-pool", "default-packet-pool-size-8", "default-packet-pool-mtu-251",
+] }
+bt-hci = "0.8"
+embassy-sync-07 = { package = "embassy-sync", version = "0.7" }   # GATT 表的锁要用 trouble 那一份
+rand_core = "0.6"                                                 # 给 SMP 播种 CSPRNG
+
+[patch.crates-io]
+trouble-host = { path = "vendor/trouble-host" }                    # 见下面「两个必须的补丁」
+```
+
+### 服务结构（HOGP）
+
+```
+0x1800 GAP   0x2A00 名字 / 0x2A01 外观 0x03C1（键盘）
+0x1801 GATT
+0x1812 HID   0x2A4A HID Information（bcdHID 0x0111 / country 0 / flags 0x02）
+             0x2A4B Report Map（123 字节，靠 Read Blob 分片读）
+             0x2A4E Protocol Mode / 0x2A4C Control Point
+             0x2A22 Boot 键盘报告（8B，Read+Notify）   ← Boot 协议
+             0x2A32 Boot 鼠标报告（4B，Read+Notify）
+             0x2A4D Report ×3（ID 1 键盘 / 2 鼠标 / 3 媒体键）  ← Report 协议
+                   每个带 0x2908 Report Reference 描述符
+```
+
+Boot 报文和 Report 报文**两条都发**：通知时两条都 `notify`，没订阅的那条直接返回 Ok。
+这样安卓（走 Report）和少数只认 Boot 的主机都能用。
+
+### 内存（这次把能挪的都挪到 PSRAM 了）
+
+| 项目 | 数值 |
+|---|---|
+| 内部堆（`heap_allocator!`） | **128 KB** |
+| 主栈（链接后剩余 RWDATA） | **40 KB** |
+| 跑完全部功能后内部堆剩余 | **43 KB**（之前只有 14.8KB） |
+| PSRAM | 8 MB，网页收发缓冲 32KB 已搬过去 |
+
+- 网页缓冲（`AP_WEB_BUF` / `STA_WEB_BUF`，共 32KB）现在从 **PSRAM** 分配（`alloc_psram_buf()`），
+  失败会自动退回内部堆。smoltcp 只拿它当字节数组，不碰 DMA、不放原子量，所以放外部 RAM 没问题。
+- **Wi-Fi / BLE 的分配走 `malloc_internal`（限内部 RAM）**，所以堆挪 PSRAM 救不了蓝牙 ——
+  PSRAM 只能装网页缓冲这种普通数据。这是本板子最关键的一条内存约束。
+- 内部堆从 100KB 提到 128KB 才够蓝牙：btdm 控制器实测吃 **35.7KB**（79248 → 43492）。
+- 主栈大小不用上机量：`xtensa-esp32s3-elf-nm <elf> | grep _stack_` 相减即可。
+  **堆每加 1KB，主栈就少 1KB**，堆加到 130KB 时主栈只剩 11KB，启动瞬间栈溢出，
+  现象是串口一个字节都没有、COM 口却还在（最容易误判成烧坏了）。
+
+### 两个必须的补丁 / 坑
+
+#### 1. 包池 MTU 不能小（64 会死）
+
+为了省 RAM 一度把 trouble 的包池压成 `8 × 64`。HID 报文确实只有几字节，
+但 **SMP 配对（Secure Connections 的 P-256 公钥）单个 PDU 要 65 字节**，
+MTU 64 会让 trouble 报 `InsufficientSpace`，现象是手机**永远卡在「正在配对」**。
+现在用 `8 × 251`（2KB 静态 RAM，值）。
+
+#### 2. 外设侧不索取对方 IRK（已 vendor 补丁）
+
+trouble 0.6 在**外设侧**配对时把 `initiator_key_distribution` 初始化成 0，
+也就是不要求手机分发 IRK。后果：手机下次连接用的是**轮换后的随机地址（RPA）**，
+`get_peer_long_term_key()` 按地址找不到原来那把 LTK →
+`Long term key request reply failed` → `Authentication Failure`，
+表现就是**第一次配对能用，断开后再也连不上**。
+
+修法在 `vendor/trouble-host/src/security_manager/pairing/peripheral.rs::new()`：
+构造 `local_features` 时 `initiator_key_distribution.set_identity_key()`。
+上游修好之后删掉 `[patch.crates-io]` 和整个 `vendor/` 即可。
+
+### bond 存 flash
+
+- 扇区 `0xB000`（配置区第三块，`0x9000` WiFi / `0xA000` Blinker / `0xB000` bond）
+- 存：LTK(16) + 地址(6) + 地址类型(1) + IRK(16，可选) + 安全等级(1) + magic + 校验和
+- 开机 `restore_bond()` 灌回协议栈，`/log` 会打印 `已恢复历史配对（IRK 有）`
+- 配对完成时 `save_bond()` 写 flash，`/log` 打印 `bond 已写入 flash`
+- 只存一台主机（一块 dongle 对一台设备，多主机切换是后续工作）
+
+### 调试手段：把 `log` 接进 `/log` 环形缓冲
+
+`main.rs` 里有个 `RingLogger`，接管了全局 logger，**不再调用**
+`esp_println::logger::init_logger_from_env()`（它会把 `set_logger` 的位置占掉）。
+
+- 只收 target 以 `trouble` 开头、以及所有 Warn 及以上的记录（否则 48 行缓冲瞬间刷没）
+- 排查时就是靠它看到 `[smp] Pairing method JustWorks` 和 `InsufficientSpace` 的
+- `Cargo.toml` 里 trouble 必须开 `log` feature，否则它内部的 `error!/warn!` 是空调用
+
+### 已知限制
+
+- 只能 BLE HID：esp-radio 没有经典蓝牙 BR/EDR，**BIOS / 装机界面 / Win7 不认**，
+  这些场景仍然只能用 USB 那条路。
+- 唤醒能力弱于 USB（依赖主机蓝牙控制器在睡眠期间保持供电）。
+- 只支持一台已经配对的手机；换设备要先在旧设备上「忘记」，或者长按 BOOT 恢复出厂。
+- 网页键鼠同时喂 USB 和 BLE 两路，**BLE 连上时两边会同时收到按键**
+  （想让它们互斥得在 `HidEvent` 里加来源标记）。
