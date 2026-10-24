@@ -20,6 +20,7 @@ mod dns;
 mod hid;
 mod lcd;
 mod mqtt;
+mod soc_temp;
 mod store;
 mod web;
 
@@ -28,7 +29,7 @@ use core::str;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{Either, Either3, select, select3};
 use embassy_net::{
     Config as NetConfig, IpAddress, Ipv4Address, Ipv4Cidr, Runner, Stack, StackResources,
     StaticConfigV4,
@@ -48,7 +49,7 @@ use embassy_usb::{Builder, Config as UsbConfig, Handler};
 use esp_backtrace as _;
 use esp_hal::{
     clock::CpuClock,
-    gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
+    gpio::{Input, InputConfig, Pull},
     interrupt::software::SoftwareInterruptControl,
     otg_fs::{Usb, asynch::Driver},
     rng::Rng,
@@ -77,18 +78,29 @@ esp_bootloader_esp_idf::esp_app_desc!();
 //
 // 有一条硬性下限：esp-radio 要求 CPU ≥ 80MHz（内部 assert），所以不能低于 80。
 
-/// CPU 主频。Wi-Fi 吞吐和网页渲染都不吃 CPU，160MHz 是「省电 + 不卡」的折中。
-/// 想再省可以降到 `_80MHz`（网页会稍慢，功能不受影响）。
-const CPU_CLOCK: CpuClock = CpuClock::_160MHz;
+/// CPU 主频。**80MHz 是 esp-radio 允许的下限**（内部 assert ≥80）。
+///
+/// 键盘/鼠标不受影响：一次按键的 CPU 处理只有几微秒（AES 有硬件加速），
+/// 而链路的延迟量级是 10ms（USB 轮询）到 几十 ms（WiFi DTIM），CPU 占比 <1%。
+/// 降主频唯一能感觉到的是网页渲染慢一点、以及大流量时输入抖动从 <1ms 涨到几 ms。
+const CPU_CLOCK: CpuClock = CpuClock::_80MHz;
 
 /// Wi-Fi 省电模式。esp-radio 默认是 `None`（射频常开，最费电）。
 /// - `Minimum`：DTIM 级别休眠，延迟几十毫秒，网页/MQTT 几乎无感 ← 用这个
 /// - `Maximum`：睡得更狠，但下载 24KB 页面会明显变慢
 const WIFI_PS: PowerSaveMode = PowerSaveMode::Minimum;
 
-/// Wi-Fi 最大发射功率，单位 0.25dBm：52 = 13dBm（默认 84 = 20dBm）。
-/// 手机/路由器就在旁边，13dBm 足够，TX 峰值电流能降不少。
-const WIFI_TX_POWER: i8 = 52;
+/// Wi-Fi 最大发射功率，单位 0.25dBm：**72 = 18dBm**（芯片默认上限是 84 = 20dBm）。
+///
+/// 走过一轮弯路，记录一下：
+///   13dBm(52) → 手机 3 米外只剩 2 格；17dBm(68) 偏弱；20dBm(84) 覆盖最好。
+/// 最后定在 **18dBm**：比拉满只低 2dB（覆盖差别很小），
+/// 但发射峰值电流能降一些 —— 这块 USB-A 直插 dongle 天线贴着机箱，
+/// 效率本来就差，功率不能降太多，18 是折中。
+///
+/// **这项对平均功耗影响很小**（只影响发射瞬间的峰值电流，空闲不耗电），
+/// 真正省电的是 `WIFI_PS` 和 `CPU_CLOCK`，别在这里抠。
+const WIFI_TX_POWER: i8 = 72;
 
 /// BLE 广播间隔（毫秒）。默认 160ms；调到 500ms 手机照样能扫到，
 /// 但射频占用降到 1/3。已经连上之后就不广播了，所以只影响"找设备"阶段。
@@ -295,17 +307,24 @@ pub struct NetInfo {
     pub ip: Option<[u8; 4]>,
     /// 最近一次连接失败的原因，配网页上直接显示出来，省得来回猜
     pub err: heapless::String<56>,
+    /// STA 的信号强度（dBm，负值，越接近 0 越好）。没连上是 0。
+    pub rssi: i8,
 }
 
 pub static NET: Mutex<CriticalSectionRawMutex, NetInfo> = Mutex::new(NetInfo {
     state: 0,
     ip: None,
     err: heapless::String::new(),
+    rssi: 0,
 });
 
 /// flash 句柄（保存配网要写）。`FlashStorage::new` 只能调一次，又不能 clone，
 /// 所以丢进这个全局盒子给 web / 按键任务用。
 pub static FLASH: Mutex<CriticalSectionRawMutex, Option<FlashStorage<'static>>> = Mutex::new(None);
+
+/// 芯片温度（单位 0.1℃），由 lcd_task 每秒更新，/status 直接读。
+/// 用原子量而不是 Mutex：读的地方多、写的地方只有一个，没必要加锁。
+pub static TEMP_DECI: core::sync::atomic::AtomicI16 = core::sync::atomic::AtomicI16::new(0);
 
 /// flash 里有没有蓝牙配对信息。
 /// 给设置页显示用，避免每次轮询 /status 都去读 flash（读一次也行，但没必要）。
@@ -949,7 +968,7 @@ async fn main(spawner: Spawner) -> ! {
         "[power] CPU {:?} / Wi-Fi PS={:?} / TX {}dBm / BLE adv {}ms",
         CPU_CLOCK,
         WIFI_PS,
-        WIFI_TX_POWER as i32 / 4,
+        (WIFI_TX_POWER as i32 / 4).min(20),
         BLE_ADV_INTERVAL_MS
     );
     info!(
@@ -1209,7 +1228,13 @@ async fn main(spawner: Spawner) -> ! {
         Err(e) => warn!("[power] 设置省电模式失败: {e:?}"),
     }
     match controller.set_max_tx_power(WIFI_TX_POWER) {
-        Ok(()) => dlog!("[power] Wi-Fi 发射功率 = {}dBm", WIFI_TX_POWER as i32 / 4),
+        // 原始值是 0.25dBm 单位，但 ESP 的实际上限是 20dBm（原始值 84 会按 20 处理），
+        // 所以这里钳一下，别打印出 21dBm 这种不存在的档位
+        Ok(()) => dlog!(
+            "[power] Wi-Fi 发射功率 = {}dBm（原始值 {}）",
+            (WIFI_TX_POWER as i32 / 4).min(20),
+            WIFI_TX_POWER
+        ),
         Err(e) => warn!("[power] 设置发射功率失败: {e:?}"),
     }
 
@@ -1305,16 +1330,29 @@ async fn wifi_task(mut controller: WifiController<'static>, creds: Option<store:
         }
 
         // 已连上：等断线，或者用户提交了新的账号密码
-        match select(NEW_CREDS.wait(), controller.wait_for_disconnect_async()).await {
-            Either::First(c) => {
+        // 已连上：等断线、等新配置，顺便每 5 秒采一次 RSSI 给 /status 用
+        match select3(
+            NEW_CREDS.wait(),
+            controller.wait_for_disconnect_async(),
+            Timer::after(Duration::from_secs(5)),
+        )
+        .await
+        {
+            Either3::First(c) => {
                 info!("[wifi] 收到新配置: {}", c.ssid);
                 cur = Some(c);
                 connected = false;
             }
-            Either::Second(_) => {
+            Either3::Second(_) => {
                 warn!("[wifi] STA 断线，准备重连");
                 NET.lock().await.state = 0;
                 connected = false;
+            }
+            Either3::Third(_) => {
+                // 信号强度：只能给用户看，顺便帮判断发射功率该不该加大
+                if let Ok(r) = controller.rssi() {
+                    NET.lock().await.rssi = r as i8;
+                }
             }
         }
     }

@@ -1291,6 +1291,7 @@ dependencies = [
  "esp-radio",
  "esp-rtos",
  "esp-storage",
+ "esp32s3 0.35.2",
  "heapless 0.9.3",
  "log",
  "mipidsi",

@@ -77,6 +77,9 @@ bt-hci = "0.8"
 embassy-sync-07 = { package = "embassy-sync", version = "0.7" }
 # 给 trouble 的 security manager 播种 CSPRNG（版本要和 trouble 用的 0.6 一致）
 rand_core = "0.6"
+# 直接点 SENS 寄存器读片上温度（esp-hal 1.1.2 没给 S3 实现 tsens）。
+# 版本必须跟 esp-hal 1.1.2 内部用的一致（0.35.2），否则寄存器类型对不上。
+esp32s3 = "0.35.2"
 esp-rtos = { version = "0.3.0", features = ["esp32s3", "embassy", "esp-radio"] }
 # 热点模式必须自己跑 DHCP：embassy-net 只有客户端，没有服务端
 esp-hal-dhcp-server = "0.4.3"

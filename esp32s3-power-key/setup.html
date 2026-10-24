@@ -43,6 +43,8 @@
   <div class="card">
     <div class="row"><span>联网(STA)</span><span id="s-state" class="dim">查询中…</span></div>
     <div class="row"><span>局域网 IP</span><span id="s-ip" class="dim">-</span></div>
+    <div class="row"><span>路由器信号</span><span id="s-rssi" class="dim">-</span></div>
+    <div class="row"><span>芯片温度</span><span id="s-temp" class="dim">-</span></div>
     <div class="row"><span>热点(AP)</span><span class="ok">192.168.4.1</span></div>
     <div id="s-err-row" class="row" style="display:none">
       <span>失败原因</span><span id="s-err" class="bad" style="font-size:12.5px"></span>
@@ -151,6 +153,30 @@ function refresh(){
     var ip = document.getElementById('s-ip');
     ip.textContent = d.ip || '-';
     ip.className = d.ip ? 'ok' : 'dim';
+    // 注意：这是「板子收到的路由器信号」（STA 侧），
+    // 跟手机连 ESP32 热点时的信号是两回事，方向相反。
+    // >='−67 算好，-75 以下偏弱
+    var rs = document.getElementById('s-rssi');
+    if (rs) {
+      if (d.rssi && d.rssi !== 0) {
+        rs.textContent = d.rssi + ' dBm';
+        rs.className = d.rssi >= -67 ? 'ok' : (d.rssi >= -75 ? 'dim' : 'bad');
+      } else {
+        rs.textContent = '-';
+        rs.className = 'dim';
+      }
+    }
+    // 芯片温度（℃）：屏幕最后一行显示的也是这个值
+    var tp = document.getElementById('s-temp');
+    if (tp) {
+      if (d.temp && d.temp !== 0) {
+        tp.textContent = d.temp + ' °C';
+        tp.className = d.temp < 60 ? 'ok' : (d.temp < 75 ? 'dim' : 'bad');
+      } else {
+        tp.textContent = '-';
+        tp.className = 'dim';
+      }
+    }
     var er = document.getElementById('s-err-row');
     var et = document.getElementById('s-err');
     if (d.err) { et.textContent = d.err; er.style.display = 'flex'; }

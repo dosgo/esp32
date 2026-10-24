@@ -204,6 +204,24 @@ espflash flash --monitor target\xtensa-esp32s3-none-elf\release\esp32s3-power-ke
 espflash flash --chip esp32s3 firmware-ble-hid.bin
 ```
 
+### 烧完怎么让它自己进应用（重要）
+
+这块板**没有 RESET 键**、串口是**原生 USB-Serial-JTAG**，
+`espflash` 默认的 `--after hard-reset`（DTR 硬复位）在这里**不管用** ——
+复位后芯片会停在 `boot:0x0 (DOWNLOAD)` / `waiting for download`，
+现象是 COM 口一直在、但板子不跑程序，只能再拔插一次。
+
+用 **`--after watchdog-reset`** 可以自己跳出去：
+
+```bash
+espflash flash --monitor --after watchdog-reset <elf>
+# 或者已经烧好了，只差复位：
+espflash reset --port COM3 --after watchdog-reset
+```
+
+看门狗复位后芯片走正常 boot 流程（不需要动 BOOT 键），
+约 5~8 秒后 USB 被 OTG 接管（COM 消失）+ WiFi 连上，就可以访问网页了。
+
 ### 串口不见了怎么重烧
 
 固件一旦 panic，`otg_fs` 已经把 USB PHY 从 USB-Serial-JTAG 抢走了，COM 口会**彻底消失**，  
@@ -500,15 +518,20 @@ trouble 0.6 在**外设侧**配对时把 `initiator_key_distribution` 初始化�
 
 ## 十一、功耗与省电（实测 1.2W → 1.0W）
 
-板子插在 USB 上测，5V 供电。**改前 1.2W（约 240mA），改后 1.0W（约 200mA）**。
+板子插在 USB 上测，5V 供电。**改前 1.2W（约 240mA），改后稳态 1.0W（约 200mA）**，
+偶尔会闪到 1.1W 持续 **1 秒左右** —— 这是 Wi-Fi 发射突发（20dBm 时峰值可到 250~300mA）
+加 BLE 连接事件造成的，属正常现象，看**平均值**就行。
+
+> 省电模式对网页延迟的影响实测**可忽略**（设置页 9.6KB 仍在 0.4~0.5s，
+> 用户主观评价「一点都不慢」），所以 `WIFI_PS=Minimum` 没必要为了响应速度退回去。
 
 ### 四个改动（参数都在 `src/main.rs` 顶部集中配置）
 
 | 项 | 常量 | 之前 | 现在 | 说明 |
 |---|---|---|---|---|
 | Wi-Fi 省电 | `WIFI_PS` | `None` | `Minimum` | **最大的一项**。esp-radio 默认 `PowerSaveMode::None`（射频常开），文档里就写着 "By default the power-saving mode is None" |
-| CPU 主频 | `CPU_CLOCK` | `CpuClock::max()` = 240MHz | `_160MHz` | esp-radio 硬性要求 ≥80MHz（内部 assert），不能更低 |
-| Wi-Fi 发射功率 | `WIFI_TX_POWER` | 84 = 20dBm | 52 = **13dBm** | 单位是 0.25dBm，取值范围 [8, 84] |
+| CPU 主频 | `CPU_CLOCK` | `CpuClock::max()` = 240MHz | 160MHz → **`_80MHz`** | esp-radio 硬性要求 ≥80MHz（内部 assert），80 就是下限。实测 80MHz 功耗更低、键鼠手感无变化 |
+| Wi-Fi 发射功率 | `WIFI_TX_POWER` | 84 = 20dBm | 52 → 68 → 84 → **72 = 18dBm** | 单位 0.25dBm，范围 [8,84]（84 实际按 20dBm 处理，日志换算要 `.min(20)`）。降到 13/17dBm 时手机 3 米外只剩 2 格，20dBm 覆盖最好；最后定 18dBm 折中（只低 2dB，峰值电流低一些） |
 | BLE 广播间隔 | `BLE_ADV_INTERVAL_MS` | 160ms | 500ms | 只影响"找设备"，连上后不广播 |
 
 `esp32s3-power-key` 启动会在 `/log` 打一行 `[power] Wi-Fi 省电模式 = Minimum` / `发射功率 = 13dBm`，
@@ -516,8 +539,15 @@ trouble 0.6 在**外设侧**配对时把 `initiator_key_distribution` 初始化�
 
 ### 省电带来的取舍（都实测过，功能没丢）
 
-- **通信距离**：20 → 13dBm 是 −7dB，理论距离减半。路由器远/墙多的话，
-  把 `WIFI_TX_POWER` 改回 `64`（16dBm）折中。
+- **通信距离（踩过的坑）**：13dBm → 手机连热点 3 米外只剩 2 格；17dBm 仍偏弱；
+  最后**拉回 20dBm**。原因是这块 USB-A 直插 dongle 的天线紧贴电脑机箱/金属外壳，
+  实际辐射效率远不如开发板，发射功率在这里不能省。
+  如果还是觉得弱，先试**加一条 USB 延长线把它挪离机箱 5~10cm**，比调参数管用。
+- **`rssi` 别看错方向**：`/status` 的 `rssi` 和设置页的「路由器信号」都是
+  **板子收到的路由器信号（STA 侧）**，跟「手机连 ESP32 热点的信号」是两回事、方向相反。
+  测 AP 覆盖时这个数字没有参考意义（AP 侧看不到每个客户端的 RSSI，esp-radio 没暴露）。
+  另外手机状态栏的「格数」是厂商的 UX 映射，不是 dBm，别用它判断；
+  要看真实值用安卓的 WiFi Analyzer 之类工具，−67 以内都算好。
 - **网页延迟**：设置页 9.6KB 从"几乎立即"变成 **0.41~0.51s**（DTIM 级休眠的固有代价）。
 - **找设备**：手机搜到 `ESP32-POWER-BLE` 最多多等 0.5s。
 - **不影响**：BLE 用旧 bond 直接加密重连、AP 侧网页 WebSocket、MQTT（断线会自动重连）、唤醒/睡眠。
@@ -534,6 +564,40 @@ trouble 0.6 在**外设侧**配对时把 `initiator_key_distribution` 初始化�
 
 **不建议动 BLE 连接间隔**：拉长到 30~50ms 能省一点，
 但鼠标拖拽会明显发涩（安卓默认给的 7.5~15ms 是 HID 的正常诉求）。
+
+### 一个反直觉的实测：降 CPU 不降温
+
+160MHz 和 80MHz 两种配置下，芯片温度都稳定在 **66~68°C**（片上传感器实测，见下节）。
+说明**发热主体是 Wi-Fi 射频 + LDO/PSRAM，不是 CPU** —— 平时绝大部分时间 CPU 都在 `waiti` 休眠。
+所以"发烫"不要指望靠降主频解决；真正能降温的只有减少射频发射（降 TX 功率 / 关热点）。
+
+键盘/鼠标手感也不受影响：一次按键的 CPU 处理只有几微秒（AES 有硬件加速），
+而链路延迟量级是 10ms（USB 轮询）到几十 ms（WiFi DTIM），CPU 占比 <1%。
+
+### 片上温度显示（LCD + /status）
+
+屏幕最后一行（原来是 `BOOT = wake`）现在显示**芯片温度**，`/status` 里也有 `temp` 字段。
+
+⚠️ 这里有个坑：**esp-hal 1.1.2 的 `tsens` 驱动不支持 S3**（元数据里 S3 没有 `soc_has_tsens`，
+只有 C2/C3/C6/H2 有），但 **S3 的硬件是有的** —— 在 `SENS` 外设的
+`SAR_TSENS_CTRL`(0x50) 寄存器里。所以 `src/soc_temp.rs` 直接拿 PAC 点寄存器：
+
+```rust
+sens.sar_tsens_ctrl().modify(|_, w| w
+    .sar_tsens_power_up().set_bit()
+    .sar_tsens_power_up_force().set_bit()
+    .sar_tsens_dump_out().set_bit());
+// 等 sar_tsens_ready，再读 sar_tsens_out（8 位原始值）
+```
+
+换算用 ESP-IDF 的 S3 公式 `raw * 0.4386 - 20.52`（offset=0，未烧校准值）。
+esp-hal 给 C3 的那套是 `offset=-1`（相当于 +27.88），**两者差 28°C**，
+`celsius_alt()` 就是留着对照的：开机前 5 次会往 `/log` 打
+`[temp] raw=185 idf=60.6C alt=88.5C`，实测 idf 那套才符合物理直觉（芯片温升 40°C 左右）。
+
+温度判读：die 67°C 属正常（结温上限 ~125°C）。但注意这颗是 **N16R8 = 带 Octal PSRAM**，
+乐鑫对 R8 的**环境温度**规格只有 **−40~65°C**（普通 S3 是 85°C，PSRAM 怕热）。
+die 67°C 对应壳内环境约 45~55°C，夏天室温 30°C+ 时要盯一下别逼近 65°C。
 
 ### 那 200mA 都花在哪（估算，没上电流探头）
 
