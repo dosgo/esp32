@@ -143,6 +143,46 @@ const STA_RETRY_INTERVAL: u64 = 10;
 /// 短按（不到这个时长）仍然是"唤醒电脑"。
 const BOOT_RESET_MS: u64 = 3000;
 
+/// 冷启动保护：上电后这段时间内，**MQTT 下发的电源指令一律丢弃**。
+///
+/// 原因：blinker_task 一启动就会连 broker 并订阅，broker 可能推来 retained 的
+/// 旧指令、App 也可能在设备上线瞬间同步一次状态。没有这道保护，
+/// 表现就是"配好网、插上电脑没多久就自己睡了"。
+///
+/// 5 秒：够覆盖"连 WiFi → DHCP → MQTT 握手 → 订阅 → 心跳"这段自动噪音期，
+/// 又不至于让断电重启后手机点不动。要更保守可以改回 10_000。
+///
+/// 网页按钮 / 串口 / BOOT 键不受这个限制 —— 那些是人当场操作的。
+const MQTT_GUARD_MS: u64 = 5_000;
+
+/// 临时总闸：MQTT 是否允许触发电源动作。
+///
+/// 2026-10-25 排查期间一度设成 `false`。现在元凶已经定位到 Wake 分支里的
+/// `[2, 0x04]`（已删除），配合 parse_power_cmd 的严格匹配 + 冷启动保护，
+/// 这条链路已经安全，恢复启用。
+const MQTT_POWER_ENABLE: bool = true;
+
+/// 诊断开关（2026-10-25）：`true` = 彻底禁掉一切主动 HID 输出。
+///
+/// 二分结论：
+///   - 全部抑制 → 电脑不睡
+///   - BOOT 键启用但报告仍抑制（remotewakeup 裸寄存器照跑）→ 电脑不睡
+/// 所以 `remote_wakeup_hw()` 是无辜的，元凶在 **HID 报告**本身。
+/// 现在改回 `false` 恢复发送，改用 POWER_REPORT_ENABLE 精确控制危险报告。
+const DIAG_NO_HID_OUTPUT: bool = false;
+
+/// 系统控制报告（Sleep / PowerDown）总开关。
+///
+/// 2026-10-25 二分结论：`[2, 0x04]` System Wake Up 才是让电脑"一插上就睡"的元凶
+/// （Windows 事件日志 `Button or Lid`）。它已从 Wake 分支里永久删除。
+///
+/// Sleep / PowerDown 这两种报告本身**没有**被证明有害，所以恢复启用。
+/// 真出问题时改回 `false` 即可一键隔离。
+const POWER_REPORT_ENABLE: bool = true;
+
+/// Wake 去抖：GPIO0 抖动 / 报文重发时，这段时间内只响应一次。
+const WAKE_DEBOUNCE_MS: u64 = 2000;
+
 macro_rules! mk_static {
     ($t:ty, $val:expr) => {{
         static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
@@ -540,12 +580,19 @@ async fn hid_task(
     // socket 只建一次：mk_static! 是对 StaticCell 做 write，写第二次会 panic，
     // 所以不能像原来那样放在 send_wol() 里面（每次唤醒都重新 mk_static）。
     let mut wol = wol_socket(stack);
+    // Wake 去抖用：上次真正执行 Wake 的时刻
+    let mut last_wake: Option<Instant> = None;
     loop {
         // 电源指令（Blinker / 网页按钮 / BOOT 键）和网页键鼠挤在同一个任务里：
         // USB 的 HidWriter 只有一份，没法再开一个任务各拿一个。
         let cmd = match select(CMD_CHAN.receive(), HID_Q.receive()).await {
             Either::First(c) => c,
             Either::Second(ev) => {
+                if DIAG_NO_HID_OUTPUT {
+                    // 诊断期连网页键鼠也不发，保证整个固件零 HID 输出
+                    dlog!("[diag] HID 事件已禁用: {ev:?}");
+                    continue;
+                }
                 match ev {
                     // 复用电源键原来的键盘 interface（Report ID 1），前面补一个 ID
                     HidEvent::Kbd(r) => send(&mut writer, &[1, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]]).await,
@@ -574,6 +621,16 @@ async fn hid_task(
         match cmd {
             PowerCmd::Wake => {
                 dlog!("[hid] 收到 Wake");
+                // 去抖：GPIO0 抖动或报文重发时，短时间内只响应一次，
+                // 否则会连着往主机灌报告，把总线搞乱。
+                if let Some(t) = last_wake {
+                    if (Instant::now() - t).as_millis() < WAKE_DEBOUNCE_MS {
+                        dlog!("[hid] Wake 去抖，忽略（{WAKE_DEBOUNCE_MS}ms 内重复）");
+                        continue;
+                    }
+                }
+                last_wake = Some(Instant::now());
+
                 // ① 可选：WOL 魔术包（本机默认关闭，走纯 USB）
                 if ENABLE_WOL {
                     send_wol(&mut wol, stack).await;
@@ -582,20 +639,33 @@ async fn hid_task(
                 USB_WAKE.signal(());
                 // 主机恢复总线要几十毫秒，等一会儿再发 HID 报文，否则会写超时
                 Timer::after(Duration::from_millis(120)).await;
-                // ③ 发系统唤醒 + 一个空格键（S0 待机认键盘输入当用户活动）
-                send(&mut writer, &[2, 0x04]).await; // System Wake Up
-                send(&mut writer, &[2, 0x00]).await;
-                Timer::after(Duration::from_millis(60)).await;
+                // ③ 只发一个空格键（S0 待机把键盘输入当用户活动，最保险）
+                //
+                // 原来这里还有一条 `[2, 0x04]` = System Wake Up (0x83)。
+                // 2026-10-25 排查"插上就睡"时把它删了：Windows 事件日志给的
+                // 睡眠原因是 "Button or Lid"，而 0x83 在系统**醒着**时被收到，
+                // 有把主机电源状态搞乱的风险；空格键已经足够唤醒，不需要它。
                 send(&mut writer, &[1, 0x00, 0x00, 0x2C, 0, 0, 0, 0, 0]).await; // Space
                 Timer::after(Duration::from_millis(40)).await;
                 send(&mut writer, &[1, 0, 0, 0, 0, 0, 0, 0, 0]).await; // release
             }
             PowerCmd::Sleep => {
+                if !POWER_REPORT_ENABLE {
+                    dlog!("[hid] System Sleep 报告已被 POWER_REPORT_ENABLE 禁用");
+                    continue;
+                }
+                // 这行日志以前没有，导致 /log 里看不到"是谁把电脑弄睡的"，排查时抓瞎
+                dlog!("[hid] 收到 Sleep -> 发送系统睡眠报告");
                 send(&mut writer, &[2, 0x02]).await; // System Sleep
                 Timer::after(Duration::from_millis(60)).await;
                 send(&mut writer, &[2, 0x00]).await;
             }
             PowerCmd::PowerDown => {
+                if !POWER_REPORT_ENABLE {
+                    dlog!("[hid] System Power Down 报告已被 POWER_REPORT_ENABLE 禁用");
+                    continue;
+                }
+                dlog!("[hid] 收到 PowerDown -> 发送关机报告");
                 send(&mut writer, &[2, 0x01]).await; // System Power Down
                 Timer::after(Duration::from_millis(60)).await;
                 send(&mut writer, &[2, 0x00]).await;
@@ -605,6 +675,13 @@ async fn hid_task(
 }
 
 async fn send(writer: &mut HidWriter<'static, Driver<'static>, 9>, data: &[u8]) {
+    if DIAG_NO_HID_OUTPUT {
+        // 二分诊断第二轮：所有 HID 报告都在这里被拦掉，
+        // 但 Wake 分支里的 USB_WAKE.signal / remote_wakeup_hw 仍然会跑 ——
+        // 就是为了单独验证"裸寄存器发 resume 信号"这条路径有没有问题。
+        dlog!("[diag] 抑制 HID 报告 {:02X?}", data);
+        return;
+    }
     if with_timeout(Duration::from_millis(300), writer.write(data))
         .await
         .is_err()
@@ -734,9 +811,142 @@ fn json_str<'a>(s: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
+/// 把 Blinker 消息解析成电源指令。**只做精确匹配，绝不 contains**。
+///
+/// 历史坑（2026-10-25）：原来这里是 `msg.contains("sleep")` 这种子串判断，
+/// 后果是 MQTT 收到**任何**带 `sleep` 字样的报文（Blinker 的配置下发、属性回显、
+/// 甚至设备名）都会让电脑立刻休眠 —— 表现就是"一插上电脑就黑屏"。
+/// 更糟的是 `power` -> `PowerDown` 那条，而设备名 / 热点名本身就是 `ESP32-POWER`。
+///
+/// 现在只认三种形式：
+///   ① 整条消息就是一个裸词：`sleep`
+///   ② JSON **键名**（Blinker 按钮组件发的 `{"btn-sleep":"tap"}`）
+///   ③ JSON **值**（`{"cmd":"sleep"}`）—— 但值里不认裸 `power`，
+///      只认 `powerdown` / `shutdown`，避免 `{"fromDevice":"power"}` 这种误伤
+///
+/// 键名归一化：去掉 `btn-` / `btn_` 前缀，大小写不敏感。
+fn parse_power_cmd(msg: &str) -> Option<PowerCmd> {
+    // ① 裸词：整条消息就是一个词
+    if let Some(cmd) = cmd_from_word(msg.trim(), true) {
+        return Some(cmd);
+    }
+
+    // ② / ③ 扫 JSON 里的字符串 token，用"后面是否紧跟冒号"区分键名和值
+    let bytes = msg.as_bytes();
+    let mut i = 0;
+    let mut last_key: Option<&str> = None;
+    while i < bytes.len() {
+        if bytes[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut j = start;
+        while j < bytes.len() && bytes[j] != b'"' {
+            j += 1;
+        }
+        if j >= bytes.len() {
+            break;
+        }
+        let token = &msg[start..j];
+        if msg[j + 1..].trim_start().starts_with(':') {
+            // 键名。注意这里有个坑：Blinker **下发组件配置**时，键名同样长成
+            // `{"btn-power":{...}}` 这个样子，和"按下按钮"的 `{"btn-power":"tap"}`
+            // 只差一个值。只认键名的话，一配上 App 就会把电脑关掉。
+            // 所以 btn-* 这种按钮键，必须值真的是 tap / press 才算按下。
+            let after = msg[j + 1..].trim_start();
+            let after = after[1..].trim_start(); // 跳过 ':'
+            let is_button = token
+                .get(..4)
+                .is_some_and(|p| eq_ci(p, "btn-") || eq_ci(p, "btn_"));
+
+            if !is_button || is_press_value(after) {
+                if let Some(cmd) = cmd_from_word(token, true) {
+                    return Some(cmd);
+                }
+            }
+            last_key = Some(token);
+        } else if last_key.is_some_and(is_cmd_field) {
+            // 值：只有键名是公认的指令字段才认，
+            // 否则 `{"mac":"sleep"}` 这种八竿子打不着的值也会把电脑弄睡
+            if let Some(cmd) = cmd_from_word(token, false) {
+                return Some(cmd);
+            }
+        }
+        i = j + 1;
+    }
+    None
+}
+
+/// 哪些键名下的"值"可以当指令看（`{"cmd":"sleep"}` / `{"data":"sleep"}`）。
+fn is_cmd_field(key: &str) -> bool {
+    eq_ci(key, "cmd")
+        || eq_ci(key, "command")
+        || eq_ci(key, "action")
+        || eq_ci(key, "data")
+        || eq_ci(key, "power")
+        || eq_ci(key, "button")
+}
+
+/// 值是不是"按了一下"。Blinker 按键组件被点时发 `{"btn-xxx":"tap"}`。
+///
+/// 只认 tap / press / click 这几种，其余（对象、数字、别的字符串）一律当配置看待。
+fn is_press_value(after_colon: &str) -> bool {
+    let Some(rest) = after_colon.strip_prefix('"') else {
+        return false; // 值是对象 / 数组 / 数字 → 组件配置，不是按键事件
+    };
+    let Some(end) = rest.find('"') else {
+        return false;
+    };
+    let v = &rest[..end];
+    eq_ci(v, "tap") || eq_ci(v, "press") || eq_ci(v, "click")
+}
+
+/// 单个 token -> 指令。
+///
+/// `allow_power` 决定要不要把裸 `power` 当成关机：键名允许
+/// （兼容 App 里已经配好的 `btn-power` 按钮），值不允许。
+fn cmd_from_word(word: &str, allow_power: bool) -> Option<PowerCmd> {
+    let w = word.trim();
+    let w = strip_prefix_ci(w, "btn-")
+        .or_else(|| strip_prefix_ci(w, "btn_"))
+        .unwrap_or(w);
+
+    if eq_ci(w, "wake") {
+        return Some(PowerCmd::Wake);
+    }
+    if eq_ci(w, "sleep") {
+        return Some(PowerCmd::Sleep);
+    }
+    if (allow_power && eq_ci(w, "power"))
+        || eq_ci(w, "powerdown")
+        || eq_ci(w, "power-off")
+        || eq_ci(w, "poweroff")
+        || eq_ci(w, "shutdown")
+    {
+        return Some(PowerCmd::PowerDown);
+    }
+    None
+}
+
+fn strip_prefix_ci<'a>(s: &'a str, p: &str) -> Option<&'a str> {
+    let head = s.get(..p.len())?; // get 而不是直接切片：非字符边界时返回 None 不 panic
+    if eq_ci(head, p) {
+        Some(&s[p.len()..])
+    } else {
+        None
+    }
+}
+
+fn eq_ci(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).all(|(x, y)| x.eq_ignore_ascii_case(&y))
+}
+
 #[embassy_executor::task]
 async fn blinker_task(stack: Stack<'static>) {
     info!("blinker task started");
+    // 冷启动保护的起点：上电后 MQTT_GUARD_MS 内收到的指令一律不执行
+    let boot_guard = Instant::now();
 
     // 缓冲和 socket 只建一次，必须放在重连循环**外面**。
     //
@@ -877,17 +1087,23 @@ async fn blinker_task(stack: Stack<'static>) {
                                 }
                             }
 
-                            // 宽容匹配：消息里含 wake / sleep / power 关键字即可
-                            let lower = msg.to_ascii_lowercase();
-                            if lower.contains("wake") {
-                                info!("-> WAKE");
-                                CMD_CHAN.send(PowerCmd::Wake).await;
-                            } else if lower.contains("sleep") {
-                                info!("-> SLEEP");
-                                CMD_CHAN.send(PowerCmd::Sleep).await;
-                            } else if lower.contains("power") {
-                                info!("-> POWER DOWN");
-                                CMD_CHAN.send(PowerCmd::PowerDown).await;
+                            // 严格匹配：只认精确的键名 / 值，不再做子串包含。
+                            // 见 parse_power_cmd() 的注释 —— 原来的 contains 判断
+                            // 会让任意带 sleep / power 字样的报文把电脑弄睡或关机。
+                            if let Some(cmd) = parse_power_cmd(msg) {
+                                if !MQTT_POWER_ENABLE {
+                                    // 总闸关着：只记日志，绝不执行
+                                    dlog!("[mqtt] 电源控制已关闭，忽略 {cmd:?}（报文: {msg}）");
+                                    warn!("mqtt power disabled, ignore {cmd:?}");
+                                } else if (Instant::now() - boot_guard).as_millis() < MQTT_GUARD_MS {
+                                    // 冷启动保护：上电头几秒 MQTT 来的指令一律不执行
+                                    dlog!("[mqtt] 冷启动保护期内，丢弃指令 {cmd:?}");
+                                    warn!("cold-start guard: drop {cmd:?}");
+                                } else {
+                                    info!("-> {cmd:?}");
+                                    dlog!("[mqtt] 执行指令 {cmd:?}");
+                                    CMD_CHAN.send(cmd).await;
+                                }
                             }
                         }
                         Err(e) => {
@@ -1067,8 +1283,17 @@ async fn main(spawner: Spawner) -> ! {
         peripherals.GPIO0,
         InputConfig::default().with_pull(Pull::Up),
     );
-    spawner
-        .spawn(button_task(button).expect("failed to spawn button task"));
+    if DIAG_NO_HID_OUTPUT {
+        // 第二轮诊断：BOOT 键**重新启用**，但 HID 报告仍然全部抑制（见 send()）。
+        // 这样只有 USB_WAKE.signal -> remote_wakeup / remote_wakeup_hw 这条裸寄存器
+        // 路径是活的，用来验证它是不是让电脑进入 "Button or Lid" 睡眠的元凶。
+        warn!("[diag] BOOT 键已启用（HID 报告仍抑制）");
+        spawner
+            .spawn(button_task(button).expect("failed to spawn button task"));
+    } else {
+        spawner
+            .spawn(button_task(button).expect("failed to spawn button task"));
+    }
 
     // 关键：这里必须**真的让出足够时间**，不能只 yield 一下就继续。
     //

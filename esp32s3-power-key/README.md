@@ -516,6 +516,101 @@ trouble 0.6 在**外设侧**配对时把 `initiator_key_distribution` 初始化�
 
 ---
 
+## 十·五、血案：插上电脑就自己睡（2026-10-25 已修）
+
+### 现象
+
+刷完固件，板子往电脑上一插，电脑黑屏、进入睡眠。唤醒后插上又睡。
+
+### 排查过程（走了两条弯路，记下来别重犯）
+
+**弯路一：以为是 MQTT 关键字匹配。**
+
+原来的代码是子串判断：
+
+```rust
+let lower = msg.to_ascii_lowercase();
+if lower.contains("wake") { ... } else if lower.contains("sleep") { Sleep }
+else if lower.contains("power") { PowerDown }        // 直接关机
+```
+
+这确实是个真 bug（设备名 `ESP32-POWER` 里就带 `power`，一配上网就可能关机），
+但**改严之后问题依旧**。所以它不是本次的主因。
+（修复版现在用 `parse_power_cmd()` 精确匹配 + 5 秒冷启动保护，保留。）
+
+**弯路二：以为是 `remote_wakeup_hw()` 那个裸寄存器 resume。**
+
+`main.rs` 里有段绕过库直接写 OTG 寄存器的代码：
+
+```rust
+regs.dctl().modify(|w| w.set_rwusig(true));   // 硬发 resume 信号
+```
+
+看着很危险，但实验证明它**无罪**（启用它、抑制所有 HID 报告 → 电脑不睡）。
+
+### 怎么一眼看穿是谁干的
+
+**Windows 事件日志自己会记，别再猜**：
+
+```powershell
+Get-WinEvent -FilterHashtable @{LogName='System'; ID=42} -MaxEvents 5 |
+  ForEach-Object { $_.TimeCreated; $_.Message }
+```
+
+事件 **42 = 系统进入睡眠**，Message 里带着**睡眠原因**：
+
+```
+系统正在进入睡眠状态。睡眠原因: Button or Lid
+```
+
+- `Button or Lid` → **电源按钮事件**，也就是 HID System Control 报告
+- `Application API` → 某程序调了 SetSuspendState
+- 事件 **41 (Kernel-Power)** → 掉电 / 硬件保护（供电问题）
+
+这一行就把方向从"程序/网络"直接指到"HID 报告"。
+
+### 真凶：`[2, 0x04]` System Wake Up
+
+Wake 分支原来发三份报告：
+
+```rust
+send(&mut writer, &[2, 0x04]).await; // ← 元凶，System Wake Up (0x83)
+send(&mut writer, &[2, 0x00]).await;
+send(&mut writer, &[1, 0x00, 0x00, 0x2C, 0, 0, 0, 0, 0]).await; // Space
+```
+
+**`0x83` 是 System Wake Up**。Windows 的 HID 驱动把它映射到 ACPI 电源按钮；
+而电脑**本来就是醒着**的时候收到"唤醒"，Windows 判定为"电源按钮被按下"，
+于是执行电源按钮的默认动作 —— **睡眠**。
+
+所以只要 Wake 被执行一次就会睡：BOOT 键抖动、GPIO0 电平误判、MQTT 消息、
+网页 `/wake`，随便哪条都能触发。这也解释了"一插上就黑屏"。
+
+> 关键证据链：删掉 `[2,0x04]`、其他一字不改 → 不睡了。唯一变量。
+
+**`0x04` 已永久删除**。唤醒只靠空格键（`0x2C`），键盘输入会被 Windows 当作
+用户活动，足够把 S0 待机 / 屏保拉回来。
+
+### 现在这三道防线
+
+| 机制 | 位置 | 作用 |
+|---|---|---|
+| `parse_power_cmd()` 精确匹配 | `main.rs` | 不再有子串误伤；`btn-*` 必须值是 `tap`/`press` 才算按下（防组件配置被当成按键） |
+| `MQTT_GUARD_MS = 5_000` | `main.rs` | 上电 5 秒内 MQTT 指令一律丢弃（防 retained 旧消息） |
+| `WAKE_DEBOUNCE_MS = 2000` | `main.rs` | Wake 去抖，防 GPIO0 抖动连发报告把总线搞乱 |
+
+### 随时能拉的两个闸
+
+```rust
+const MQTT_POWER_ENABLE: bool = true;    // false = MQTT 完全不能触发电源动作
+const POWER_REPORT_ENABLE: bool = true;  // false = Sleep/PowerDown 报告一律不发
+const DIAG_NO_HID_OUTPUT: bool = false;  // true  = 零 HID 输出，只枚举
+```
+
+再出怪事就按 `DIAG_NO_HID_OUTPUT = true` 烧一版，然后一个个放开 —— 二分最快。
+
+---
+
 ## 十一、功耗与省电（实测 1.2W → 1.0W）
 
 板子插在 USB 上测，5V 供电。**改前 1.2W（约 240mA），改后稳态 1.0W（约 200mA）**，
