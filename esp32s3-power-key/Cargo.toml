@@ -51,6 +51,8 @@ esp-storage = { version = "0.9.0", features = ["esp32s3"] }
 heapless = "0.9.3"
 static_cell = "2.1.1"
 log = "0.4.34"
+# WebSocket 握手要 SHA1（控制页走 WS 收键鼠），纯 no_std，无 alloc
+sha1 = { version = "0.10", default-features = false }
 
 # ---- LCD：0.96" ST7735S 80x160（T-Dongle-S3 同款接线）----
 mipidsi = { version = "0.10", default-features = false }

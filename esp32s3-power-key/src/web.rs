@@ -1,25 +1,202 @@
-//! 极简 HTTP 服务器（no_std，不引框架）—— 只用来配网和恢复出厂。
+//! 极简 HTTP + WebSocket 服务器（no_std，不引框架）。
 //!
 //! 路由：
-//!   GET /setup                    -> WiFi 配网表单
+//!   GET /                         -> 设置页（WiFi / Blinker / 日志 / 恢复出厂）**主页**
+//!   GET /kvm                      -> 键鼠控制页（虚拟键盘 + 鼠标 + 唤醒按钮）
+//!   GET /ws                       -> WebSocket 升级，之后收键鼠 + 电源指令
 //!   GET /save?ssid=..&pass=..     -> 保存 STA 账号密码（写 flash + 通知 wifi_task）
-//!   GET /status                   -> JSON，给配网页轮询连接结果
+//!   GET /save-blinker?dev=..      -> 保存 Blinker 凭据
+//!   GET /status                   -> JSON，给设置页轮询连接结果
+//!   GET /log                      -> 诊断日志纯文本
+//!   GET /wake | /sleep            -> 电源控制（不用开 WebSocket 的快捷入口）
 //!   GET /factory-reset            -> 恢复出厂设置（清配置区 + 重启）
-//!   其它任何 GET                  -> 也返回配网页面（兜住手机的俘虏门户探测）
 //!
-//! 没有 WebSocket —— 这个项目控制走 Blinker/MQTT，网页只负责配网，所以不需要 sha1 握手。
+//! WebSocket 这块是从 esp32s3-hid-kvm 搬过来的（sha1 握手 + 帧解析），
+//! 因为电源键原来只有 HTTP，不带 WS。
 
 use core::str;
 
 use embassy_net::tcp::TcpSocket;
 use embedded_io_async::Write;
 use heapless::String;
+use sha1::{Digest, Sha1};
 
 use crate::store;
 
+const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const PAGE: &str = include_str!("../index.html");
 const SETUP_PAGE: &str = include_str!("../setup.html");
 
 pub const HTTP_PORT: u16 = 80;
+
+/// 一条连接处理完之后是什么类型
+pub enum Served {
+    /// 已经升级成 WebSocket，调用方接着收键鼠指令
+    WebSocket,
+    /// 返回了一个 HTTP 页面
+    Page,
+}
+
+// ---------------- WebSocket 握手 ----------------
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// SHA1(key + GUID) 再 base64 —— WebSocket 握手的 Sec-WebSocket-Accept
+fn ws_accept(key: &[u8], out: &mut [u8; 28]) {
+    let mut h = Sha1::new();
+    h.update(key);
+    h.update(WS_GUID);
+    let d = h.finalize(); // 20 字节
+
+    let mut i = 0usize;
+    let mut o = 0usize;
+    while i < 20 {
+        let n = if 20 - i >= 3 { 3 } else { 20 - i };
+        let b0 = d[i];
+        let b1 = if n > 1 { d[i + 1] } else { 0 };
+        let b2 = if n > 2 { d[i + 2] } else { 0 };
+        out[o] = B64[(b0 >> 2) as usize];
+        out[o + 1] = B64[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize];
+        out[o + 2] = if n > 1 {
+            B64[(((b1 & 0x0F) << 2) | (b2 >> 6)) as usize]
+        } else {
+            b'='
+        };
+        out[o + 3] = if n > 2 { B64[(b2 & 0x3F) as usize] } else { b'=' };
+        i += 3;
+        o += 4;
+    }
+}
+
+/// 取某个 header 的值。
+///
+/// **必须按"行首 = 名字"精确匹配**，不能用 `find_seq` 在整段请求里搜子串 ——
+/// Chrome 发 WebSocket 握手时 `Connection: Upgrade` 排在 `Upgrade: websocket`
+/// **前面**，子串匹配会先命中前者，取到的不是 header 值，于是 `is_ws` 被判成
+/// false，服务端拿 200 + 21KB 页面去回应 WebSocket 握手，浏览器直接断开。
+fn header_value<'a>(req: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    let mut lines = req.split(|&b| b == b'\n');
+    lines.next()?; // 跳过请求行
+    for raw in lines {
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if line.is_empty() {
+            break; // 空行 = header 结束
+        }
+        if line.len() > name.len()
+            && line[..name.len()].eq_ignore_ascii_case(name)
+            && line[name.len()] == b':'
+        {
+            return Some(line[name.len() + 1..].trim_ascii());
+        }
+    }
+    None
+}
+
+fn build_upgrade<'a>(accept: &'a [u8; 28], out: &'a mut [u8; 200]) -> &'a [u8] {
+    let mut w = Cursor { buf: out, pos: 0 };
+    w.push(b"HTTP/1.1 101 Switching Protocols\r\n");
+    w.push(b"Upgrade: websocket\r\n");
+    w.push(b"Connection: Upgrade\r\n");
+    w.push(b"Sec-WebSocket-Accept: ");
+    w.push(accept);
+    w.push(b"\r\n\r\n");
+    w.done()
+}
+
+// ---------------- WebSocket 帧 ----------------
+
+pub const OP_TEXT: u8 = 0x1;
+pub const OP_CLOSE: u8 = 0x8;
+pub const OP_PING: u8 = 0x9;
+#[allow(dead_code)]
+pub const OP_PONG: u8 = 0xA;
+
+async fn read_all(s: &mut TcpSocket<'_>, buf: &mut [u8]) -> Result<(), ()> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = read_some(s, &mut buf[done..]).await?;
+        done += n;
+    }
+    Ok(())
+}
+
+/// 读一帧。payload 写进 `buf`，返回 (opcode, 长度)。
+/// 客户端发的帧**必须**带 mask，这里做 unmask。
+pub async fn ws_read(s: &mut TcpSocket<'_>, buf: &mut [u8]) -> Result<(u8, usize), ()> {
+    let mut head = [0u8; 2];
+    read_all(s, &mut head).await?;
+
+    let opcode = head[0] & 0x0F;
+    let masked = head[1] & 0x80 != 0;
+    let mut len = (head[1] & 0x7F) as usize;
+
+    if len == 126 {
+        let mut ext = [0u8; 2];
+        read_all(s, &mut ext).await?;
+        len = u16::from_be_bytes(ext) as usize;
+    } else if len == 127 {
+        let mut ext = [0u8; 8];
+        read_all(s, &mut ext).await?;
+        len = u64::from_be_bytes(ext) as usize;
+    }
+
+    let cap = if len < buf.len() { len } else { buf.len() - 1 };
+
+    let mask = if masked {
+        let mut m = [0u8; 4];
+        read_all(s, &mut m).await?;
+        m
+    } else {
+        [0u8; 4]
+    };
+
+    read_all(s, &mut buf[..cap]).await?;
+    if masked {
+        for i in 0..cap {
+            buf[i] ^= mask[i % 4];
+        }
+    }
+    // 超出缓冲的余下字节直接丢掉（控制指令都很短，不会发生）
+    let mut skip = len - cap;
+    let mut tmp = [0u8; 32];
+    while skip > 0 {
+        let n = if skip < 32 { skip } else { 32 };
+        read_all(s, &mut tmp[..n]).await?;
+        skip -= n;
+    }
+
+    Ok((opcode, cap))
+}
+
+/// 发一帧文本（服务端 -> 客户端不需要 mask）
+pub async fn ws_text(s: &mut TcpSocket<'_>, text: &str) -> Result<(), ()> {
+    let b = text.as_bytes();
+    let len = b.len();
+    if len < 126 {
+        let mut head = [0x81u8, len as u8];
+        s.write_all(&mut head).await.map_err(|_| ())?;
+    } else if len < 65536 {
+        let mut head = [0x81u8, 126u8, 0, 0];
+        head[2..].copy_from_slice(&(len as u16).to_be_bytes());
+        s.write_all(&mut head).await.map_err(|_| ())?;
+    } else {
+        return Err(());
+    }
+    // write_all 需要 &mut，b 是共享引用，按块拷一份再发
+    let mut chunk = [0u8; 128];
+    let mut off = 0usize;
+    while off < len {
+        let n = if len - off < 128 { len - off } else { 128 };
+        chunk[..n].copy_from_slice(&b[off..off + n]);
+        s.write_all(&mut chunk[..n]).await.map_err(|_| ())?;
+        off += n;
+    }
+    Ok(())
+}
+
+pub async fn ws_pong(s: &mut TcpSocket<'_>) -> Result<(), ()> {
+    s.write_all(&mut [0x8A, 0x00]).await.map_err(|_| ())
+}
 
 fn find_seq(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.len() > hay.len() {
@@ -114,7 +291,7 @@ fn urldecode(src: &[u8], out: &mut [u8]) -> usize {
     n
 }
 
-fn hex_val(c: u8) -> Option<u8> {
+pub fn hex_val(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),
         b'a'..=b'f' => Some(c - b'a' + 10),
@@ -211,11 +388,11 @@ async fn handle_save(path: &[u8]) -> Option<store::Creds> {
 }
 
 /// 处理一条 TCP 连接
-pub async fn serve_once(socket: &mut TcpSocket<'_>) {
+pub async fn serve_once(socket: &mut TcpSocket<'_>) -> Served {
     let mut buf = [0u8; 2048];
     let n = match read_headers(socket, &mut buf).await {
         Ok(n) => n,
-        Err(_) => return,
+        Err(_) => return Served::Page,
     };
     let req = &buf[..n];
     let path = request_path(req);
@@ -232,7 +409,7 @@ pub async fn serve_once(socket: &mut TcpSocket<'_>) {
         } else {
             let _ = write_html(socket, SAVED_FAIL).await;
         }
-        return;
+        return Served::Page;
     }
 
     // ---- 保存账号密码 ----
@@ -250,35 +427,37 @@ pub async fn serve_once(socket: &mut TcpSocket<'_>) {
                 let _ = write_html(socket, SAVED_FAIL).await;
             }
         }
-        return;
+        return Served::Page;
     }
 
     // ---- 状态查询（配网页轮询用）----
     if find_seq(path, b"/status").is_some() {
         let _ = write_status(socket).await;
-        return;
+        return Served::Page;
     }
 
     // ---- 诊断日志（USB 唤醒排查用）----
     if find_seq(path, b"/log").is_some() {
         let _ = write_log(socket).await;
-        return;
+        return Served::Page;
     }
 
     // ---- 电源控制：唤醒 / 睡眠（热点侧、局域网侧共用）----
+    // 这是「不开 WebSocket 也能按」的快捷入口；控制页顶栏那两个按钮是走 WS 的，
+    // 因为 WS 连着的时候同一个 stack 上接不了第二个 HTTP 请求。
     if find_seq(path, b"/wake").is_some() {
         log::info!("[web] 收到唤醒请求");
         // 先把响应发回去，再去拉总线：唤醒后如果主机重新枚举，这条连接会断，
         // 没发完的话手机上会看到"发送失败"，体验上像没成功。
         let _ = write_html(socket, WAKE_SENT).await;
         crate::request_wake().await;
-        return;
+        return Served::Page;
     }
     if find_seq(path, b"/sleep").is_some() {
         log::info!("[web] 收到睡眠请求");
         let _ = write_html(socket, SLEEP_SENT).await;
         crate::request_sleep().await;
-        return;
+        return Served::Page;
     }
 
     // ---- 恢复出厂设置 ----
@@ -293,8 +472,38 @@ pub async fn serve_once(socket: &mut TcpSocket<'_>) {
         esp_hal::system::software_reset();
     }
 
-    // ---- 其它一切路径都返回配网页 ----
-    let _ = write_html(socket, SETUP_PAGE).await;
+    // ---- 键鼠控制页（不在主页：主页留给配置）----
+    if find_seq(path, b"/kvm").is_some() {
+        let _ = write_html(socket, PAGE).await;
+        return Served::Page;
+    }
+
+    // ---- WebSocket 升级（键鼠 + 电源指令都走这条长连接）----
+    let is_ws = find_seq(path, b"/ws").is_some()
+        && header_value(req, b"Upgrade").map_or(false, |v| v.eq_ignore_ascii_case(b"websocket"));
+
+    if !is_ws {
+        // 其它一切路径（`/`、`/setup`、手机的俘虏门户探测）都返回**设置页**。
+        // 手机连上没有外网的热点时会自己弹"登录到此网络"，落到配置页正是想要的。
+        let _ = write_html(socket, SETUP_PAGE).await;
+        return Served::Page;
+    }
+
+    let key = match header_value(req, b"Sec-WebSocket-Key") {
+        Some(k) => k,
+        None => return Served::Page,
+    };
+
+    let mut accept = [0u8; 28];
+    ws_accept(key, &mut accept);
+
+    let mut resp = [0u8; 200];
+    let body = build_upgrade(&accept, &mut resp);
+    if socket.write_all(body).await.is_err() {
+        return Served::Page;
+    }
+    let _ = socket.flush().await;
+    Served::WebSocket
 }
 
 const WAKE_SENT: &str = "已发送唤醒指令";
