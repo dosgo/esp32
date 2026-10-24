@@ -61,6 +61,10 @@ embedded-storage = "0.3.1"
 # 直接点 SENS 寄存器读片上温度：esp-hal 1.1.2 没给 S3 实现 tsens。
 # 版本必须跟 esp-hal 1.1.2 内部用的一致（0.35.2），否则寄存器类型对不上。
 esp32s3 = "0.35.2"
+# ---- LCD：0.96" ST7735S 80x160（和 power-key 同一块板、同一套接线）----
+mipidsi = { version = "0.10", default-features = false }
+embedded-graphics = "0.8"
+embedded-hal-bus = "0.2"
 heapless = "0.9.3"
 static_cell = "2.1.1"
 log = "0.4.34"

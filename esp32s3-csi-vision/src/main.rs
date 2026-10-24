@@ -26,6 +26,7 @@
 
 mod config;
 mod csi;
+mod lcd;
 mod soc_temp;
 mod store;
 mod web;
@@ -40,6 +41,7 @@ use embassy_net::{
     StaticConfigV4,
     icmp::{IcmpEndpoint, IcmpSocket, PacketMetadata},
     tcp::TcpSocket,
+    udp::{PacketMetadata as UdpMeta, UdpSocket},
 };
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
@@ -144,6 +146,11 @@ static AP_POOL: StaticCell<[u8; POOL]> = StaticCell::new();
 static STA_RES: StaticCell<StackResources<12>> = StaticCell::new();
 static AP_RES: StaticCell<StackResources<12>> = StaticCell::new();
 
+static DNS_RX_META: StaticCell<[UdpMeta; 2]> = StaticCell::new();
+static DNS_RX_BUF: StaticCell<[u8; 384]> = StaticCell::new();
+static DNS_TX_META: StaticCell<[UdpMeta; 2]> = StaticCell::new();
+static DNS_TX_BUF: StaticCell<[u8; 128]> = StaticCell::new();
+
 static PING_RX_META: StaticCell<[PacketMetadata; 2]> = StaticCell::new();
 static PING_RX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
 static PING_TX_META: StaticCell<[PacketMetadata; 2]> = StaticCell::new();
@@ -154,7 +161,11 @@ static PING_TX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
-    esp_alloc::heap_allocator!(size: 128 * 1024);
+    // 堆和主栈共用同一块 DRAM，**堆每加 1KB 主栈就少 1KB**。
+    // 原来是 128KB，加了自激流量的两个任务后直接栈溢出
+    // （stack pointer out of range）。96KB 对 esp-radio（约需 80KB）
+    // + embassy-net 足够，把剩下的让给栈。
+    esp_alloc::heap_allocator!(size: 96 * 1024);
 
     // 160MHz 而不是 240MHz：CSI 的瓶颈在射频不在 CPU
     // （64 路整数开方 × 100Hz，80MHz 都绰绰有余）。
@@ -270,13 +281,28 @@ async fn main(spawner: Spawner) -> ! {
     // 先开一次 CSI —— **AP 模式下也能采数**。
     // 只要浏览器连上热点打开页面，每 10ms 一个的 WebSocket 心跳
     // 就是实打实的下行帧，一样触发 CSI 回调。
-    match controller.set_csi(CsiConfig::default(), csi::on_csi) {
-        Ok(()) => info!("[csi] 已启用（AP 模式即可采数）"),
+    match controller.set_csi(csi_config(), csi::on_csi) {
+        Ok(()) => info!("[csi] 已启用（dump_ack 打开，无客户端也能采数）"),
         Err(e) => warn!("[csi] 预启用失败（等连上 STA 后再试）: {e:?}"),
     }
 
     spawner.spawn(ping_task(stack).expect("spawn ping"));
+    spawner.spawn(dns_trigger_task(stack).expect("spawn dns trigger"));
     spawner.spawn(stat_task(stack).expect("spawn stat"));
+
+    // 0.96" ST7735S：显示 AP 账号密码 / STA IP / 温度 / CSI 帧率。
+    // 放在 WiFi 初始化之后 spawn：屏幕初始化那几十毫秒阻塞不影响射频校准。
+    spawner.spawn(
+        lcd::lcd_task(
+            p.SPI2,
+            p.GPIO10,
+            p.GPIO11,
+            p.GPIO12,
+            p.GPIO13,
+            p.GPIO14,
+        )
+        .expect("spawn lcd"),
+    );
 
     info!(
         "热点 {}  ->  http://{}.{}.{}.{}   配网: /setup",
@@ -324,6 +350,20 @@ fn placeholder_sta() -> StationConfig {
     StationConfig::default()
         .with_ssid("esp32-idle")
         .with_auth_method(AuthenticationMethod::None)
+}
+
+/// CSI 配置。
+///
+/// **必须打开 `dump_ack_en`**：这个 CPE 把 ICMP 全拦了（发出 700 多个 ping，
+/// 回包 0 个），所以「ping 网关拿 echo reply 触发 CSI」这条路走不通。
+/// 打开后，ESP32 自己发数据时收到的 MAC 层 ACK 帧也会上报 CSI ——
+/// ACK 虽然是控制帧、只带 L-LTF，但前导码是完整的，振幅照样能用。
+///
+/// 这样即使没有任何客户端连进来，帧率也不会掉到 0。
+fn csi_config() -> CsiConfig {
+    let mut c = CsiConfig::default();
+    c.dump_ack_en = true;
+    c
 }
 
 // ============================================================
@@ -413,7 +453,7 @@ async fn wifi_task(mut controller: WifiController<'static>, creds: Option<store:
         if connected {
             info!("[wifi] 已连上 {}", c.ssid);
             // 射频重配过，CSI 再设一次最保险
-            let _ = controller.set_csi(CsiConfig::default(), csi::on_csi);
+            let _ = controller.set_csi(csi_config(), csi::on_csi);
 
             // 等断线 / 等新配置
             match select(
@@ -454,6 +494,116 @@ async fn wifi_task(mut controller: WifiController<'static>, creds: Option<store:
 ///
 /// 为什么不用 UDP：UDP 发出去对端不一定回，而 ICMP echo 是必然回的，
 /// 而且是「发一个收一个」的确定节奏，CSI 帧率稳定可预测。
+/// 用 DNS 查询给 CSI 喂流量。
+///
+/// 背景：这个 CPE 把 ICMP 全拦了（发 700 多个 ping，回包 0），
+/// `dump_ack_en` 也不上报 ACK 帧的 CSI，而客户端隔离又让「连自己」失败。
+/// 三条自触发路全断，导致页面一关 CSI 帧率就掉到个位数。
+///
+/// DNS 是第四条路，而且这条一定通：
+///   - DNS 服务器就是网关（DHCP 分配的），路由器**必须**应答 DNS，否则全网没法上网
+///   - 请求路径是「客户端 → 网关」，属于基础转发，**不受客户端隔离影响**
+///     （隔离只拦客户端之间的单播）
+///   - 响应是标准 UDP 数据帧，带完整前导码，CSI 正常上报
+///
+/// 我们不需要解析响应内容，只要它回来触发射频收包就行。
+#[embassy_executor::task]
+async fn dns_trigger_task(stack: Stack<'static>) {
+    let mut sock = UdpSocket::new(
+        stack,
+        DNS_RX_META.init([UdpMeta::EMPTY; 2]),
+        DNS_RX_BUF.init([0; 384]),
+        DNS_TX_META.init([UdpMeta::EMPTY; 2]),
+        DNS_TX_BUF.init([0; 128]),
+    );
+    // 绑 0 = 让协议栈分配临时端口
+    if sock.bind(0).is_err() {
+        error!("[dns] bind 失败，CSI 没有触发流量");
+        return;
+    }
+
+    // 最小 DNS 查询：查 "a.cn" 的 A 记录。查不存在/存在的域名都行，
+    // 服务器总要回一个响应（答案或 NXDOMAIN），我们要的只是这个响应包。
+    const QUERY: [u8; 22] = [
+        0xAB, 0xCD, // ID
+        0x01, 0x00, // Flags: RD
+        0x00, 0x01, // QDCOUNT = 1
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // AN / NS / AR
+        0x01, b'a', 0x02, b'c', b'n', 0x00, // QNAME = a.cn
+        0x00, 0x01, // QTYPE  = A
+        0x00, 0x01, // QCLASS = IN
+    ];
+
+    let mut sent: u32 = 0;
+    let mut recvd: u32 = 0;
+    let mut reported = false;
+    let mut report = Instant::now();
+    let mut last_sent: u32 = 0;
+    // 按「绝对节拍」调度，而不是每轮固定 sleep：
+    // send + 等响应本身要花 1~4ms，固定 sleep 20ms 会让实际周期变成 22~24ms，
+    // 速率就飘了。用 next 累加目标时刻，落后了才补齐。
+    let mut next = Instant::now();
+
+    loop {
+        let dns = match stack.config_v4() {
+            Some(c) => c.dns_servers.first().copied(),
+            None => None,
+        };
+        let Some(dns) = dns else {
+            Timer::after(Duration::from_secs(1)).await;
+            next = Instant::now();
+            continue;
+        };
+
+        if sock.send_to(&QUERY, (dns, 53)).await.is_ok() {
+            sent += 1;
+        }
+
+        // 等响应。只要收到就说明射频收到了数据帧，CSI 已经触发，
+        // 内容直接丢掉不做解析。
+        if let Ok(true) = with_timeout(
+            Duration::from_millis(4),
+            sock.recv_from_with(|_d, _m| true),
+        )
+        .await
+        {
+            recvd += 1;
+        }
+
+        if report.elapsed() >= Duration::from_secs(4) {
+            // 用真实窗口宽度算速率，而不是拿配置值充数
+            let ms = report.elapsed().as_millis() as u32;
+            let hz = if ms > 0 {
+                sent.wrapping_sub(last_sent) * 1000 / ms
+            } else {
+                0
+            };
+            last_sent = sent;
+            report = Instant::now();
+            info!(
+                "[dns] 发出 {} / 收到 {}（实测 {} Hz，目标 {} Hz）",
+                sent,
+                recvd,
+                hz,
+                1000 / config::DNS_INTERVAL_MS
+            );
+            if sent > 20 && recvd == 0 && !reported {
+                reported = true;
+                warn!("[dns] 发了很多查询但没响应：路由器可能不是 DNS 服务器");
+            }
+        }
+
+        next += Duration::from_millis(config::DNS_INTERVAL_MS);
+        let now = Instant::now();
+        if next > now {
+            Timer::after(next - now).await;
+        } else {
+            // 落后太多就重新对齐，不追债（否则会连发一串补上）
+            next = now;
+        }
+    }
+}
+
 #[embassy_executor::task]
 async fn ping_task(stack: Stack<'static>) {
     let mut sock = IcmpSocket::new(
@@ -470,26 +620,60 @@ async fn ping_task(stack: Stack<'static>) {
 
     let payload = [0x5au8; 32];
     let mut next = Instant::now();
+    let mut sent: u32 = 0;
+    let mut failed: u32 = 0;
+    let mut recvd: u32 = 0;
+    let mut no_gw: u32 = 0;
+    let mut report = Instant::now();
 
     loop {
-        let gw = match stack.config_v4().and_then(|c| c.gateway) {
-            Some(g) => g,
-            None => {
-                // DHCP 还没完成（或者根本没配网）
-                Timer::after(Duration::from_millis(500)).await;
-                next = Instant::now();
-                continue;
-            }
+        let gw = match stack.config_v4() {
+            Some(c) => c.gateway,
+            None => None,
         };
 
-        let _ = sock.send_to(&payload, IpAddress::Ipv4(gw)).await;
-        // 顺手把回包读掉：echo reply 本身就是触发 CSI 的那个包，
-        // 不读的话 rx 队列会堆满，smoltcp 之后会开始丢。
-        let _ = with_timeout(
+        let Some(gw) = gw else {
+            no_gw += 1;
+            if no_gw == 1 || no_gw % 20 == 0 {
+                // 第一次和之后每 20 次打一行，别刷屏
+                match stack.config_v4() {
+                    Some(c) => warn!("[ping] 配置存在但没有网关: {:?}", c),
+                    None => warn!("[ping] 还没拿到 DHCP 配置"),
+                }
+            }
+            Timer::after(Duration::from_millis(500)).await;
+            next = Instant::now();
+            continue;
+        };
+
+        match sock.send_to(&payload, IpAddress::Ipv4(gw)).await {
+            Ok(()) => sent += 1,
+            Err(_) => failed += 1,
+        }
+        // 收 echo reply：这既是「网关到底回不回」的判据，
+        // 也顺手清空 rx 队列（不读的话 smoltcp 之后会开始丢）。
+        if let Ok(Ok(_)) = with_timeout(
             Duration::from_millis(2),
             sock.recv_from_with(|(_, _)| ()),
         )
-        .await;
+        .await
+        {
+            recvd += 1;
+        }
+
+        if report.elapsed() >= Duration::from_secs(4) {
+            report = Instant::now();
+            info!(
+                "[ping] gw={} 发出 {} / 发出失败 {} / 收到回包 {} / 无网关 {}",
+                gw, sent, failed, recvd, no_gw
+            );
+            if sent > 20 && recvd == 0 {
+                warn!("[ping] 包发出去了但一个回包都没收到：网关禁 ICMP，CSI 拿不到触发流量");
+            }
+            if failed > 0 && sent > 0 && failed * 2 > sent {
+                warn!("[ping] 一半以上发不出去，路由器可能禁 ICMP 或 limit 了速率");
+            }
+        }
 
         next += Duration::from_millis(config::PING_INTERVAL_MS);
         let now = Instant::now();
@@ -525,16 +709,22 @@ async fn stat_task(stack: Stack<'static>) {
         STA_RSSI.store(csi::LAST_RSSI.load(Ordering::Relaxed), Ordering::Relaxed);
 
         // --- 芯片温度 ---
-        // 两种换算差 27.88℃，这里都打出来，用「手摸板子烫不烫」来判断哪个对。
-        let mut temp_note = heapless::String::<48>::new();
+        let mut temp_note = heapless::String::<24>::new();
         if let Some(raw) = soc_temp::read_raw() {
             let a = soc_temp::celsius_x10(raw);
-            let b = soc_temp::celsius_alt_x10(raw);
             TEMP_X10.store(a, Ordering::Relaxed);
             let _ = core::fmt::Write::write_fmt(
                 &mut temp_note,
-                format_args!("raw={} idf={}.{}C alt={}.{}C", raw, a / 10, a % 10, b / 10, b % 10),
+                format_args!("{}.{} ℃", a / 10, a % 10),
             );
+            // 开机第一次把 raw 和两套换算都打出来备查（对照 power-key 用）
+            if tick == 0 {
+                info!(
+                    "[temp] raw={} → IDF {}.{}℃ / alt {}.{}℃（alt 已证伪，仅参考）",
+                    raw, a / 10, a % 10,
+                    soc_temp::celsius_alt_x10(raw) / 10, soc_temp::celsius_alt_x10(raw) % 10
+                );
+            }
         }
 
         // --- CSI 帧率 ---
@@ -544,7 +734,6 @@ async fn stat_task(stack: Stack<'static>) {
         tick += 1;
 
         let ip = STA_IP.load(Ordering::Relaxed).to_be_bytes();
-        let temp = TEMP_X10.load(Ordering::Relaxed);
         info!(
             "[csi] {:>4} 帧/秒 | rssi {:>4} | {} 路子载波 | {} | IP {}.{}.{}.{}",
             fps,
