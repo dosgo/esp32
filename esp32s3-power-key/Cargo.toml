@@ -42,7 +42,41 @@ esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
 # 不锁的话 cargo 会解出 1.2 然后两边打架
 esp-hal = { version = "=1.1.2", features = ["esp32s3", "unstable"] }
 esp-println = { version = "0.17.0", features = ["esp32s3", "log-04"] }
-esp-radio = { version = "0.18.0", features = ["esp32s3", "wifi"] }
+# ble + coex：S3 的 Wi-Fi 与 BLE 共用一个射频，必须同时开 coex 才能并行跑
+# unstable 是拿到 `ble::controller::BleConnector`（HCI 通道）的前置
+esp-radio = { version = "0.18.0", features = [
+    "esp32s3",
+    "wifi",
+    "ble",
+    "coex",
+    "unstable",
+] }
+# BLE 主机协议栈（纯 Rust，no_std）。0.6.0 依赖 bt-hci 0.8，
+# 正好是 esp-radio 0.18 内置的那个版本，类型能直接对接。
+# 不要 central/scan：这版只做外设（被手机连），省 flash 也省 RAM
+trouble-host = { version = "0.6.0", default-features = false, features = [
+    "peripheral",
+    "gatt",
+    "derive",
+    # 安卓/iOS 连 HID 会强制走 SMP 配对，不开这个就卡在「正在配对」
+    "security",
+    # 让 trouble 内部的 error!/warn! 真的被编进来（走 main.rs 的环形 logger，
+    # 没这行它内部的错误全都是空调用，排查配对问题时抓瞎）
+    "log",
+    "default-packet-pool",
+    # 包池 8 包 × 251 字节。**MTU 不能压到 64**：
+    # SMP 配对（Secure Connections 的 P-256 公钥）单个 PDU 要 65 字节，
+    # 64 的 MTU 会让 trouble 直接报 `InsufficientSpace`，
+    # 现象就是手机一直卡在「正在配对」。
+    "default-packet-pool-size-8",
+    "default-packet-pool-mtu-251",
+] }
+bt-hci = "0.8"
+# trouble 0.6 内部用的是 embassy-sync 0.7，而本工程主体是 0.8。
+# GATT 属性表的锁类型必须和 trouble 那一份对上，所以单独引一个 0.7 改个名字。
+embassy-sync-07 = { package = "embassy-sync", version = "0.7" }
+# 给 trouble 的 security manager 播种 CSPRNG（版本要和 trouble 用的 0.6 一致）
+rand_core = "0.6"
 esp-rtos = { version = "0.3.0", features = ["esp32s3", "embassy", "esp-radio"] }
 # 热点模式必须自己跑 DHCP：embassy-net 只有客户端，没有服务端
 esp-hal-dhcp-server = "0.4.3"
@@ -62,3 +96,9 @@ embedded-hal-bus = "0.2"
 [profile.release]
 opt-level = "s"
 codegen-units = 1
+
+# vendor 了一份 trouble-host（见 vendor/trouble-host），只为一处补丁：
+# 外设侧配对时主动索取对方的 IRK，否则手机轮换随机地址后重连必然 Authentication Failure。
+# 上游修好之后把这段删掉、改回 registry 版本即可。
+[patch.crates-io]
+trouble-host = { path = "vendor/trouble-host" }

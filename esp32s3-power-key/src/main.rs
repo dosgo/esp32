@@ -15,6 +15,7 @@
 #![no_std]
 #![no_main]
 
+mod ble;
 mod dns;
 mod hid;
 mod lcd;
@@ -147,6 +148,7 @@ static USB_WAKE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 // 键盘**复用**原来那个 boot 6KRO 接口（Report ID 1），所以这里存的是 8 字节
 // 裸报告（mod + 保留 + 6 键），写的时候前面补一个 0x01。
 
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum HidEvent {
     /// boot 键盘报告 8 字节：[mod, 0, k1..k6]
     Kbd([u8; 8]),
@@ -243,10 +245,15 @@ macro_rules! dlog {
 }
 
 /// 队列满就丢一帧（鼠标位移丢一帧无所谓，不能让整条队列把键盘堵住）
+///
+/// 同时喂两路：USB（HID_Q）和 BLE（ble::BLE_Q）。
+/// 两个队列各自独立限深，蓝牙断了也不影响 USB 那条老路。
 fn push_hid(ev: HidEvent) {
     if HID_Q.try_send(ev).is_err() {
         dlog!("[hid] 队列满，丢一帧");
     }
+    // 蓝牙没连上时事件没人取，队列满了直接丢，不打扰 USB
+    let _ = ble::BLE_Q.try_send(ev);
 }
 
 /// 松开所有键：切窗口 / 断开连接 / 点「释放所有键」都走这里，防卡键。
@@ -837,14 +844,67 @@ async fn blinker_task(stack: Stack<'static>) {
     }
 }
 
+/// 把 `log` 的记录也塞进 `/log` 环形缓冲。
+///
+/// 为什么需要：这块板子的 USB-Serial-JTAG 一被 OTG 接管，串口日志就彻底没了，
+/// 而 trouble（蓝牙协议栈）和 esp-radio 的关键错误都是走 `log` 的 error!/warn!，
+/// 不接过来就完全看不见 —— 排查配对失败时就是这么卡住的。
+///
+/// 只收：target 以 trouble 开头的（蓝牙协议栈内部）、以及所有 Warn 及以上的。
+/// 其余（esp-hal 的 debug 之类）丢掉，否则 48 行的环形缓冲瞬间被刷没了。
+struct RingLogger;
+
+impl log::Log for RingLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.target().starts_with("trouble")
+            || metadata.level() <= log::Level::Warn
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        // 只留 target 的最后一段，省字符（一行只有 96 字节）
+        let target = record.target().rsplit("::").next().unwrap_or("log");
+        // 开机头几秒 USB-Serial-JTAG 还没被 OTG 抢走，串口能同步看到一份
+        esp_println::println!("[{}/{}] {}", target, record.level().as_str(), record.args());
+        push_log(format_args!(
+            "[{}/{}] {}",
+            target,
+            record.level().as_str(),
+            record.args()
+        ));
+    }
+
+    fn flush(&self) {}
+}
+
+static RING_LOGGER: RingLogger = RingLogger;
+
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
-    esp_println::logger::init_logger_from_env();
+    // 注意：不要再调 esp_println::logger::init_logger_from_env()。
+    // 它内部会 set_logger 占住全局位置，我们的环形 logger 就装不上了。
+    let _ = log::set_logger(&RING_LOGGER);
+    log::set_max_level(log::LevelFilter::Info);
 
-    esp_alloc::heap_allocator!(size: 100 * 1024);
+    // 内部 DRAM 堆。这块是 .bss 里的静态数组，**加多了会直接链接失败**，
+    // 而且链接脚本里主栈就是 RWDATA 剩下的空间 —— 堆每加 1KB，主栈少 1KB。
+    // 现在能定到 128KB，是因为网页收发缓冲（32KB）已经挪到 PSRAM（见下面）。
+    esp_alloc::heap_allocator!(size: 128 * 1024);
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
+
+    // PSRAM（板载 8MB OPI）也挂进全局堆，但只带 External 能力位。
+    // esp-radio 的 Wi-Fi / 蓝牙分配走 `malloc_internal`（限内部 RAM），
+    // 所以永远拿不到 PSRAM —— 这正是我们要的：**PSRAM 只装普通数据**。
+    esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
+    info!(
+        "[psram] 就绪，PSRAM 可用 {} B，内部堆 {} B",
+        esp_alloc::HEAP.free_caps(esp_alloc::MemoryCapability::External.into()),
+        esp_alloc::HEAP.free_caps(esp_alloc::MemoryCapability::Internal.into()),
+    );
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
@@ -1067,18 +1127,19 @@ async fn main(spawner: Spawner) -> ! {
     //     .expect("failed to spawn lcd task"),
     //     );
 
-    // 每个网起 WEB_SESSIONS 个网页会话任务（各自一个监听 socket + 一块 2KB×2 缓冲）
+    // 每个网起 WEB_SESSIONS 个网页会话任务（各自一个监听 socket + 一块 2KB×2 缓冲）。
+    // 缓冲从 PSRAM 里一次性取 16KB（两个网共 32KB），内部 DRAM 一字节都不占。
     spawn_web_sessions(
         spawner,
         ap_stack,
         "AP",
-        AP_WEB_BUF.init([[0u8; WEB_BUF]; WEB_SESSIONS * 2]),
+        AP_WEB_BUF.init(alloc_psram_buf(WEB_BUF * WEB_SESSIONS * 2)),
     );
     spawn_web_sessions(
         spawner,
         stack,
         "STA",
-        STA_WEB_BUF.init([[0u8; WEB_BUF]; WEB_SESSIONS * 2]),
+        STA_WEB_BUF.init(alloc_psram_buf(WEB_BUF * WEB_SESSIONS * 2)),
     );
 
     // 热点侧必须自带 DHCP + 假 DNS，否则手机连上会"无互联网"然后断开
@@ -1093,6 +1154,11 @@ async fn main(spawner: Spawner) -> ! {
         .spawn(status_task(stack).expect("failed to spawn status task"));
     spawner
         .spawn(blinker_task(stack).expect("failed to spawn blinker task"));
+
+    // BLE 可行性验证：Wi-Fi 起来之后再初始化蓝牙控制器（S3 单射频，靠 coex 共存）。
+    // 这一版只广播 + 接受连接，还没有 HID 服务；失败也不影响 USB/Wi-Fi。
+    spawner
+        .spawn(ble::ble_task(peripherals.BT).expect("failed to spawn ble task"));
 
     println!("USB HID ready. Plug USB(GPIO19/20) into the PC.");
     println!(
@@ -1307,10 +1373,29 @@ const WEB_SESSIONS: usize = 4;
 /// 24KB 的页面靠 write_all 分片发，局域网里感觉不到差别。
 const WEB_BUF: usize = 2048;
 
-static AP_WEB_BUF: static_cell::StaticCell<[[u8; WEB_BUF]; WEB_SESSIONS * 2]> =
-    static_cell::StaticCell::new();
-static STA_WEB_BUF: static_cell::StaticCell<[[u8; WEB_BUF]; WEB_SESSIONS * 2]> =
-    static_cell::StaticCell::new();
+/// 每个网要 `WEB_SESSIONS × 2` 块缓冲，两个网共 32KB。
+/// 这 32KB 现在从 **PSRAM** 里出：smoltcp 只是拿它当字节数组读写，
+/// 不碰 DMA、不放原子量，所以放外部 RAM 完全没问题（省下来的内部 DRAM
+/// 全部让给蓝牙控制器和主栈）。
+static AP_WEB_BUF: static_cell::StaticCell<&'static mut [u8]> = static_cell::StaticCell::new();
+static STA_WEB_BUF: static_cell::StaticCell<&'static mut [u8]> = static_cell::StaticCell::new();
+
+/// 从 PSRAM 分配一块普通数据缓冲，PSRAM 不可用时退回内部堆。
+fn alloc_psram_buf(len: usize) -> &'static mut [u8] {
+    unsafe {
+        let layout = core::alloc::Layout::from_size_align_unchecked(len, 4);
+        let mut p =
+            esp_alloc::HEAP.alloc_caps(esp_alloc::MemoryCapability::External.into(), layout);
+        if p.is_null() {
+            dlog!("[psram] 分配 {}B 失败，退回内部堆", len);
+            p = esp_alloc::HEAP.alloc_caps(esp_alloc::MemoryCapability::Internal.into(), layout);
+        }
+        assert!(!p.is_null(), "网页缓冲分配失败");
+        let s = core::slice::from_raw_parts_mut(p, len);
+        s.fill(0);
+        s
+    }
+}
 
 /// 当前活着的 WebSocket 条数（两套栈共享）。
 ///
@@ -1322,13 +1407,13 @@ static WS_CLIENTS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::
 async fn web_task(
     stack: Stack<'static>,
     tag: &'static str,
-    rx: &'static mut [u8; WEB_BUF],
-    tx: &'static mut [u8; WEB_BUF],
+    rx: &'static mut [u8],
+    tx: &'static mut [u8],
 ) {
     web_server(stack, tag, rx, tx).await;
 }
 
-/// 把一块 buffer 切一半当 rx、一半当 tx，然后起 `WEB_SESSIONS` 个会话任务。
+/// 把一块缓冲切成 2×`WEB_SESSIONS` 份（前一半 rx、后一半 tx），然后起 `WEB_SESSIONS` 个会话任务。
 ///
 /// 注意 buffer 必须由调用方传进来：`mk_static!` 展开成函数内的 static，
 /// 这个函数会被 AP / STA 各调一次，函数内 static 只有一份，第二次写必 panic。
@@ -1336,12 +1421,20 @@ fn spawn_web_sessions(
     spawner: Spawner,
     stack: Stack<'static>,
     tag: &'static str,
-    buf: &'static mut [[u8; WEB_BUF]; WEB_SESSIONS * 2],
+    buf: &'static mut [u8],
 ) {
-    let (rx, tx) = buf.split_at_mut(WEB_SESSIONS);
-    for (r, t) in rx.iter_mut().zip(tx.iter_mut()) {
+    debug_assert_eq!(buf.len(), WEB_BUF * WEB_SESSIONS * 2);
+    // 一遍 split_at_mut 把缓冲切成 2×WEB_SESSIONS 块。
+    // 不能用 `&mut rx[i*WEB_BUF..]`：那样每轮都重新借一次 `*rx`，
+    // 而 spawn 要求 'static，借用检查器会拦（E0499）。
+    let (mut rest_rx, mut rest_tx) = buf.split_at_mut(WEB_BUF * WEB_SESSIONS);
+    for _ in 0..WEB_SESSIONS {
+        let (r, r2) = rest_rx.split_at_mut(WEB_BUF);
+        let (t, t2) = rest_tx.split_at_mut(WEB_BUF);
         spawner
             .spawn(web_task(stack, tag, r, t).expect("failed to spawn web session"));
+        rest_rx = r2;
+        rest_tx = t2;
     }
 }
 
@@ -1352,8 +1445,8 @@ fn spawn_web_sessions(
 async fn web_server(
     stack: Stack<'static>,
     tag: &'static str,
-    rx: &'static mut [u8; WEB_BUF],
-    tx: &'static mut [u8; WEB_BUF],
+    rx: &'static mut [u8],
+    tx: &'static mut [u8],
 ) {
     let mut socket = TcpSocket::new(stack, rx, tx);
 

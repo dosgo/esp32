@@ -256,3 +256,94 @@ pub fn save_blinker(f: &mut FlashStorage<'_>, c: &BlinkerCreds) -> bool {
     }
     true
 }
+
+// =============== BLE 配对信息（bond） ===============
+//
+// 为什么必须存：手机配对后会记住这把 LTK，重连时要求链路加密。
+// 板子一断电就忘了密钥的话，手机上还留着旧的配对记录，
+// 结果就是「永远连不上，必须在手机里忘记设备再重配」。
+//
+// 只支持一台主机（这正是我们要的：一块 dongle 对着手机/平板用）。
+// 占配置区第三块扇区（0xB000）。
+
+pub const BOND_FLASH_ADDR: u32 = CREDS_FLASH_ADDR + 2 * FlashStorage::SECTOR_SIZE;
+
+/// 一条配对记录
+#[derive(Clone, Copy, Default)]
+pub struct BondRec {
+    /// 长密钥（LE Secure Connections 派生的 LTK）
+    pub ltk: [u8; 16],
+    /// 对方地址
+    pub addr: [u8; 6],
+    /// 地址类型（0 = public，1 = random）
+    pub kind: u8,
+    /// 对方的 IRK（用来解析轮换后的随机地址）
+    pub irk: Option<[u8; 16]>,
+    /// 安全等级：0 未加密 / 1 加密 / 2 加密+认证
+    pub level: u8,
+}
+
+/// 布局：[0..4] magic [4] 版本 [5] level [6] kind [7] has_irk [8..24] ltk
+///       [24..30] addr [30..46] irk（没有就全 0） [46] 校验和
+pub fn load_bond(f: &mut FlashStorage<'_>) -> Option<BondRec> {
+    let mut b = Buf([0; 128]);
+    if ReadNorFlash::read(f, BOND_FLASH_ADDR, &mut b.0).is_err() {
+        return None;
+    }
+    if u32::from_le_bytes([b.0[0], b.0[1], b.0[2], b.0[3]]) != MAGIC {
+        return None;
+    }
+    let mut sum: u8 = 0;
+    for i in 0..46 {
+        sum = sum.wrapping_add(b.0[i]);
+    }
+    if sum != b.0[46] {
+        return None;
+    }
+
+    let mut r = BondRec {
+        ltk: [0; 16],
+        addr: [0; 6],
+        kind: b.0[6],
+        irk: None,
+        level: b.0[5],
+    };
+    r.ltk.copy_from_slice(&b.0[8..24]);
+    r.addr.copy_from_slice(&b.0[24..30]);
+    if b.0[7] != 0 {
+        let mut irk = [0u8; 16];
+        irk.copy_from_slice(&b.0[30..46]);
+        r.irk = Some(irk);
+    }
+    Some(r)
+}
+
+pub fn save_bond(f: &mut FlashStorage<'_>, r: &BondRec) -> bool {
+    let mut b = Buf([0u8; 128]);
+    b.0[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+    b.0[4] = 1; // 版本
+    b.0[5] = r.level;
+    b.0[6] = r.kind;
+    b.0[7] = if r.irk.is_some() { 1 } else { 0 };
+    b.0[8..24].copy_from_slice(&r.ltk);
+    b.0[24..30].copy_from_slice(&r.addr);
+    if let Some(irk) = r.irk {
+        b.0[30..46].copy_from_slice(&irk);
+    }
+    let mut sum: u8 = 0;
+    for i in 0..46 {
+        sum = sum.wrapping_add(b.0[i]);
+    }
+    b.0[46] = sum;
+
+    let sector = FlashStorage::SECTOR_SIZE;
+    if NorFlash::erase(f, BOND_FLASH_ADDR, BOND_FLASH_ADDR + sector).is_err() {
+        warn!("[store] bond 扇区擦除失败");
+        return false;
+    }
+    if NorFlash::write(f, BOND_FLASH_ADDR, &b.0).is_err() {
+        warn!("[store] bond 写入失败");
+        return false;
+    }
+    true
+}
