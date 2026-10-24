@@ -283,6 +283,10 @@ pub static NET: Mutex<CriticalSectionRawMutex, NetInfo> = Mutex::new(NetInfo {
 /// 所以丢进这个全局盒子给 web / 按键任务用。
 pub static FLASH: Mutex<CriticalSectionRawMutex, Option<FlashStorage<'static>>> = Mutex::new(None);
 
+/// flash 里有没有蓝牙配对信息。
+/// 给设置页显示用，避免每次轮询 /status 都去读 flash（读一次也行，但没必要）。
+pub static BOND_PRESENT: AtomicBool = AtomicBool::new(false);
+
 /// 运行时生效的 Blinker 凭据。优先用 flash 里存的（网页可改），
 /// 没存过就回退到下面那几个编译期常量。
 pub static BLINKER_CFG: Mutex<CriticalSectionRawMutex, store::BlinkerCreds> =
@@ -360,6 +364,23 @@ pub async fn request_wake() {
 pub async fn request_sleep() {
     dlog!("[web] 请求 Sleep");
     CMD_CHAN.send(PowerCmd::Sleep).await;
+}
+
+/// 只清蓝牙配对（WiFi / Blinker 保留），返回是否成功。
+/// 清完由调用方负责重启 —— 协议栈里的 bond 只在内存里，不重启是清不干净的。
+pub async fn clear_bond_flash() -> bool {
+    let ok = {
+        let mut g = FLASH.lock().await;
+        match g.as_mut() {
+            Some(f) => store::clear_bond(f),
+            None => false,
+        }
+    };
+    if ok {
+        BOND_PRESENT.store(false, Ordering::Relaxed);
+        dlog!("[web] 蓝牙配对已清空（需重启生效）");
+    }
+    ok
 }
 
 /// 恢复出厂：擦掉整个配置区（WiFi 账号密码 + 将来所有持久化设置）

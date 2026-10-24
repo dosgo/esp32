@@ -347,3 +347,14 @@ pub fn save_bond(f: &mut FlashStorage<'_>, r: &BondRec) -> bool {
     }
     true
 }
+
+/// 只清掉蓝牙配对信息（保留 WiFi / Blinker 配置）。
+/// 擦完重启，协议栈里的内存 bond 也就一起没了。
+pub fn clear_bond(f: &mut FlashStorage<'_>) -> bool {
+    let sector = FlashStorage::SECTOR_SIZE;
+    if NorFlash::erase(f, BOND_FLASH_ADDR, BOND_FLASH_ADDR + sector).is_err() {
+        warn!("[store] 清空蓝牙配对失败");
+        return false;
+    }
+    true
+}

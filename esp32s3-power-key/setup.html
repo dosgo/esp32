@@ -113,6 +113,20 @@
   </div>
 
   <div class="card cborder">
+    <div style="font-size:14px;font-weight:500;margin-bottom:6px">蓝牙配对（手机 / 平板键鼠）</div>
+    <div class="tip" style="margin-top:0;margin-bottom:10px">
+      这块 dongle 现在同时是蓝牙键鼠，配对一台手机/平板之后，<br>
+      用 <b>/kvm</b> 页面敲的键就会同时发给电脑（USB）和手机（BLE）。
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+      <span style="color:#889099">当前配对：</span>
+      <span id="s-bond" class="dim">-</span>
+    </div>
+    <a class="danger" href="/clear-bond"
+       onclick="return confirm('清空蓝牙配对？\n\n板子会忘掉已配对的设备并重启。WiFi 和 Blinker 配置不受影响。\n\n注意：手机里也要「忘记 ESP32-POWER-BLE」，否则再连会一直认证失败。')">清空蓝牙配对</a>
+  </div>
+
+  <div class="card cborder">
     <div style="font-size:14px;font-weight:500;margin-bottom:6px">恢复出厂设置</div>
     <div class="tip" style="margin-top:0;margin-bottom:12px">
       清掉所有已保存的 WiFi，重启后只剩热点 ESP32-POWER / power1234。<br>
@@ -143,6 +157,11 @@ function refresh(){
     else { er.style.display = 'none'; }
     var bd = document.getElementById('s-bdev');
     if (d.bdev) { bd.textContent = d.bdev; bd.className = 'ok'; }
+    var bo = document.getElementById('s-bond');
+    if (bo) {
+      if (d.bond === true)  { bo.textContent = '已配对 1 台'; bo.className = 'ok'; }
+      else if (d.bond === false) { bo.textContent = '没有配对'; bo.className = 'dim'; }
+    }
   }).catch(function(){});
 }
 refresh();

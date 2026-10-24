@@ -9,6 +9,7 @@
 //!   GET /status                   -> JSON，给设置页轮询连接结果
 //!   GET /log                      -> 诊断日志纯文本
 //!   GET /wake | /sleep            -> 电源控制（不用开 WebSocket 的快捷入口）
+//!   GET /clear-bond               -> 只清蓝牙配对（WiFi/Blinker 保留）+ 重启
 //!   GET /factory-reset            -> 恢复出厂设置（清配置区 + 重启）
 //!
 //! WebSocket 这块是从 esp32s3-hid-kvm 搬过来的（sha1 握手 + 帧解析），
@@ -460,6 +461,27 @@ pub async fn serve_once(socket: &mut TcpSocket<'_>) -> Served {
         return Served::Page;
     }
 
+    // ---- 清空蓝牙配对（不动 WiFi / Blinker）----
+    //
+    // 必须重启：trouble 的 bond 在内存里还有一份，光擦 flash 不重启的话，
+    // 当前这条连接还能继续用，只有重新上电才会真的"忘掉"。
+    if find_seq(path, b"/clear-bond").is_some() {
+        log::warn!("[web] 收到清空蓝牙配对请求");
+        let ok = crate::clear_bond_flash().await;
+        let _ = write_html(
+            socket,
+            if ok {
+                BOND_CLEARED
+            } else {
+                BOND_CLEAR_FAILED
+            },
+        )
+        .await;
+        // 先把页面发出去，再重启
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(600)).await;
+        esp_hal::system::software_reset();
+    }
+
     // ---- 恢复出厂设置 ----
     if find_seq(path, b"/factory-reset").is_some() {
         log::warn!("[web] 收到恢复出厂设置请求");
@@ -531,6 +553,22 @@ const SAVED_FAIL: &str = "<!doctype html><meta charset=utf-8>\
 <p>可能是名字太长（最多 32 字符）或密码太长（最多 64 字符）。</p>\
 <p><a href='/setup' style='color:#40c8e0'>返回重填</a></p>";
 
+const BOND_CLEARED: &str = "<!doctype html><meta charset=utf-8>\
+<meta name=viewport content='width=device-width,initial-scale=1'>\
+<title>蓝牙配对已清空</title><body style='font:16px system-ui;background:#0c1016;color:#e8eef7;padding:24px'>\
+<h2 style='color:#3ad06a'>蓝牙配对已清空，正在重启…</h2>\
+<p>WiFi 和 Blinker 配置都还在，只擦掉了配对信息。</p>\
+<p style='color:#f0b040'><b>手机上还要做一步</b>：手机里仍然记着这台设备，\
+必须先「忘记 / 取消配对」<b>ESP32-POWER-BLE</b>，否则重连会一直 Authentication Failure\
+（板子已经不认这个旧密钥了）。</p>\
+<p style='color:#889099'>约 8 秒后打开 <a href='/' style='color:#40c8e0'>设置页</a> 重新搜索配对即可。</p>";
+
+const BOND_CLEAR_FAILED: &str = "<!doctype html><meta charset=utf-8>\
+<meta name=viewport content='width=device-width,initial-scale=1'>\
+<title>清空失败</title><body style='font:16px system-ui;background:#0c1016;color:#e8eef7;padding:24px'>\
+<h2 style='color:#e05a5a'>清空蓝牙配对失败</h2>\
+<p>flash 擦除出错了，配对信息还在。可以试试长按 BOOT 3 秒恢复出厂（会连 WiFi 一起清掉）。</p>";
+
 const RESET_OK: &str = "<!doctype html><meta charset=utf-8>\
 <meta name=viewport content='width=device-width,initial-scale=1'>\
 <title>已恢复出厂</title><body style='font:16px system-ui;background:#0c1016;color:#e8eef7;padding:24px'>\
@@ -581,8 +619,16 @@ async fn write_status(socket: &mut TcpSocket<'_>) -> Result<(), ()> {
         } else {
             let _ = core::fmt::Write::write_fmt(&mut body, format_args!("（固件内置）"));
         }
-        let _ = core::fmt::Write::write_fmt(&mut body, format_args!("\"}}"));
+        let _ = core::fmt::Write::write_fmt(&mut body, format_args!("\""));
     }
+    // 有没有蓝牙配对：设置页显示状态，也用来提示"要不要先清空再配对新设备"
+    let _ = core::fmt::Write::write_fmt(
+        &mut body,
+        format_args!(
+            ",\"bond\":{}}}",
+            crate::BOND_PRESENT.load(core::sync::atomic::Ordering::Relaxed)
+        ),
+    );
     write_html(socket, &body).await
 }
 

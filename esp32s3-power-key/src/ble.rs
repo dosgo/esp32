@@ -596,6 +596,7 @@ async fn restore_bond(stack: &Stack<'_, BleController, DefaultPacketPool>) {
         }
     };
     let Some(rec) = rec else {
+        crate::BOND_PRESENT.store(false, Ordering::Relaxed);
         bl!("[ble] 没有历史配对");
         return;
     };
@@ -610,10 +611,13 @@ async fn restore_bond(stack: &Stack<'_, BleController, DefaultPacketPool>) {
         true,
     );
     match stack.add_bond_information(info) {
-        Ok(()) => bl!(
-            "[ble] 已恢复历史配对（IRK {}）",
-            if rec.irk.is_some() { "有" } else { "无" }
-        ),
+        Ok(()) => {
+            crate::BOND_PRESENT.store(true, Ordering::Relaxed);
+            bl!(
+                "[ble] 已恢复历史配对（IRK {}）",
+                if rec.irk.is_some() { "有" } else { "无" }
+            );
+        }
         Err(e) => bl!("[ble] 恢复配对失败：{:?}", e),
     }
 }
@@ -635,6 +639,7 @@ async fn save_bond(b: &BondInformation) {
         None => false,
     };
     if ok {
+        crate::BOND_PRESENT.store(true, Ordering::Relaxed);
         bl!("[ble] bond 已写入 flash");
     } else {
         bl!("[ble] bond 写 flash 失败（下次上电会忘）");
