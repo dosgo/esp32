@@ -145,13 +145,17 @@ pub async fn lcd_task(
 
     draw_str(&mut display, 2, 104, "config", dim_style);
     draw_str(&mut display, 2, 116, "192.168.4.1", style);
-    draw_str(&mut display, 2, 132, "BOOT = wake", dim_style);
+    // 最后一行原来是 "BOOT = wake"，改成芯片温度（BOOT 的用法文档里写着，屏幕上没必要占位）
+    draw_str(&mut display, 2, 132, "SoC", dim_style);
 
     // ===== 动态部分：值变了才重画 =====
     // None 表示"还没画过"，第一轮一定会画
     let mut last_sta: Option<u8> = None;
     let mut last_ip: Option<Option<[u8; 4]>> = None;
     let mut last_bl: Option<bool> = None;
+    let mut last_temp: Option<i32> = None;
+    // 前 5 次读到的温度打到 /log（含 raw 值），之后就不再刷屏
+    let mut temp_log_left = 5u8;
 
     loop {
         let (state, ip, on) = {
@@ -212,6 +216,39 @@ pub async fn lcd_task(
                 MonoTextStyle::new(&FONT_6X10, if on { OK } else { BAD }),
             );
             last_bl = Some(on);
+        }
+
+        // ---- 芯片温度（整数度变化才重画，避免数字一直抖）----
+        if let Some(raw) = crate::soc_temp::read_raw() {
+            let celsius = crate::soc_temp::celsius_idf(raw);
+            // 前几次把 raw 和两种换算都打出来，方便对照实物判断公式对不对
+            if temp_log_left > 0 {
+                temp_log_left -= 1;
+                crate::push_log(format_args!(
+                    "[temp] raw={} idf={:.1}C alt={:.1}C",
+                    raw,
+                    celsius,
+                    crate::soc_temp::celsius_alt(raw)
+                ));
+            }
+            // 存一份给 /status（单位 0.1℃，整数运算避免浮点格式化）
+            crate::TEMP_DECI.store((celsius * 10.0) as i16, core::sync::atomic::Ordering::Relaxed);
+            let whole = (celsius + if celsius >= 0.0 { 0.5 } else { -0.5 }) as i32;
+            if last_temp != Some(whole) {
+                line.clear();
+                let _ = write!(line, "{}C", whole);
+                // 温度配色：60℃ 以下绿，60~75 白，75 以上红
+                let col = if whole < 60 {
+                    OK
+                } else if whole < 75 {
+                    FG
+                } else {
+                    BAD
+                };
+                clear_box(&mut display, 26, 132, 52, 10);
+                draw_str(&mut display, 26, 132, line.as_str(), MonoTextStyle::new(&FONT_6X10, col));
+                last_temp = Some(whole);
+            }
         }
 
         Timer::after(Duration::from_secs(1)).await;

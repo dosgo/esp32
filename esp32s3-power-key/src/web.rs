@@ -578,7 +578,7 @@ const RESET_OK: &str = "<!doctype html><meta charset=utf-8>\
 
 /// 当前网络状态 JSON，配网页轮询它来判断有没有连上
 async fn write_status(socket: &mut TcpSocket<'_>) -> Result<(), ()> {
-    let mut body: String<220> = String::new();
+    let mut body: String<256> = String::new();
     {
         let info = crate::NET.lock().await;
         let state = match info.state {
@@ -599,6 +599,8 @@ async fn write_status(socket: &mut TcpSocket<'_>) -> Result<(), ()> {
                 let _ = core::fmt::Write::write_fmt(&mut body, format_args!(",\"ip\":\"\""));
             }
         }
+        // 信号强度（dBm，负值；没连上是 0）
+        let _ = core::fmt::Write::write_fmt(&mut body, format_args!(",\"rssi\":{}", info.rssi));
         // 连接失败的原因，页面上直接显示（转义一下引号，别把 JSON 拆坏）
         let _ = core::fmt::Write::write_fmt(&mut body, format_args!(",\"err\":\""));
         for ch in info.err.chars() {
@@ -621,6 +623,9 @@ async fn write_status(socket: &mut TcpSocket<'_>) -> Result<(), ()> {
         }
         let _ = core::fmt::Write::write_fmt(&mut body, format_args!("\""));
     }
+    // 芯片温度（0.1℃，0 = 还没读到）
+    let t = crate::TEMP_DECI.load(core::sync::atomic::Ordering::Relaxed);
+    let _ = core::fmt::Write::write_fmt(&mut body, format_args!(",\"temp\":{}.{}", t / 10, (t % 10).abs()));
     // 有没有蓝牙配对：设置页显示状态，也用来提示"要不要先清空再配对新设备"
     let _ = core::fmt::Write::write_fmt(
         &mut body,
