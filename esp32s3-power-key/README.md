@@ -16,14 +16,48 @@
 
 ---
 
-## 二、填配置（3 个文件要改的地方都在 `src/main.rs` 顶部）
+## 二、填配置（要改的地方都在 `src/main.rs` 顶部）
 
-### 1. WiFi
+### 1. WiFi —— **不用写代码了，网页配**
+
+固件现在**同时开着热点和联网**，WiFi 账号密码存在 flash 里，用网页配：
+
+```
+           ┌── 热点 ESP32-POWER ──► 192.168.4.1   （永远开着：配网、救急）
+ESP32-S3 ──┤
+           └── 你家 WiFi ────────► 192.168.1.x   （配过就自动连，MQTT 靠它）
+```
+
+第一次用：
+
+1. 手机/电脑连热点 **`ESP32-POWER`**，密码 `power1234`
+2. 浏览器打开 **http://192.168.4.1**（安卓一般会自动弹"登录到此网络"）
+3. 填 WiFi 名字和密码 → **保存并连接**
+4. 等 10~20 秒，页面上「联网」变成 **已连接** 并显示局域网 IP
+
+配好之后开机自动连，**换 WiFi 也不用重新烧固件**。热点一直在，随时能回来改。
+
+> ⚠️ **必须连上有外网的 WiFi** —— Blinker 走公网 MQTT，连不上就控制不了。
+> 热点只是给你配网用的，它本身没有外网。
+
+热点名 / 密码在 `src/store.rs`：
 
 ```rust
-const WIFI_SSID: &str = "你家WiFi名";
-const WIFI_PASSWORD: &str = "你家WiFi密码";
+pub const AP_SSID: &str = "ESP32-POWER";
+pub const AP_PASSWORD: &str = "power1234";   // 留空 = 开放网络；否则必须 8~63 字符
+pub const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
 ```
+
+> 如果你家路由器网段正好是 `192.168.4.x`，把 `AP_IP` 改成别的（比如 `192.168.71.1`）。
+
+### 恢复出厂设置
+
+清空整个配置区（16KB）并重启，之后只剩热点、没配过网：
+
+| 方式 | 操作 |
+|---|---|
+| 板子上 | **长按 BOOT 键 3 秒**（短按是唤醒电脑） |
+| 网页 | 打开 `http://192.168.4.1` → 最下面「恢复出厂设置」→ 确认 |
 
 ### 2. Blinker 凭据（3 个值）
 
@@ -85,17 +119,26 @@ espflash flash --monitor target\xtensa-esp32s3-none-elf\release\esp32s3-power-ke
 
 退出串口监视：`Ctrl + ]`
 
+已编译镜像在 `firmware-powerkey.bin`（约 604 KB），也可以直接烧：
+
+```powershell
+espflash flash --chip esp32s3 firmware-powerkey.bin
+```
+
 ---
 
 ## 五、先验证 HID 通不通（不用联网）
 
-固件里板载 **BOOT 键（GPIO0）按一下 = 发一次唤醒**。
+固件里板载 **BOOT 键（GPIO0）短按一下就发一次唤醒**。
 
 1. 板子插电脑（"USB" 口）
 2. 等 Windows 识别出"HID 键盘"（设备管理器 → 键盘 会多一个）
-3. 按 BOOT 键 → 如果电脑亮屏/解除屏保，说明 HID 链路全通
+3. 按一下 BOOT 键 → 如果电脑亮屏/解除屏保，说明 HID 链路全通
 
 这一步通了，再去配 Blinker。
+
+> BOOT 键两种用法：**短按（< 3 秒）= 唤醒电脑**，**长按 3 秒 = 恢复出厂设置**。
+> 注意短按是**松手那一刻**才发唤醒的，所以按住不放不会误触发。
 
 ---
 
@@ -128,10 +171,16 @@ espflash flash --monitor target\xtensa-esp32s3-none-elf\release\esp32s3-power-ke
 | 现象 | 处理 |
 |------|------|
 | 插上电脑没反应 / 识别不出键盘 | 换到标 "USB" 的口；换根带数据线的 USB 线 |
-| 串口一直刷 WiFi 连不上 | 检查 SSID/密码；板子离路由器近点 |
+| 找不到热点 `ESP32-POWER` | 等 10 秒再刷 WiFi 列表；或者板子供电不足（换 USB 口） |
+| 手机连上热点一直「正在获取 IP 地址」 | DHCP 服务没起来，看串口有没有 `[dhcp] 启动：` |
+| 手机提示「无互联网」并自动断开 | 关掉手机的「自动切换网络 / 网络助理」；DNS 那块看 `src/dns.rs` |
+| 配网保存后一直连不上 | 名字/密码错了，或路由器是 5G 频段（ESP32-S3 只支持 2.4G）。回 192.168.4.1 重填 |
+| 串口一直刷 WiFi 连不上 | `[wifi] 连接失败` 多半是密码错；`连接超时` 多半是信号弱或 5G 频段 |
+| 想换 WiFi / 忘了配过哪个 | 连热点重新配一次就行；或长按 BOOT 3 秒恢复出厂 |
 | MQTT 连不上 | 检查 deviceName / iotId / iotToken 三个值有没有复制全；Blinker App 里设备要在线 |
 | App 点了没反应 | 串口日志看有没有 `recv:` 这一行；没有说明云端没转发，检查 App 按钮的键名 |
 | HID 写入超时警告 | 电脑没枚举设备（没插好 / 插错口），固件会自动跳过不会死机 |
+| 短按 BOOT 没唤醒 | 短按是**松手时**触发的；按太久（≥3 秒）会变成恢复出厂 |
 
 ---
 
@@ -140,7 +189,10 @@ espflash flash --monitor target\xtensa-esp32s3-none-elf\release\esp32s3-power-ke
 | 功能 | 用的 crate |
 |------|-----------|
 | USB HID | `esp-hal::otg_fs` + `embassy-usb` + `HidWriter` |
-| WiFi | `esp-radio` + `embassy-net` |
+| WiFi（AP+STA 双开） | `esp-radio` 的 `Config::AccessPointStation` + `embassy-net`（两个独立 stack） |
+| 热点 DHCP / DNS | `esp-hal-dhcp-server` + 手写迷你 DNS（`src/dns.rs`） |
+| 配网网页 | 手写极简 HTTP（`src/web.rs`）+ 内嵌 `setup.html`，不引框架 |
+| 凭证持久化 | `esp-storage` 写 flash `0x9000`（`src/store.rs`） |
 | 远程控制 | 手写最小 MQTT 3.1.1 客户端（`src/mqtt.rs`），直连 Blinker broker |
 | 异步运行时 | `embassy-executor` + `esp-rtos` |
 
