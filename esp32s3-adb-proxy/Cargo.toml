@@ -1,0 +1,52 @@
+[package]
+name = "esp32s3-adb-proxy"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+# ESP32-S3 作为 USB Host（OTG）连接安卓手机，把手机的 ADB 接口
+# 原样桥接到 TCP 5555，让电脑上 `adb connect <esp32-ip>:5555` 直接拿到 shell。
+#
+# 关键：esp-hal 1.1.2 的 otg_fs 只实现了 device 模式，
+# 本项目直接用 embassy-usb-synopsys-otg 的 host 驱动 + 自写 ESP32-S3 host 初始化。
+
+[dependencies]
+critical-section = "1.2.0"
+embassy-executor = { version = "0.10.0", features = ["executor-thread"] }
+embassy-futures = "0.1.2"
+embassy-net = { version = "0.9.1", features = [
+    "proto-ipv4",
+    "medium-ethernet",
+    "dhcpv4",
+    "dns",
+    "tcp",
+    "udp",
+] }
+embassy-sync = "0.8.0"
+embassy-time = { version = "0.5.1", features = ["generic-queue-8"] }
+embassy-usb-driver = "0.2.2"
+embassy-usb-synopsys-otg = { version = "0.4.0", features = ["host"] }
+embedded-io-async = "0.7"
+esp-alloc = "0.10.0"
+esp-backtrace = { version = "0.19.0", features = [
+    "esp32s3",
+    "panic-handler",
+    "println",
+] }
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
+esp-hal = { version = "1.1.2", features = ["esp32s3", "unstable"] }
+# 注意：host 模式占用 GPIO19/20，USB-Serial-JTAG 不可用，日志必须走 UART0
+esp-println = { version = "0.17.0", default-features = false, features = [
+    "esp32s3",
+    "uart",
+    "log-04",
+] }
+esp-radio = { version = "0.18.0", features = ["esp32s3", "wifi"] }
+esp-rtos = { version = "0.3.0", features = ["esp32s3", "embassy", "esp-radio"] }
+heapless = "0.9.3"
+static_cell = "2.1.1"
+log = "0.4.34"
+
+[profile.release]
+opt-level = "s"
+codegen-units = 1

@@ -1,0 +1,46 @@
+[package]
+name = "esp32s3-power-key"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+# ESP32-S3 用 USB HID（Keyboard + System Control）+ WiFi 远程控制电脑休眠/唤醒
+# 生态版本参考 esparrier：esp-hal 1.1.2 + esp-radio 0.18 + embassy-usb 0.6
+
+[dependencies]
+critical-section = "1.2.0"
+embassy-executor = { version = "0.10.0", features = ["executor-thread"] }
+embassy-net = { version = "0.9.1", features = [
+    "proto-ipv4",
+    "medium-ethernet",
+    "dhcpv4",
+    "dns",
+    "tcp",
+    "udp",
+] }
+embassy-sync = "0.8.0"
+embedded-io-async = "0.7"
+embassy-time = { version = "0.5.1", features = ["generic-queue-8"] }
+embassy-usb = { version = "0.6.0", features = [
+    "max-handler-count-4",
+    "max-interface-count-4",
+] }
+embassy-usb-driver = "0.2.2"
+esp-alloc = "0.10.0"
+esp-backtrace = { version = "0.19.0", features = [
+    "esp32s3",
+    "panic-handler",
+    "println",
+] }
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
+esp-hal = { version = "1.1.2", features = ["esp32s3", "unstable"] }
+esp-println = { version = "0.17.0", features = ["esp32s3", "log-04"] }
+esp-radio = { version = "0.18.0", features = ["esp32s3", "wifi"] }
+esp-rtos = { version = "0.3.0", features = ["esp32s3", "embassy", "esp-radio"] }
+heapless = "0.9.3"
+static_cell = "2.1.1"
+log = "0.4.34"
+
+[profile.release]
+opt-level = "s"
+codegen-units = 1
