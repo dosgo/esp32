@@ -61,14 +61,38 @@ use esp_hal_dhcp_server::{
 use embassy_usb_synopsys_otg::otg_v1::Otg;
 use esp_println::println;
 use esp_radio::wifi::{
-    AuthenticationMethod, Config as WifiConfig, ControllerConfig, Interface, WifiController,
-    ap::AccessPointConfig, sta::StationConfig,
+    AuthenticationMethod, Config as WifiConfig, ControllerConfig, Interface, PowerSaveMode,
+    WifiController, ap::AccessPointConfig, sta::StationConfig,
 };
 use esp_storage::FlashStorage;
 use heapless::String as HString;
 use log::{error, info, warn};
 
 esp_bootloader_esp_idf::esp_app_desc!();
+
+// ===================== 省电配置 =====================
+//
+// 背景：Wi-Fi AP + STA 双开、BLE 常驻广播、240MHz 主频，实测 5V/1.2W（约 240mA）。
+// 上面每一项都有独立的省电档位，集中放在这里方便调。
+//
+// 有一条硬性下限：esp-radio 要求 CPU ≥ 80MHz（内部 assert），所以不能低于 80。
+
+/// CPU 主频。Wi-Fi 吞吐和网页渲染都不吃 CPU，160MHz 是「省电 + 不卡」的折中。
+/// 想再省可以降到 `_80MHz`（网页会稍慢，功能不受影响）。
+const CPU_CLOCK: CpuClock = CpuClock::_160MHz;
+
+/// Wi-Fi 省电模式。esp-radio 默认是 `None`（射频常开，最费电）。
+/// - `Minimum`：DTIM 级别休眠，延迟几十毫秒，网页/MQTT 几乎无感 ← 用这个
+/// - `Maximum`：睡得更狠，但下载 24KB 页面会明显变慢
+const WIFI_PS: PowerSaveMode = PowerSaveMode::Minimum;
+
+/// Wi-Fi 最大发射功率，单位 0.25dBm：52 = 13dBm（默认 84 = 20dBm）。
+/// 手机/路由器就在旁边，13dBm 足够，TX 峰值电流能降不少。
+const WIFI_TX_POWER: i8 = 52;
+
+/// BLE 广播间隔（毫秒）。默认 160ms；调到 500ms 手机照样能扫到，
+/// 但射频占用降到 1/3。已经连上之后就不广播了，所以只影响"找设备"阶段。
+const BLE_ADV_INTERVAL_MS: u64 = 500;
 
 // ===================== 需要你填写的配置 =====================
 //
@@ -914,13 +938,20 @@ async fn main(spawner: Spawner) -> ! {
     // 现在能定到 128KB，是因为网页收发缓冲（32KB）已经挪到 PSRAM（见下面）。
     esp_alloc::heap_allocator!(size: 128 * 1024);
 
-    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    let config = esp_hal::Config::default().with_cpu_clock(CPU_CLOCK);
     let peripherals = esp_hal::init(config);
 
     // PSRAM（板载 8MB OPI）也挂进全局堆，但只带 External 能力位。
     // esp-radio 的 Wi-Fi / 蓝牙分配走 `malloc_internal`（限内部 RAM），
     // 所以永远拿不到 PSRAM —— 这正是我们要的：**PSRAM 只装普通数据**。
     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
+    info!(
+        "[power] CPU {:?} / Wi-Fi PS={:?} / TX {}dBm / BLE adv {}ms",
+        CPU_CLOCK,
+        WIFI_PS,
+        WIFI_TX_POWER as i32 / 4,
+        BLE_ADV_INTERVAL_MS
+    );
     info!(
         "[psram] 就绪，PSRAM 可用 {} B，内部堆 {} B",
         esp_alloc::HEAP.free_caps(esp_alloc::MemoryCapability::External.into()),
@@ -1071,7 +1102,7 @@ async fn main(spawner: Spawner) -> ! {
         }
     };
 
-    let (controller, interfaces) = match esp_radio::wifi::new(
+    let (mut controller, interfaces) = match esp_radio::wifi::new(
         peripherals.WIFI,
         ControllerConfig::default().with_initial_config(initial),
     ) {
@@ -1168,6 +1199,19 @@ async fn main(spawner: Spawner) -> ! {
         .spawn(dhcp_task(ap_stack).expect("failed to spawn dhcp task"));
     spawner
         .spawn(dns_task(ap_stack).expect("failed to spawn dns task"));
+
+    // ---- 省电：射频省电模式 + 发射功率 ----
+    //
+    // 必须在 wifi_task 拿走 controller 之前设。两项都是 esp-radio 的 unstable API。
+    // 失败只记日志：省电没设上也照样能用，只是费电。
+    match controller.set_power_saving(WIFI_PS) {
+        Ok(()) => dlog!("[power] Wi-Fi 省电模式 = {:?}", WIFI_PS),
+        Err(e) => warn!("[power] 设置省电模式失败: {e:?}"),
+    }
+    match controller.set_max_tx_power(WIFI_TX_POWER) {
+        Ok(()) => dlog!("[power] Wi-Fi 发射功率 = {}dBm", WIFI_TX_POWER as i32 / 4),
+        Err(e) => warn!("[power] 设置发射功率失败: {e:?}"),
+    }
 
     spawner
         .spawn(wifi_task(controller, creds.clone()).expect("failed to spawn wifi task"));

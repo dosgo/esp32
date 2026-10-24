@@ -495,3 +495,50 @@ trouble 0.6 在**外设侧**配对时把 `initiator_key_distribution` 初始化�
 - 只支持一台已经配对的手机；换设备要先在旧设备上「忘记」，或者长按 BOOT 恢复出厂。
 - 网页键鼠同时喂 USB 和 BLE 两路，**BLE 连上时两边会同时收到按键**
   （想让它们互斥得在 `HidEvent` 里加来源标记）。
+
+---
+
+## 十一、功耗与省电（实测 1.2W → 1.0W）
+
+板子插在 USB 上测，5V 供电。**改前 1.2W（约 240mA），改后 1.0W（约 200mA）**。
+
+### 四个改动（参数都在 `src/main.rs` 顶部集中配置）
+
+| 项 | 常量 | 之前 | 现在 | 说明 |
+|---|---|---|---|---|
+| Wi-Fi 省电 | `WIFI_PS` | `None` | `Minimum` | **最大的一项**。esp-radio 默认 `PowerSaveMode::None`（射频常开），文档里就写着 "By default the power-saving mode is None" |
+| CPU 主频 | `CPU_CLOCK` | `CpuClock::max()` = 240MHz | `_160MHz` | esp-radio 硬性要求 ≥80MHz（内部 assert），不能更低 |
+| Wi-Fi 发射功率 | `WIFI_TX_POWER` | 84 = 20dBm | 52 = **13dBm** | 单位是 0.25dBm，取值范围 [8, 84] |
+| BLE 广播间隔 | `BLE_ADV_INTERVAL_MS` | 160ms | 500ms | 只影响"找设备"，连上后不广播 |
+
+`esp32s3-power-key` 启动会在 `/log` 打一行 `[power] Wi-Fi 省电模式 = Minimum` / `发射功率 = 13dBm`，
+改完可以直接看有没有生效（设置失败只 warn，不影响功能，只是费电）。
+
+### 省电带来的取舍（都实测过，功能没丢）
+
+- **通信距离**：20 → 13dBm 是 −7dB，理论距离减半。路由器远/墙多的话，
+  把 `WIFI_TX_POWER` 改回 `64`（16dBm）折中。
+- **网页延迟**：设置页 9.6KB 从"几乎立即"变成 **0.41~0.51s**（DTIM 级休眠的固有代价）。
+- **找设备**：手机搜到 `ESP32-POWER-BLE` 最多多等 0.5s。
+- **不影响**：BLE 用旧 bond 直接加密重连、AP 侧网页 WebSocket、MQTT（断线会自动重连）、唤醒/睡眠。
+
+### 还能再降，但都有代价
+
+| 手段 | 预估 | 代价 |
+|---|---|---|
+| **热点按需开**（现在 24h 每 100ms 发一次 beacon） | −30~50mA | 配网/救急要改成「STA 连不上才开」或长按 BOOT 开。**这是最后一块大头** |
+| `WIFI_PS` 改 `Maximum` | −10~20mA | 24KB 页面加载从 0.5s 变 1~2s |
+| `CPU_CLOCK` 降到 `_80MHz` | −15~25mA | 网页处理变慢 |
+| LCD 发 `SLPIN` 指令 | −5~10mA | 屏关掉，但**背光是硬连常亮的**（原理图没这根 GPIO），省得有限 |
+| BLE 广播拉到 1~2s | −3~5mA | 搜设备更慢 |
+
+**不建议动 BLE 连接间隔**：拉长到 30~50ms 能省一点，
+但鼠标拖拽会明显发涩（安卓默认给的 7.5~15ms 是 HID 的正常诉求）。
+
+### 那 200mA 都花在哪（估算，没上电流探头）
+
+Wi-Fi 射频 80~100mA（AP beacon + STA 定期唤醒）、CPU 20~30mA、USB 设备模式 10~20mA、
+LCD 背光 + PSRAM 10~15mA，剩下分散在 BLE 广播和 Flash 访问。
+
+> 想压到 100mA 以下只能砍功能：关热点、或者允许深度睡眠（Deep Sleep 会断 USB HID 和 BLE，
+> 唤醒靠 GPIO —— 那是另一套架构了）。

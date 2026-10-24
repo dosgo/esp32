@@ -422,7 +422,14 @@ async fn advertise_loop(
         let acceptor = match with_timeout(
             Duration::from_secs(10),
             peripheral.advertise(
-                &Default::default(),
+                &{
+                    // 广播间隔拉长到 500ms（默认 160ms）：射频占用降到 1/3，
+                    // 手机扫到设备也就多等零点几秒，连上之后就不再广播了。
+                    let mut p = AdvertisementParameters::default();
+                    p.interval_min = Duration::from_millis(crate::BLE_ADV_INTERVAL_MS);
+                    p.interval_max = Duration::from_millis(crate::BLE_ADV_INTERVAL_MS);
+                    p
+                },
                 Advertisement::ConnectableScannableUndirected {
                     adv_data: ADV_DATA,
                     scan_data: &[],
