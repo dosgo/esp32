@@ -670,18 +670,36 @@ async fn hid_task(
 
 #[embassy_executor::task]
 async fn ap_web_task(stack: Stack<'static>) {
-    web_server(stack, "AP").await;
+    web_server(
+        stack,
+        "AP",
+        mk_static!([u8; 4096], [0u8; 4096]),
+        mk_static!([u8; 4096], [0u8; 4096]),
+    )
+    .await;
 }
 
 #[embassy_executor::task]
 async fn sta_web_task(stack: Stack<'static>) {
-    web_server(stack, "STA").await;
+    web_server(
+        stack,
+        "STA",
+        mk_static!([u8; 4096], [0u8; 4096]),
+        mk_static!([u8; 4096], [0u8; 4096]),
+    )
+    .await;
 }
 
 /// HTTP + WebSocket。热点侧和局域网侧各跑一份。
-async fn web_server(stack: Stack<'static>, tag: &'static str) {
-    let rx = mk_static!([u8; 4096], [0u8; 4096]);
-    let tx = mk_static!([u8; 4096], [0u8; 4096]);
+///
+/// 缓冲从外面传进来（而不是在函数里 mk_static）：这个函数会被两个任务各调一次，
+/// 而函数内的 static 只有一份，第二次写 StaticCell 会直接 panic。
+async fn web_server(
+    stack: Stack<'static>,
+    tag: &'static str,
+    rx: &'static mut [u8],
+    tx: &'static mut [u8],
+) {
     let mut socket = TcpSocket::new(stack, rx, tx);
     socket.set_timeout(Some(Duration::from_secs(120)));
 
