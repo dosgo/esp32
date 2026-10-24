@@ -1,0 +1,67 @@
+[package]
+name = "esp32s3-hid-kvm"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+# ESP32-S3 模拟 USB 键盘 + 鼠标（两个独立 boot interface），
+# 通过 WiFi 起一个 Web 页面，浏览器里输入键盘、移动鼠标，ESP32 转发成 HID 报告。
+#
+# 设计要点：
+# - 键盘/鼠标状态全由**浏览器端**维护，ESP32 只做解析转发，固件零状态管理
+# - 键鼠用两个独立 HID interface + boot protocol，BIOS / 无驱动环境也能用
+# - Web 走 WebSocket（鼠标移动要实时，HTTP POST 每次建连接太慢）
+# - HTTP/WebSocket 自己写，不引框架：只需要 2 个路由，自写更可控
+
+[dependencies]
+critical-section = "1.2.0"
+embassy-executor = { version = "0.10.0", features = ["executor-thread"] }
+embassy-futures = "0.1.2"
+embassy-net = { version = "0.9.1", features = [
+    "proto-ipv4",
+    "medium-ethernet",
+    "dhcpv4",
+    "dns",
+    "tcp",
+    "udp",
+] }
+embassy-sync = "0.8.0"
+embassy-time = { version = "0.5.1", features = ["generic-queue-8"] }
+embassy-usb = "0.6.0"
+embassy-usb-driver = "0.2.2"
+embedded-graphics = "0.8.2"
+embedded-hal = "1.0"
+embedded-io-async = "0.7"
+embedded-storage = "0.3.1"
+embedded-hal-bus = "0.3.0"
+esp-alloc = "0.10.0"
+esp-backtrace = { version = "0.19.0", features = [
+    "esp32s3",
+    "panic-handler",
+    "println",
+] }
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
+esp-hal = { version = "=1.1.2", features = ["esp32s3", "unstable"] }
+# device 模式下 GPIO19/20 归 OTG，USB-Serial-JTAG 失效；
+# 单口 dongle 没有 UART，所以日志走网络（见 src/netlog.rs）
+esp-println = { version = "0.17.0", default-features = false, features = [
+    "esp32s3",
+    "uart",
+    "log-04",
+] }
+esp-radio = { version = "0.18.0", features = ["esp32s3", "wifi"] }
+esp-rtos = { version = "0.3.0", features = ["esp32s3", "embassy", "esp-radio"] }
+# 热点模式必须自己跑 DHCP：embassy-net 只有 DHCP **客户端**，没有服务端。
+# 没有它，手机连上热点会一直卡在"正在获取 IP"。
+esp-hal-dhcp-server = "0.4.3"
+# 把"上次选的模式"写进 flash，掉电不丢
+esp-storage = { version = "0.9.0", features = ["esp32s3"] }
+heapless = "0.9.3"
+log = "0.4.34"
+mipidsi = "0.10.0"
+sha1 = { version = "0.10", default-features = false }
+static_cell = "2.1.1"
+
+[profile.release]
+opt-level = "s"
+codegen-units = 1
