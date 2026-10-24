@@ -16,6 +16,7 @@
 #![no_main]
 
 mod dns;
+mod lcd;
 mod mqtt;
 mod store;
 mod web;
@@ -44,7 +45,7 @@ use embassy_usb::{Builder, Config as UsbConfig, Handler};
 use esp_backtrace as _;
 use esp_hal::{
     clock::CpuClock,
-    gpio::{Input, InputConfig, Pull},
+    gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
     interrupt::software::SoftwareInterruptControl,
     otg_fs::{Usb, asynch::Driver},
     rng::Rng,
@@ -242,6 +243,10 @@ pub static FLASH: Mutex<CriticalSectionRawMutex, Option<FlashStorage<'static>>> 
 /// 没存过就回退到下面那几个编译期常量。
 pub static BLINKER_CFG: Mutex<CriticalSectionRawMutex, store::BlinkerCreds> =
     Mutex::new(store::BlinkerCreds::new());
+
+/// Blinker 是否在线（MQTT 已订阅成功）。给 LCD 显示用。
+/// 注意这和 App 上显示的"在线"是两码事：App 看的是心跳回复，这里看的是 MQTT 会话。
+pub static BLINKER_ONLINE: AtomicBool = AtomicBool::new(false);
 
 /// 网页保存 Blinker 凭据：写 flash + 更新内存。调用方负责重启。
 pub async fn save_blinker_cfg(c: store::BlinkerCreds) -> bool {
@@ -682,6 +687,7 @@ async fn blinker_task(stack: Stack<'static>) {
                 failed = true;
             } else {
                 dlog!("[mqtt] 已连上 Blinker 并订阅成功");
+                BLINKER_ONLINE.store(true, Ordering::Relaxed);
                 info!("subscribed, waiting for commands");
                 // 注意：这里**不能**用 select(wait_publish, Timer) 来做"每 30 秒发 PINGREQ"。
                 // 那样每 30 秒会取消一次正在进行的 read，一旦正好读到半个报文，MQTT 流就错位，
@@ -746,6 +752,7 @@ async fn blinker_task(stack: Stack<'static>) {
                         }
                         Err(e) => {
                             dlog!("[mqtt] 连接错误: {e:?}");
+                            BLINKER_ONLINE.store(false, Ordering::Relaxed);
                             warn!("MQTT error: {e:?}, reconnecting");
                             break;
                         }
@@ -938,6 +945,25 @@ async fn main(spawner: Spawner) -> ! {
     // HID 任务要拿联网侧的 stack 发 WOL，所以挪到这里 spawn
     spawner
         .spawn(hid_task(writer, stack).expect("failed to spawn hid task"));
+
+    // LCD 放在这里 spawn：USB 枚举和 WiFi 初始化都已经过去了，
+    // 屏初始化的几十毫秒阻塞不会影响枚举。
+    //
+    // 【临时停用】引脚还没确定（实测 4/5/3/2/1 点不亮），改用文件末尾的引脚扫描。
+    // 找到正确引脚后把这段恢复（去掉注释）、删掉扫描循环，并改 lcd.rs 顶部的引脚。
+    //
+    // spawner.spawn(
+    //     lcd::lcd_task(
+    //         peripherals.SPI2,
+    //         peripherals.GPIO5, // SCL
+    //         peripherals.GPIO3, // SDA
+    //         peripherals.GPIO4, // CS
+    //         peripherals.GPIO2, // DC
+    //         peripherals.GPIO1, // RST
+    //     )
+    //     .expect("failed to spawn lcd task"),
+    //     );
+
     spawner
         .spawn(ap_web_task(ap_stack).expect("failed to spawn ap web task"));
     spawner
@@ -964,6 +990,23 @@ async fn main(spawner: Spawner) -> ! {
         store::AP_IP
     );
     println!("BOOT: 短按唤醒 / 长按 {BOOT_RESET_MS}ms 恢复出厂");
+
+    // LCD：GNPE Pocket-Dongle-S3-0.96 的真实接线（官方原理图）
+    //   文档：github.com/beastboost/jcorp-nomad/blob/main/docs/PocketDongleS3.md
+    //   SCL=10  SDA=11  CS=12  DC=13  RST=14，背光硬连常亮（无 GPIO）
+    //   注意：这块板**不是** LilyGO T-Dongle-S3 克隆，接线完全不同。
+    spawner
+        .spawn(
+            lcd::lcd_task(
+                peripherals.SPI2,
+                peripherals.GPIO10, // SCLK
+                peripherals.GPIO11, // MOSI / SDA
+                peripherals.GPIO12, // CS
+                peripherals.GPIO13, // DC
+                peripherals.GPIO14, // RST
+            )
+            .expect("failed to spawn lcd task"),
+        );
 
     loop {
         Timer::after(Duration::from_secs(30)).await;
