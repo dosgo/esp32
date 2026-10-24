@@ -149,3 +149,110 @@ pub fn factory_reset(f: &mut FlashStorage<'_>) -> bool {
     }
     true
 }
+
+// =============== Blinker 凭据（网页里可改，改完不用重烧） ===============
+//
+// 占用配置区的第二块扇区（0xA000）。三个值都是字符串：
+//   deviceName（也是 MQTT clientId）/ iotId（MQTT 用户名）/ iotToken（MQTT 密码）
+// 它们来自浏览器打开下面这个地址后返回的 JSON：
+//   https://iot.diandeng.tech/api/v1/user/device/diy/auth?authKey=你的authKey&protocol=mqtt
+
+pub const BLINKER_FLASH_ADDR: u32 = CREDS_FLASH_ADDR + FlashStorage::SECTOR_SIZE;
+pub const MAX_DEV: usize = 40;
+pub const MAX_TOKEN: usize = 72;
+
+#[derive(Clone, Default)]
+pub struct BlinkerCreds {
+    pub device: String<MAX_DEV>,
+    pub iot_id: String<MAX_DEV>,
+    pub token: String<MAX_TOKEN>,
+}
+
+impl BlinkerCreds {
+    pub const fn new() -> Self {
+        Self {
+            device: String::new(),
+            iot_id: String::new(),
+            token: String::new(),
+        }
+    }
+    pub fn is_set(&self) -> bool {
+        !self.device.is_empty() && !self.token.is_empty()
+    }
+}
+
+/// 布局：[0..4] magic  [4] dev 长度  [5] iotId 长度  [6] token 长度  [7..] 数据  [末尾] 校验和
+pub fn load_blinker(f: &mut FlashStorage<'_>) -> Option<BlinkerCreds> {
+    let mut b = Buf([0; 128]);
+    if ReadNorFlash::read(f, BLINKER_FLASH_ADDR, &mut b.0).is_err() {
+        return None;
+    }
+    if u32::from_le_bytes([b.0[0], b.0[1], b.0[2], b.0[3]]) != MAGIC {
+        return None;
+    }
+    let dl = b.0[4] as usize;
+    let il = b.0[5] as usize;
+    let tl = b.0[6] as usize;
+    if dl == 0 || dl > MAX_DEV || il > MAX_DEV || tl == 0 || tl > MAX_TOKEN {
+        return None;
+    }
+    let total = 7 + dl + il + tl;
+    if total + 1 > b.0.len() {
+        return None;
+    }
+    let mut sum: u8 = 0;
+    for i in 0..total {
+        sum = sum.wrapping_add(b.0[i]);
+    }
+    if sum != b.0[total] {
+        return None;
+    }
+
+    let mut c = BlinkerCreds::new();
+    let mut off = 7;
+    c.device.push_str(str::from_utf8(&b.0[off..off + dl]).ok()?).ok()?;
+    off += dl;
+    c.iot_id.push_str(str::from_utf8(&b.0[off..off + il]).ok()?).ok()?;
+    off += il;
+    c.token.push_str(str::from_utf8(&b.0[off..off + tl]).ok()?).ok()?;
+    Some(c)
+}
+
+pub fn save_blinker(f: &mut FlashStorage<'_>, c: &BlinkerCreds) -> bool {
+    let dl = c.device.len();
+    let il = c.iot_id.len();
+    let tl = c.token.len();
+    if dl == 0 || dl > MAX_DEV || il > MAX_DEV || tl == 0 || tl > MAX_TOKEN {
+        warn!("[store] Blinker 凭据长度不合法，不写");
+        return false;
+    }
+
+    let mut b = Buf([0u8; 128]);
+    b.0[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+    b.0[4] = dl as u8;
+    b.0[5] = il as u8;
+    b.0[6] = tl as u8;
+    let mut off = 7;
+    b.0[off..off + dl].copy_from_slice(c.device.as_bytes());
+    off += dl;
+    b.0[off..off + il].copy_from_slice(c.iot_id.as_bytes());
+    off += il;
+    b.0[off..off + tl].copy_from_slice(c.token.as_bytes());
+    off += tl;
+    let mut sum: u8 = 0;
+    for i in 0..off {
+        sum = sum.wrapping_add(b.0[i]);
+    }
+    b.0[off] = sum;
+
+    let sector = FlashStorage::SECTOR_SIZE;
+    if NorFlash::erase(f, BLINKER_FLASH_ADDR, BLINKER_FLASH_ADDR + sector).is_err() {
+        warn!("[store] Blinker 扇区擦除失败");
+        return false;
+    }
+    if NorFlash::write(f, BLINKER_FLASH_ADDR, &b.0).is_err() {
+        warn!("[store] Blinker 写入失败");
+        return false;
+    }
+    true
+}

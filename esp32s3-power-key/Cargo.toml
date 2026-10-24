@@ -27,6 +27,9 @@ embassy-usb = { version = "0.6.0", features = [
     "max-handler-count-4",
     "max-interface-count-4",
 ] }
+# 只为了拿到 otg_v1::Otg，好直接操作 DCTL.RWUSIG 做硬件级远程唤醒。
+# 版本必须和 esp-hal 内部用的一致（Cargo.lock 里就是 0.3.3），否则类型对不上。
+embassy-usb-synopsys-otg = "0.3.3"
 embassy-usb-driver = "0.2.2"
 esp-alloc = "0.10.0"
 esp-backtrace = { version = "0.19.0", features = [
