@@ -1,0 +1,79 @@
+[package]
+name = "esp32s3-csi-vision"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+# ESP32-S3 用 Wi-Fi CSI（信道状态信息）做无摄像头感知成像。
+#
+# 原理：Wi-Fi 每一帧的物理层前导码里带着「信道频率响应」——
+# 也就是 56 个 OFDM 子载波上的复数增益（I/Q）。人体在链路附近移动时，
+# 多径被扰动，这些子载波的幅度/相位就会跟着抖。把 56 个子载波的幅度
+# 按时间铺成瀑布图，就得到一张「射频成像」图：静止时是平滑条纹，
+# 有人走动时出现明显的横向扰动带。
+#
+# 本项目不需要摄像头、不需要 ESP-IDF，纯 Rust no_std + esp-hal。
+#
+# 纯 Rust 栈：esp-hal 1.1.2 + esp-radio 0.18（csi feature）+ esp-rtos 0.3 + embassy-net 0.9
+#
+# esp-radio 的 `csi` feature 依赖 `unstable`，两个必须同时开。
+
+[dependencies]
+critical-section = "1.2.0"
+embassy-executor = { version = "0.10.0", features = ["executor-thread"] }
+embassy-futures = "0.1.2"
+embassy-net = { version = "0.9.1", features = [
+    "proto-ipv4",
+    "medium-ethernet",
+    "dhcpv4",
+    "dns",
+    "tcp",
+    "udp",
+    # 自己 ping 网关，制造稳定的下行流量来持续触发 CSI 采集
+    "icmp",
+] }
+embassy-sync = "0.8.0"
+embassy-time = { version = "0.5.1", features = ["generic-queue-8"] }
+embedded-io-async = "0.7"
+esp-alloc = "0.10.0"
+esp-backtrace = { version = "0.19.0", features = [
+    "esp32s3",
+    "panic-handler",
+    "println",
+] }
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
+# 锁死 =1.1.2：esp-radio 0.18 / esp-rtos 0.3 只认 esp-hal 1.1.x
+esp-hal = { version = "=1.1.2", features = ["esp32s3", "unstable"] }
+esp-println = { version = "0.17.0", features = ["esp32s3", "log-04"] }
+# csi = 打开 WifiController::set_csi / wifi::csi 模块；unstable 是它的前置
+esp-radio = { version = "0.18.0", features = [
+    "esp32s3",
+    "wifi",
+    "csi",
+    "unstable",
+] }
+esp-rtos = { version = "0.3.0", features = ["esp32s3", "embassy", "esp-radio"] }
+# 热点模式必须自己跑 DHCP：embassy-net 只有客户端，没有服务端
+esp-hal-dhcp-server = "0.4.3"
+# Wi-Fi 账号密码存 flash（网页配网，掉电不丢）
+esp-storage = { version = "0.9.0", features = ["esp32s3"] }
+embedded-storage = "0.3.1"
+# 直接点 SENS 寄存器读片上温度：esp-hal 1.1.2 没给 S3 实现 tsens。
+# 版本必须跟 esp-hal 1.1.2 内部用的一致（0.35.2），否则寄存器类型对不上。
+esp32s3 = "0.35.2"
+heapless = "0.9.3"
+static_cell = "2.1.1"
+log = "0.4.34"
+# WebSocket 握手要 SHA1，纯 no_std
+sha1 = { version = "0.10", default-features = false }
+
+[profile.release]
+# CSI 回调在射频任务上下文里跑，每帧都要算 56 次整数开方。
+# opt-level = "s" 会把 isqrt 编译成很笨的循环，实测拖慢回调。
+# 这里用 2（不追极限体积，追回调延迟）。
+opt-level = 2
+codegen-units = 1
+lto = "thin"
+
+[profile.dev]
+opt-level = 2

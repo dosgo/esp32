@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>ESP32-S3 · Wi-Fi CSI 感知成像（模拟预览）</title>
+<style>
+  :root{
+    --bg:#070b14; --panel:#0d1420; --panel2:#111a28; --line:#1b2637;
+    --text:#dbe6f5; --dim:#6f829e; --accent:#22d3ee; --warn:#fbbf24; --bad:#f87171; --ok:#34d399;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    background:radial-gradient(1200px 600px at 20% -10%, #10233a 0%, var(--bg) 55%);
+    color:var(--text);
+    font:13px/1.5 ui-monospace,"SF Mono","JetBrains Mono",Consolas,"Courier New",monospace;
+    padding:14px; display:flex; flex-direction:column; gap:12px;
+    min-height:100%;
+  }
+  header{
+    display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+    padding:0 2px;
+  }
+  .brand{font-size:15px; letter-spacing:.06em; font-weight:600}
+  .brand span{color:var(--accent)}
+  .brand em{color:var(--dim); font-style:normal; font-size:11px; letter-spacing:.12em; margin-left:8px}
+  .spacer{flex:1}
+  .chip{
+    display:inline-flex; align-items:center; gap:6px;
+    background:var(--panel); border:1px solid var(--line); border-radius:6px;
+    padding:4px 9px; font-size:11.5px; color:var(--dim);
+  }
+  .chip b{color:var(--text); font-weight:600}
+  a.chip{text-decoration:none; color:inherit; transition:border-color .15s}
+  a.chip:hover{border-color:var(--accent); color:var(--accent)}
+  a.chip.warn{border-color:#4a3a12}
+  a.chip.warn:hover{border-color:var(--warn)}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--dim);box-shadow:0 0 8px currentColor}
+  .dot.on{background:var(--ok); color:var(--ok)}
+  .dot.bad{background:var(--bad); color:var(--bad)}
+  .dot.warn{background:var(--warn); color:var(--warn)}
+
+  main{display:grid; grid-template-columns:1fr 320px; gap:12px; flex:1; min-height:0}
+  @media (max-width:900px){ main{grid-template-columns:1fr} }
+
+  .card{
+    background:linear-gradient(180deg,var(--panel2),var(--panel));
+    border:1px solid var(--line); border-radius:10px;
+    display:flex; flex-direction:column; overflow:hidden;
+    box-shadow:0 8px 24px -18px #000 inset;
+  }
+  .card-h{
+    display:flex; justify-content:space-between; align-items:center; gap:8px;
+    padding:8px 11px; font-size:11px; letter-spacing:.09em; color:var(--dim);
+    border-bottom:1px solid var(--line); text-transform:uppercase;
+  }
+  .card-h b{color:var(--text); letter-spacing:0; text-transform:none; font-size:11.5px}
+  .card-b{flex:1; min-height:0; position:relative}
+  canvas{display:block; width:100%; height:100%}
+
+  aside{display:flex; flex-direction:column; gap:12px; min-height:0}
+  aside .card{flex:1}
+  .wfcard{min-height:320px}
+  .heat{height:74px; flex:0 0 auto}
+
+  #stateWrap{
+    display:flex; align-items:center; gap:10px;
+    padding:6px 12px; border-radius:8px; border:1px solid var(--line);
+    background:var(--panel);
+  }
+  #stateTxt{font-size:13px; font-weight:600; letter-spacing:.04em; color:var(--dim)}
+  #stateBar{height:4px; width:96px; border-radius:2px; background:#182234; overflow:hidden}
+  #stateBar i{display:block; height:100%; width:0%; background:var(--ok); transition:width .12s linear}
+
+  footer{
+    display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+    color:var(--dim); font-size:11.5px; padding:0 2px 4px;
+  }
+  footer label{display:flex; align-items:center; gap:8px}
+  input[type=range]{width:110px; accent-color:var(--accent)}
+  button{
+    background:var(--panel); color:var(--text); border:1px solid var(--line);
+    border-radius:6px; padding:5px 12px; font:inherit; font-size:11.5px; cursor:pointer;
+  }
+  button:hover{border-color:var(--accent); color:var(--accent)}
+  .hint{color:#42526b; font-size:11px}
+  .val{color:var(--accent); font-weight:600}
+  #ovl{
+    position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    background:rgba(7,11,20,.82); color:var(--dim); font-size:12px; text-align:center;
+    padding:20px; line-height:1.9;
+  }
+  #ovl.hide{display:none}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">ESP32-S3 <span>Wi-Fi CSI</span><em>射频感知成像 · 模拟预览</em></div>
+  <div class="spacer"></div>
+  <div class="chip"><span class="dot" id="dotConn"></span><span id="connTxt">连接中</span></div>
+  <div class="chip">RSSI <b id="rssi">--</b> dBm</div>
+  <div class="chip">CSI <b id="fps">--</b> 帧/秒</div>
+  <div class="chip">子载波 <b id="ncar">--</b></div>
+  <div class="chip">芯片 <b id="temp">--</b> ℃</div>
+  <a class="chip" id="netChip" href="/setup" title="点击进入配网"><span class="dot" id="dotNet"></span><span id="netTxt">网络…</span></a>
+</header>
+
+<main>
+  <section class="card wfcard">
+    <div class="card-h"><b>时频瀑布图</b><span>子载波频率 → × 时间 ↓ · 亮 = 强</span></div>
+    <div class="card-b">
+      <canvas id="wf"></canvas>
+      <div id="ovl">模拟数据加载中…</div>
+    </div>
+  </section>
+
+  <aside>
+    <section class="card">
+      <div class="card-h"><b>子载波响应</b><span id="barsInfo">快照</span></div>
+      <div class="card-b"><canvas id="bars"></canvas></div>
+    </section>
+
+    <section class="card">
+      <div class="card-h"><b>运动能量</b><span id="motionVal" class="val">0.00</span></div>
+      <div class="card-b"><canvas id="motion"></canvas></div>
+    </section>
+  </aside>
+</main>
+
+<section class="card heat">
+  <div class="card-h"><b>子载波活动强度</b><span>哪些多径正在被扰动</span></div>
+  <div class="card-b"><canvas id="heat"></canvas></div>
+</section>
+
+<footer>
+  <div id="stateWrap">
+    <span class="dot" id="dotState"></span>
+    <span id="stateTxt">等待数据</span>
+    <div id="stateBar"><i id="stateFill"></i></div>
+  </div>
+  <label>灵敏度 <input type="range" id="sens" min="0.4" max="3" step="0.05" value="1"><span id="sensVal">1.00×</span></label>
+  <button id="pause">暂停</button>
+  <button id="clear">清空</button>
+  <span class="spacer"></span>
+  <span class="hint">CSI 只反映射频链路的多径扰动，不是光学图像 · 人体挡在 ESP32 与路由器之间效果最明显</span>
+</footer>
+
+<script>
+"use strict";
+
+/* ------------------------------------------------------------------
+ *  参数
+ * ------------------------------------------------------------------ */
+const WF_ROWS = 320;        // 瀑布图保留多少行历史（每行 = 一帧）
+const MOTION_LEN = 360;     // 运动能量波形长度
+const HEAT_LEN = 40;        // 活动热条聚合的帧数
+
+const wfCv   = document.getElementById('wf');
+const wfCtx  = wfCv.getContext('2d', { alpha:false });
+const barCv  = document.getElementById('bars');
+const barCtx = barCv.getContext('2d');
+const moCv   = document.getElementById('motion');
+const moCtx  = moCv.getContext('2d');
+const htCv   = document.getElementById('heat');
+const htCtx  = htCv.getContext('2d');
+
+const el = id => document.getElementById(id);
+
+/* ------------------------------------------------------------------
+ *  色表：深蓝 → 蓝 → 青 → 绿 → 黄 → 红
+ *  ImageData 的 Uint32 视图在小端机器上是 0xAABBGGRR
+ * ------------------------------------------------------------------ */
+const COLORS = (() => {
+  const stops = [
+    [0.00, [6, 10, 22]],
+    [0.20, [16, 34, 78]],
+    [0.40, [12, 92, 145]],
+    [0.58, [14, 172, 190]],
+    [0.74, [66, 216, 138]],
+    [0.88, [246, 202, 62]],
+    [1.00, [255, 88, 68]],
+  ];
+  const out = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255;
+    let a = stops[0], b = stops[stops.length - 1];
+    for (let k = 0; k < stops.length - 1; k++) {
+      if (t >= stops[k][0] && t <= stops[k + 1][0]) { a = stops[k]; b = stops[k + 1]; break; }
+    }
+    const f = (t - a[0]) / ((b[0] - a[0]) || 1);
+    const r = Math.round(a[1][0] + (b[1][0] - a[1][0]) * f);
+    const g = Math.round(a[1][1] + (b[1][1] - a[1][1]) * f);
+    const bl = Math.round(a[1][2] + (b[1][2] - a[1][2]) * f);
+    out[i] = (255 << 24) | (bl << 16) | (g << 8) | r;
+  }
+  return out;
+})();
+
+/* ------------------------------------------------------------------
+ *  状态
+ * ------------------------------------------------------------------ */
+let NC = 0;                 // 子载波数（第一帧才知道）
+let off, octx, img, u32;    // 瀑布图离屏画布
+let prevZ = null;           // 上一帧的标准化振幅
+const motionHist = new Float32Array(MOTION_LEN);
+let motionHead = 0;
+let motionVal = 0;
+let heatAccum = null;
+let paused = false;
+let sens = 1.0;
+let frameCount = 0, fpsWin = 0, fpsLast = performance.now();
+let lastRssi = null;
+
+/* ------------------------------------------------------------------
+ *  尺寸自适应
+ * ------------------------------------------------------------------ */
+function fit(cv) {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (!w || !h) return;
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
+    cv.width = Math.round(w * dpr);
+    cv.height = Math.round(h * dpr);
+  }
+}
+function fitAll() { [wfCv, barCv, moCv, htCv].forEach(fit); }
+window.addEventListener('resize', fitAll);
+setTimeout(fitAll, 30);
+
+/* ------------------------------------------------------------------
+ *  瀑布图
+ * ------------------------------------------------------------------ */
+function initWaterfall(n) {
+  NC = n;
+  off = document.createElement('canvas');
+  off.width = NC;
+  off.height = WF_ROWS;
+  octx = off.getContext('2d', { alpha: false });
+  img = octx.createImageData(NC, WF_ROWS);
+  u32 = new Uint32Array(img.data.buffer);
+  u32.fill(COLORS[0]);
+  octx.putImageData(img, 0, 0);
+  el('ncar').textContent = NC;
+  el('ovl').classList.add('hide');
+}
+
+/* 用 5% / 95% 分位做归一化：抗单点尖峰，比 min/max 稳得多 */
+function normalize(src) {
+  const n = src.length;
+  const tmp = Float32Array.from(src);
+  tmp.sort();
+  const lo = tmp[Math.floor(n * 0.05)];
+  const hi = tmp[Math.min(n - 1, Math.floor(n * 0.95))];
+  const span = Math.max(hi - lo, 1e-3);
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    out[i] = Math.min(1, Math.max(0, (src[i] - lo) / span));
+  }
+  return out;
+}
+
+function pushWaterfall(norm) {
+  // 整体下移一行，再画顶行
+  u32.copyWithin(NC, 0, NC * (WF_ROWS - 1));
+  for (let i = 0; i < NC; i++) {
+    u32[i] = COLORS[(norm[i] * 255) | 0];
+  }
+  octx.putImageData(img, 0, 0);
+}
+
+/* ------------------------------------------------------------------
+ *  运动检测
+ *
+ *  先对每帧振幅做「零均值 + 单位方差」标准化，再和上一帧求平均绝对差。
+ *  这样做的好处是跟绝对信号强度无关：人走到路由器旁边导致 RSSI 整体抬升，
+ *  不会误判成运动；只有子载波之间的**相对形状**变了才算动。
+ * ------------------------------------------------------------------ */
+function motionOf(amp) {
+  const n = amp.length;
+  let mean = 0;
+  for (let i = 0; i < n; i++) mean += amp[i];
+  mean /= n;
+  let varSum = 0;
+  for (let i = 0; i < n; i++) { const d = amp[i] - mean; varSum += d * d; }
+  const sd = Math.sqrt(varSum / n) || 1;
+
+  const z = new Float32Array(n);
+  for (let i = 0; i < n; i++) z[i] = (amp[i] - mean) / sd;
+
+  let diff = 0;
+  if (prevZ && prevZ.length === n) {
+    for (let i = 0; i < n; i++) diff += Math.abs(z[i] - prevZ[i]);
+    diff /= n;
+
+    // 累积每路子载波的活动量（画热条）
+    if (heatAccum) {
+      for (let i = 0; i < n; i++) heatAccum[i] += Math.abs(z[i] - prevZ[i]) / n;
+    }
+  }
+  prevZ = z;
+  return diff;
+}
+
+/* ------------------------------------------------------------------
+ *  各视图绘制
+ * ------------------------------------------------------------------ */
+function drawWaterfall() {
+  const ctx = wfCtx;
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(off, 0, 0, NC, WF_ROWS, 0, 0, wfCv.width, wfCv.height);
+}
+
+function drawBars(amp) {
+  const W = barCv.width, H = barCv.height;
+  const ctx = barCtx;
+  ctx.clearRect(0, 0, W, H);
+  if (!amp) return;
+
+  const n = amp.length;
+  const gap = Math.max(0, W / n * 0.18);
+  const bw = W / n - gap;
+
+  let mn = Infinity, mx = -Infinity;
+  for (let i = 0; i < n; i++) { const v = amp[i]; if (v < mn) mn = v; if (v > mx) mx = v; }
+  const span = Math.max(mx - mn, 1);
+
+  for (let i = 0; i < n; i++) {
+    const t = (amp[i] - mn) / span;
+    const h = Math.max(1, t * H * 0.92);
+    const x = i * (W / n);
+    const grad = ctx.createLinearGradient(0, H, 0, H - h);
+    grad.addColorStop(0, '#15456b');
+    grad.addColorStop(0.55, '#22d3ee');
+    grad.addColorStop(1, '#a7f3d0');
+    ctx.fillStyle = grad;
+    ctx.fillRect(x, H - h, bw, h);
+  }
+}
+
+function drawMotion() {
+  const W = moCv.width, H = moCv.height;
+  const ctx = moCtx;
+  ctx.clearRect(0, 0, W, H);
+
+  // 参考线：0.3 / 0.8 / 1.6 三档阈值
+  ctx.strokeStyle = '#1b2637';
+  ctx.lineWidth = 1;
+  for (const th of [0.3, 0.8, 1.6]) {
+    const y = H - Math.min(1, th / 2.0) * H;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  }
+
+  const scale = Math.min(1, 2.0 / 2.0);
+  ctx.beginPath();
+  for (let i = 0; i < MOTION_LEN; i++) {
+    const idx = (motionHead + i) % MOTION_LEN;
+    const v = Math.min(motionHist[idx], 2.0) / 2.0;
+    const x = (i / (MOTION_LEN - 1)) * W;
+    const y = H - v * H;
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  }
+  ctx.strokeStyle = '#22d3ee';
+  ctx.lineWidth = 1.6;
+  ctx.stroke();
+
+  // 填充
+  ctx.lineTo(W, H); ctx.lineTo(0, H); ctx.closePath();
+  ctx.fillStyle = 'rgba(34,211,238,0.10)';
+  ctx.fill();
+}
+
+function drawHeat() {
+  const W = htCv.width, H = htCv.height;
+  const ctx = htCtx;
+  ctx.clearRect(0, 0, W, H);
+  if (!heatAccum || !NC) return;
+
+  let mx = 0;
+  for (let i = 0; i < NC; i++) if (heatAccum[i] > mx) mx = heatAccum[i];
+  const inv = mx > 1e-6 ? 1 / mx : 0;
+
+  for (let i = 0; i < NC; i++) {
+    const t = heatAccum[i] * inv;
+    const c = COLORS[(t * 255) | 0];
+    const r = (c & 255), g = (c >> 8) & 255, b = (c >> 16) & 255;
+    ctx.fillStyle = `rgb(${r},${g},${b})`;
+    ctx.fillRect(i * (W / NC), 0, W / NC + 0.6, H);
+  }
+}
+
+/* ------------------------------------------------------------------
+ *  状态判定
+ * ------------------------------------------------------------------ */
+function updateState(v) {
+  const x = v / sens;
+  let label, color, cls, fill;
+
+  if (lastRssi === null) {
+    label = '等待数据'; color = 'var(--dim)'; cls = ''; fill = 0;
+  } else if (x < 0.28) {
+    label = '无人 / 完全静止'; color = 'var(--ok)'; cls = 'on'; fill = 12;
+  } else if (x < 0.62) {
+    label = '有人存在 · 轻微动作'; color = 'var(--accent)'; cls = 'on'; fill = 42;
+  } else if (x < 1.25) {
+    label = '持续动作'; color = 'var(--warn)'; cls = 'warn'; fill = 72;
+  } else {
+    label = '剧烈活动'; color = 'var(--bad)'; cls = 'bad'; fill = 100;
+  }
+
+  el('stateTxt').textContent = label;
+  el('stateTxt').style.color = color;
+  el('dotState').className = 'dot ' + cls;
+  el('dotState').style.background = color;
+  el('dotState').style.color = color;
+  el('stateFill').style.width = fill + '%';
+  el('stateFill').style.background = color;
+}
+
+/* ------------------------------------------------------------------
+ *  收到一帧
+ * ------------------------------------------------------------------ */
+function onFrame(rssi, flags, amp, ts) {
+  lastRssi = rssi;
+  el('rssi').textContent = rssi;
+
+  if (amp.length !== NC) initWaterfall(amp.length);
+
+  // 硬件标记「前 4 字节无效」时补零，别让它污染归一化
+  const a = Float32Array.from(amp);
+  if (flags & 1) { a[0] = a[1]; a[2] = a[3]; }
+
+  const norm = normalize(a);
+  pushWaterfall(norm);
+  drawWaterfall();
+  drawBars(a);
+
+  const m = motionOf(a);
+  motionVal = motionVal * 0.55 + m * 0.45;   // EMA 平滑
+  motionHist[motionHead] = motionVal;
+  motionHead = (motionHead + 1) % MOTION_LEN;
+
+  if (!heatAccum || heatAccum.length !== NC) heatAccum = new Float32Array(NC);
+  for (let i = 0; i < NC; i++) heatAccum[i] *= 0.94;   // 衰减，显示「最近」的活动
+
+  drawMotion();
+  drawHeat();
+  updateState(motionVal);
+
+  el('motionVal').textContent = motionVal.toFixed(2);
+  el('motionVal').style.color =
+    motionVal / sens < 0.28 ? 'var(--ok)' :
+    motionVal / sens < 0.62 ? 'var(--accent)' :
+    motionVal / sens < 1.25 ? 'var(--warn)' : 'var(--bad)';
+
+  frameCount++;
+  const now = performance.now();
+  if (now - fpsLast >= 1000) {
+    fpsWin = Math.round(frameCount * 1000 / (now - fpsLast));
+    frameCount = 0; fpsLast = now;
+    el('fps').textContent = fpsWin;
+  }
+}
+
+/* ------------------------------------------------------------------
+ *  顶栏状态：芯片温度 / 路由器连接
+ * ------------------------------------------------------------------ */
+let netShown = null;
+
+function setTemp(dc) {
+  if (!dc) return;
+  const t = dc / 10;
+  const el2 = el('temp');
+  el2.textContent = t.toFixed(1);
+  el2.style.color = t >= 75 ? 'var(--bad)' : t >= 62 ? 'var(--warn)' : '';
+}
+
+function setNet(up, ip) {
+  if (netShown === up + ip) return;
+  netShown = up + ip;
+  const chip = el('netChip');
+  const dot = el('dotNet');
+  if (up) {
+    el('netTxt').textContent = ip;
+    dot.className = 'dot on';
+    chip.classList.remove('warn');
+    chip.title = '已连上路由器，点此可改配网';
+  } else {
+    el('netTxt').textContent = '未配网 · 点此配置';
+    dot.className = 'dot warn';
+    chip.classList.add('warn');
+    chip.title = '还没连上路由器，点击配网';
+  }
+}
+
+/* ------------------------------------------------------------------
+ *  WebSocket
+ * ------------------------------------------------------------------ */
+let ws = null;
+let hbTimer = null;
+let retry = 0;
+
+function setConn(ok, txt) {
+  el('dotConn').className = 'dot ' + (ok ? 'on' : 'bad');
+  el('connTxt').textContent = txt;
+}
+
+function connect() {
+  const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+  ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    retry = 0;
+    setConn(true, '已连接');
+    // 10ms 心跳：既是保活，也是固件推送 CSI 的节拍器
+    hbTimer = setInterval(() => {
+      if (ws && ws.readyState === 1) ws.send('p');
+    }, 10);
+  };
+
+  ws.onmessage = ev => {
+    if (typeof ev.data === 'string') {
+      try {
+        const j = JSON.parse(ev.data);
+        if (j.t === 'st') {
+          el('fps').textContent = j.fps;
+          el('rssi').textContent = j.rssi;
+          lastRssi = j.rssi;
+          if (j.n) el('ncar').textContent = j.n === NC ? NC : (NC || j.n);
+          setTemp(j.temp);
+          setNet(!!j.sta, j.ip || '');
+        }
+      } catch (_) { /* 忽略 */ }
+      return;
+    }
+    if (paused) return;
+
+    const dv = new DataView(ev.data);
+    if (dv.getUint8(0) !== 1) return;
+    const rssi = dv.getInt8(1);
+    const flags = dv.getUint8(2);
+    const n = dv.getUint8(3);
+    if (n < 8 || n > 64) return;
+    const amp = new Uint8Array(ev.data, 4, n);
+    const ts = dv.getUint32(4 + n, true);
+    onFrame(rssi, flags, amp, ts);
+  };
+
+  ws.onclose = () => {
+    setConn(false, '已断开');
+    if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
+    retry = Math.min(retry + 1, 6);
+    setTimeout(connect, 300 * retry);
+  };
+
+  ws.onerror = () => { setConn(false, '连接失败'); };
+}
+
+/* ------------------------------------------------------------------
+ *  交互
+ * ------------------------------------------------------------------ */
+el('sens').addEventListener('input', e => {
+  sens = parseFloat(e.target.value);
+  el('sensVal').textContent = sens.toFixed(2) + '×';
+});
+
+el('pause').addEventListener('click', e => {
+  paused = !paused;
+  e.target.textContent = paused ? '继续' : '暂停';
+});
+
+el('clear').addEventListener('click', () => {
+  if (u32) { u32.fill(COLORS[0]); octx.putImageData(img, 0, 0); drawWaterfall(); }
+  motionHist.fill(0);
+  if (heatAccum) heatAccum.fill(0);
+  prevZ = null;
+  motionVal = 0;
+  drawMotion(); drawHeat();
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && ws && ws.readyState !== 1) connect();
+});
+
+
+/* ------------------------------------------------------------------
+ *  离线模拟器（preview.html 专用）
+ *
+ *  没有板子也能看效果。数据是合成的，但走的是和真机完全相同的
+ *  onFrame() 渲染路径，所以色阶、运动判定、瀑布滚动都一致。
+ * ------------------------------------------------------------------ */
+function startSim() {
+  setConn(true, '模拟数据');
+  el('ovl').classList.add('hide');
+  setNet(true, '192.168.1.23');
+
+  const N = 56;
+  let t = 0, n = 0;
+
+  setInterval(() => {
+    if (paused) return;
+    t += 0.02;
+    n++;
+
+    // 温度模拟：缓慢漂移，40~48℃
+    if (n % 25 === 0) setTemp(Math.round(440 + Math.sin(t * 0.08) * 40));
+
+    // 14 秒一个循环：静止 → 呼吸 → 走动 → 静止
+    const cyc = t % 14;
+    const walking = cyc > 5 && cyc < 10;
+    const breathing = !walking && cyc > 2 && cyc < 5;
+
+    const amp = new Uint8Array(N);
+    for (let i = 0; i < N; i++) {
+      let base = 30
+        + 11 * Math.sin(i * 0.31 + 0.4)
+        + 7 * Math.cos(i * 0.13 + 1.2)
+        + 4 * Math.sin(i * 0.87);
+      base += 3 * Math.sin(t * 0.25);
+
+      let d = 0;
+      if (walking) {
+        const center = 28 + 16 * Math.sin(t * 0.9);
+        d += Math.sin(t * 11 + i * 0.6) * 9 *
+             Math.exp(-Math.pow((i - center) / 14, 2));
+      } else if (breathing) {
+        d += Math.sin(t * 2.6) * 2.2;
+      }
+
+      const noise = (Math.random() - 0.5) * 2.4;
+      amp[i] = Math.max(1, Math.min(255, Math.round(base + d + noise)));
+    }
+
+    const rssi = Math.round(-45 + Math.sin(t * 0.3) * 3 - (walking ? 3 : 0));
+    onFrame(rssi, 0, amp, Math.round(t * 1000));
+    el('fps').textContent = 50;
+  }, 20);
+}
+
+fitAll();
+startSim();
+</script>
+</body>
+</html>
