@@ -443,8 +443,8 @@ pub async fn serve_once(socket: &mut TcpSocket<'_>) -> Served {
     }
 
     // ---- 电源控制：唤醒 / 睡眠（热点侧、局域网侧共用）----
-    // 这是「不开 WebSocket 也能按」的快捷入口；控制页顶栏那两个按钮是走 WS 的，
-    // 因为 WS 连着的时候同一个 stack 上接不了第二个 HTTP 请求。
+    // 这是「不开 WebSocket 也能按」的快捷入口，给 curl / 脚本用；
+    // 控制页顶栏那两个按钮走 WS，省一次握手（现在会话槽有 4 个，走 HTTP 也接得上）。
     if find_seq(path, b"/wake").is_some() {
         log::info!("[web] 收到唤醒请求");
         // 先把响应发回去，再去拉总线：唤醒后如果主机重新枚举，这条连接会断，

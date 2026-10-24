@@ -1008,9 +1008,10 @@ async fn main(spawner: Spawner) -> ! {
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
     let seed2 = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xA5A5_5A5A;
 
-    // socket 槽位要从宽：热点侧同时要 web(TCP) + DHCP(UDP) + DNS(UDP)，
-    // 联网侧要 web(TCP) + MQTT(TCP) + WOL(UDP) + DNS 查询(UDP) 共四个，
-    // 之前给 3 个不够，smoltcp 会直接 panic（adding a socket to a full SocketSet）。
+    // socket 槽位要从宽：每个网现在并排跑 WEB_SESSIONS 个网页监听 socket，
+    // 联网侧还要加 MQTT(TCP) + WOL(UDP) + DNS 查询(UDP)，
+    // 热点侧加 DHCP(UDP) + 假 DNS(UDP)。
+    // 不够的话 smoltcp 会直接 panic（adding a socket to a full SocketSet）。
     // 热点侧：ESP32 自己就是网关，地址固定
     let (ap_stack, ap_runner) = embassy_net::new(
         interfaces.access_point,
@@ -1019,7 +1020,7 @@ async fn main(spawner: Spawner) -> ! {
             gateway: None,
             dns_servers: heapless::Vec::new(),
         }),
-        mk_static!(StackResources<6>, StackResources::<6>::new()),
+        mk_static!(StackResources<10>, StackResources::<10>::new()),
         seed,
     );
 
@@ -1036,7 +1037,7 @@ async fn main(spawner: Spawner) -> ! {
     let (stack, sta_runner) = embassy_net::new(
         interfaces.station,
         sta_net_config,
-        mk_static!(StackResources<6>, StackResources::<6>::new()),
+        mk_static!(StackResources<10>, StackResources::<10>::new()),
         seed2,
     );
 
@@ -1066,10 +1067,19 @@ async fn main(spawner: Spawner) -> ! {
     //     .expect("failed to spawn lcd task"),
     //     );
 
-    spawner
-        .spawn(ap_web_task(ap_stack).expect("failed to spawn ap web task"));
-    spawner
-        .spawn(sta_web_task(stack).expect("failed to spawn sta web task"));
+    // 每个网起 WEB_SESSIONS 个网页会话任务（各自一个监听 socket + 一块 2KB×2 缓冲）
+    spawn_web_sessions(
+        spawner,
+        ap_stack,
+        "AP",
+        AP_WEB_BUF.init([[0u8; WEB_BUF]; WEB_SESSIONS * 2]),
+    );
+    spawn_web_sessions(
+        spawner,
+        stack,
+        "STA",
+        STA_WEB_BUF.init([[0u8; WEB_BUF]; WEB_SESSIONS * 2]),
+    );
 
     // 热点侧必须自带 DHCP + 假 DNS，否则手机连上会"无互联网"然后断开
     spawner
@@ -1285,26 +1295,54 @@ async fn dns_task(stack: Stack<'static>) {
     dns::run(stack, store::AP_IP).await;
 }
 
-#[embassy_executor::task]
-async fn ap_web_task(stack: Stack<'static>) {
-    web_server(
-        stack,
-        "AP",
-        mk_static!([u8; 3072], [0u8; 3072]),
-        mk_static!([u8; 3072], [0u8; 3072]),
-    )
-    .await;
+/// 每个网同时能接几条网页连接。
+///
+/// 以前是 1 条：一个 stack 只有一个 TcpSocket，WebSocket 升级后它就一直占着，
+/// 第二个人打开 /kvm 直接连不上（新 SYN 没有 listen 状态的 socket 可接，回 RST），
+/// 已经打开的页面也会一直"3 秒后重连"。
+/// 现在每个网并排跑 `WEB_SESSIONS` 个监听 socket —— smoltcp 允许多个 socket 同时
+/// listen 同一个端口，新连接自然落到空闲的那个上，不需要额外的任务分发器。
+const WEB_SESSIONS: usize = 4;
+/// 单条连接的收发缓冲。WS 帧最大 42 字节、HTTP 请求头几百字节，2KB 足够；
+/// 24KB 的页面靠 write_all 分片发，局域网里感觉不到差别。
+const WEB_BUF: usize = 2048;
+
+static AP_WEB_BUF: static_cell::StaticCell<[[u8; WEB_BUF]; WEB_SESSIONS * 2]> =
+    static_cell::StaticCell::new();
+static STA_WEB_BUF: static_cell::StaticCell<[[u8; WEB_BUF]; WEB_SESSIONS * 2]> =
+    static_cell::StaticCell::new();
+
+/// 当前活着的 WebSocket 条数（两套栈共享）。
+///
+/// 只有最后一条断开时才 `release_all()`：以前不管几条，谁断就把键盘鼠标全清零，
+/// 多人同时用时会把别人正按住的键一起松掉（拖拽直接断）。
+static WS_CLIENTS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+#[embassy_executor::task(pool_size = WEB_SESSIONS * 2)]
+async fn web_task(
+    stack: Stack<'static>,
+    tag: &'static str,
+    rx: &'static mut [u8; WEB_BUF],
+    tx: &'static mut [u8; WEB_BUF],
+) {
+    web_server(stack, tag, rx, tx).await;
 }
 
-#[embassy_executor::task]
-async fn sta_web_task(stack: Stack<'static>) {
-    web_server(
-        stack,
-        "STA",
-        mk_static!([u8; 3072], [0u8; 3072]),
-        mk_static!([u8; 3072], [0u8; 3072]),
-    )
-    .await;
+/// 把一块 buffer 切一半当 rx、一半当 tx，然后起 `WEB_SESSIONS` 个会话任务。
+///
+/// 注意 buffer 必须由调用方传进来：`mk_static!` 展开成函数内的 static，
+/// 这个函数会被 AP / STA 各调一次，函数内 static 只有一份，第二次写必 panic。
+fn spawn_web_sessions(
+    spawner: Spawner,
+    stack: Stack<'static>,
+    tag: &'static str,
+    buf: &'static mut [[u8; WEB_BUF]; WEB_SESSIONS * 2],
+) {
+    let (rx, tx) = buf.split_at_mut(WEB_SESSIONS);
+    for (r, t) in rx.iter_mut().zip(tx.iter_mut()) {
+        spawner
+            .spawn(web_task(stack, tag, r, t).expect("failed to spawn web session"));
+    }
 }
 
 /// 配网 HTTP 服务。热点侧和局域网侧各跑一份。
@@ -1314,8 +1352,8 @@ async fn sta_web_task(stack: Stack<'static>) {
 async fn web_server(
     stack: Stack<'static>,
     tag: &'static str,
-    rx: &'static mut [u8],
-    tx: &'static mut [u8],
+    rx: &'static mut [u8; WEB_BUF],
+    tx: &'static mut [u8; WEB_BUF],
 ) {
     let mut socket = TcpSocket::new(stack, rx, tx);
 
@@ -1332,23 +1370,22 @@ async fn web_server(
 
         // 收请求头只给 10 秒。
         //
-        // 为什么：一个网**只有一个 socket**。手机切了 WiFi / 息屏 / 标签页被冻结时，
-        // 对端不会发 FIN，这条连接会一直占着这个唯一的 socket —— 新连接（包括页面
-        // 重连的 WebSocket）全部被拒，表现就是页面上永远"已断开，3 秒后重连"。
-        // 之前这里给的是 120 秒，等于卡住时整个网页服务要瘫两分钟。
+        // 原因：手机切了 WiFi / 息屏 / 标签页被冻结时，对端不会发 FIN，
+        // 这条连接会一直占着一个会话槽。槽位现在有 WEB_SESSIONS 个，被占一个不至于
+        // 全瘫，但也没必要白等 —— 10 秒足够一台手机把请求头发完。
         socket.set_timeout(Some(Duration::from_secs(10)));
 
         match web::serve_once(&mut socket).await {
             web::Served::WebSocket => {
-                dlog!("[web/{tag}] WS 已升级");
+                let alive = WS_CLIENTS.fetch_add(1, Ordering::Relaxed) + 1;
+                dlog!("[web/{tag}] WS 已升级（在线 {alive} 条）");
                 // 升级成功后换成长超时：页面每 20 秒发一次 `_p` 心跳，
                 // 读超时太小会把正常空闲的连接误杀（页面又会闪断重连）。
                 socket.set_timeout(Some(Duration::from_secs(120)));
                 let _ = web::ws_text(&mut socket, "_ok").await;
 
-                // 一条连接一直读，直到客户端关闭 / 超时。
-                // 注意：一个 stack 只有一个 socket，WS 开着的时候这个 stack 上的
-                // HTTP 页面就进不来了 —— 想改 WiFi 就先关掉控制页（或走另一个网）。
+                // 这条连接一直读，直到客户端关闭 / 超时。别的会话槽照常在 accept，
+                // 所以同时开几个页面都行（同一台设备同时操作会互相覆盖，见 README）。
                 let mut buf = [0u8; 256];
                 loop {
                     match web::ws_read(&mut socket, &mut buf).await {
@@ -1365,9 +1402,15 @@ async fn web_server(
                     }
                 }
 
-                // 断开时把所有键松开，免得目标机上卡键
-                dlog!("[web/{tag}] WS 断开，已释放所有键");
-                release_all();
+                // 只在最后一个客户端离开时清空键鼠。
+                // 多人同时用时，谁断都 release_all() 会把别人按住的键一起松掉。
+                let left = WS_CLIENTS.fetch_sub(1, Ordering::Relaxed) - 1;
+                if left == 0 {
+                    dlog!("[web/{tag}] WS 断开（已无客户端），释放所有键");
+                    release_all();
+                } else {
+                    dlog!("[web/{tag}] WS 断开，还有 {left} 条在线");
+                }
             }
             web::Served::Page => {}
         }
