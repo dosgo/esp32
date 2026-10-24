@@ -16,12 +16,14 @@
 #![no_main]
 
 mod dns;
+mod hid;
 mod lcd;
 mod mqtt;
 mod store;
 mod web;
 
 use core::fmt::Write as _;
+use core::str;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use embassy_executor::Spawner;
@@ -137,6 +139,27 @@ static CMD_CHAN: Channel<CriticalSectionRawMutex, PowerCmd, 8> = Channel::new();
 /// 必须先做 USB 远程唤醒（remote wakeup）把总线恢复到 active。
 static USB_WAKE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
+// ================= 网页键鼠（从 hid-kvm 移植）=================
+//
+// 热点和局域网各跑一个 web server，两边都能下发键鼠指令，但 USB 的 HidWriter
+// 只有一份、不能 clone，所以走队列：web 任务只管塞事件，hid_task 单独消费写 USB。
+//
+// 键盘**复用**原来那个 boot 6KRO 接口（Report ID 1），所以这里存的是 8 字节
+// 裸报告（mod + 保留 + 6 键），写的时候前面补一个 0x01。
+
+pub enum HidEvent {
+    /// boot 键盘报告 8 字节：[mod, 0, k1..k6]
+    Kbd([u8; 8]),
+    /// 鼠标：[btn, dx, dy, wheel]
+    Mouse([u8; 4]),
+    /// 媒体键：16 位 usage（小端），0 = 松开
+    Cc([u8; 2]),
+}
+
+pub static HID_Q: Channel<CriticalSectionRawMutex, HidEvent, 24> = Channel::new();
+
+// 下面 push_hid / release_all 两个函数放在 dlog! 宏定义之后（macro_rules 是文本作用域）
+
 // ================= 诊断日志：手机连热点打开 http://192.168.4.1/log 查看 =========
 //
 // 为什么需要：这块是 USB-A 直插的 dongle 板，只有一个 USB 口，OTG 一旦接管，
@@ -217,6 +240,20 @@ macro_rules! dlog {
     ($($a:tt)*) => {
         $crate::push_log(format_args!($($a)*))
     };
+}
+
+/// 队列满就丢一帧（鼠标位移丢一帧无所谓，不能让整条队列把键盘堵住）
+fn push_hid(ev: HidEvent) {
+    if HID_Q.try_send(ev).is_err() {
+        dlog!("[hid] 队列满，丢一帧");
+    }
+}
+
+/// 松开所有键：切窗口 / 断开连接 / 点「释放所有键」都走这里，防卡键。
+pub fn release_all() {
+    push_hid(HidEvent::Kbd([0u8; 8]));
+    push_hid(HidEvent::Cc([0u8; 2]));
+    push_hid(HidEvent::Mouse([0u8; 4]));
 }
 
 /// 网络状态，给配网页的 /status 用
@@ -422,13 +459,45 @@ async fn remote_wakeup_hw() {
 }
 
 #[embassy_executor::task]
-async fn hid_task(mut writer: HidWriter<'static, Driver<'static>, 9>, stack: Stack<'static>) {
+async fn hid_task(
+    mut writer: HidWriter<'static, Driver<'static>, 9>,
+    mut mouse: HidWriter<'static, Driver<'static>, 4>,
+    mut cc: HidWriter<'static, Driver<'static>, 2>,
+    stack: Stack<'static>,
+) {
     info!("hid task started");
     // socket 只建一次：mk_static! 是对 StaticCell 做 write，写第二次会 panic，
     // 所以不能像原来那样放在 send_wol() 里面（每次唤醒都重新 mk_static）。
     let mut wol = wol_socket(stack);
     loop {
-        let cmd = CMD_CHAN.receive().await;
+        // 电源指令（Blinker / 网页按钮 / BOOT 键）和网页键鼠挤在同一个任务里：
+        // USB 的 HidWriter 只有一份，没法再开一个任务各拿一个。
+        let cmd = match select(CMD_CHAN.receive(), HID_Q.receive()).await {
+            Either::First(c) => c,
+            Either::Second(ev) => {
+                match ev {
+                    // 复用电源键原来的键盘 interface（Report ID 1），前面补一个 ID
+                    HidEvent::Kbd(r) => send(&mut writer, &[1, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]]).await,
+                    HidEvent::Mouse(r) => {
+                        if with_timeout(Duration::from_millis(200), mouse.write(&r))
+                            .await
+                            .is_err()
+                        {
+                            dlog!("[hid] 鼠标报告超时（电脑没枚举？）");
+                        }
+                    }
+                    HidEvent::Cc(r) => {
+                        if with_timeout(Duration::from_millis(200), cc.write(&r))
+                            .await
+                            .is_err()
+                        {
+                            dlog!("[hid] 媒体键报告超时");
+                        }
+                    }
+                }
+                continue;
+            }
+        };
         info!("executing: {cmd:?}");
 
         match cmd {
@@ -825,6 +894,39 @@ async fn main(spawner: Spawner) -> ! {
         hid_boot_protocol: HidBootProtocol::None,
     };
     let writer = HidWriter::<Driver<'static>, 9>::new(&mut builder, hid_state, hid_config);
+
+    // ② 鼠标：boot protocol，4 字节（网页上的触控区）
+    let mouse_state = mk_static!(HidState, HidState::new());
+    let mouse = HidWriter::<Driver<'static>, 4>::new(
+        &mut builder,
+        mouse_state,
+        HidConfig {
+            report_descriptor: hid::MOUSE_DESC,
+            request_handler: None,
+            // 鼠标要跟手，轮询间隔压到 1ms（键盘 10ms 足够）
+            poll_ms: 1,
+            max_packet_size: 8,
+            hid_subclass: HidSubclass::Boot,
+            hid_boot_protocol: HidBootProtocol::Mouse,
+        },
+    );
+
+    // ③ Consumer Control：音量 / 播放暂停等媒体键（2 字节，usage 16 位）
+    let cc_state = mk_static!(HidState, HidState::new());
+    let cc = HidWriter::<Driver<'static>, 2>::new(
+        &mut builder,
+        cc_state,
+        HidConfig {
+            report_descriptor: hid::CONSUMER_DESC,
+            request_handler: None,
+            poll_ms: 10,
+            max_packet_size: 8,
+            // 不是 boot device，用 No
+            hid_subclass: HidSubclass::No,
+            hid_boot_protocol: HidBootProtocol::None,
+        },
+    );
+
     let device = builder.build();
 
     spawner
@@ -944,7 +1046,7 @@ async fn main(spawner: Spawner) -> ! {
         .spawn(net_task(sta_runner).expect("failed to spawn sta net task"));
     // HID 任务要拿联网侧的 stack 发 WOL，所以挪到这里 spawn
     spawner
-        .spawn(hid_task(writer, stack).expect("failed to spawn hid task"));
+        .spawn(hid_task(writer, mouse, cc, stack).expect("failed to spawn hid task"));
 
     // LCD 放在这里 spawn：USB 枚举和 WiFi 初始化都已经过去了，
     // 屏初始化的几十毫秒阻塞不会影响枚举。
@@ -1216,18 +1318,59 @@ async fn web_server(
     tx: &'static mut [u8],
 ) {
     let mut socket = TcpSocket::new(stack, rx, tx);
-    socket.set_timeout(Some(Duration::from_secs(30)));
 
     info!("[web/{tag}] 监听 {}:{}", "0.0.0.0", web::HTTP_PORT);
 
     loop {
+        // 空等新连接可以等很久（这里 120 秒只是让日志偶尔刷一行）
+        socket.set_timeout(Some(Duration::from_secs(120)));
         if let Err(e) = socket.accept(web::HTTP_PORT).await {
             warn!("[web/{tag}] accept 失败: {e:?}");
             Timer::after(Duration::from_millis(500)).await;
             continue;
         }
 
-        web::serve_once(&mut socket).await;
+        // 收请求头只给 10 秒。
+        //
+        // 为什么：一个网**只有一个 socket**。手机切了 WiFi / 息屏 / 标签页被冻结时，
+        // 对端不会发 FIN，这条连接会一直占着这个唯一的 socket —— 新连接（包括页面
+        // 重连的 WebSocket）全部被拒，表现就是页面上永远"已断开，3 秒后重连"。
+        // 之前这里给的是 120 秒，等于卡住时整个网页服务要瘫两分钟。
+        socket.set_timeout(Some(Duration::from_secs(10)));
+
+        match web::serve_once(&mut socket).await {
+            web::Served::WebSocket => {
+                dlog!("[web/{tag}] WS 已升级");
+                // 升级成功后换成长超时：页面每 20 秒发一次 `_p` 心跳，
+                // 读超时太小会把正常空闲的连接误杀（页面又会闪断重连）。
+                socket.set_timeout(Some(Duration::from_secs(120)));
+                let _ = web::ws_text(&mut socket, "_ok").await;
+
+                // 一条连接一直读，直到客户端关闭 / 超时。
+                // 注意：一个 stack 只有一个 socket，WS 开着的时候这个 stack 上的
+                // HTTP 页面就进不来了 —— 想改 WiFi 就先关掉控制页（或走另一个网）。
+                let mut buf = [0u8; 256];
+                loop {
+                    match web::ws_read(&mut socket, &mut buf).await {
+                        Ok((web::OP_TEXT, n)) => dispatch(&buf[..n]),
+                        Ok((web::OP_PING, _)) => {
+                            let _ = web::ws_pong(&mut socket).await;
+                        }
+                        Ok((web::OP_CLOSE, _)) => {
+                            dlog!("[web/{tag}] 客户端主动关闭");
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+
+                // 断开时把所有键松开，免得目标机上卡键
+                dlog!("[web/{tag}] WS 断开，已释放所有键");
+                release_all();
+            }
+            web::Served::Page => {}
+        }
 
         socket.close();
         let _ = socket.flush().await;
@@ -1241,4 +1384,151 @@ async fn web_server(
 #[embassy_executor::task(pool_size = 2)]
 async fn net_task(mut runner: Runner<'static, Interface<'static>>) {
     runner.run().await
+}
+
+// ==================== 网页键鼠：线协议解析 ====================
+//
+// 从 esp32s3-hid-kvm 的 dispatch() 移植，唯一区别是键盘只有一路 boot 6KRO
+// （电源键原有的那个 interface），所以 `n`（NKRO bitmap）和 `k`（6KRO 数组）
+// 两种帧都归一成 6KRO 再发。
+//
+//   n <40位hex>                   NKRO 键盘报告（20 字节，这里转成 6KRO）
+//   k <mod> <k1..k6>              boot 6KRO 键盘报告（页面不发，留着方便手动调试）
+//   m <btn> <dx> <dy> <wheel>     鼠标（相对位移）
+//   c <usage>                     媒体键，usage=0 表示松开
+//   p wake|sleep|power            电源指令（网页顶栏那两个按钮）
+//   r                             释放所有键
+//   _p                            心跳（20 秒一次，只为保活）
+//
+// 没有 BIOS 模式开关：这个键盘本来就是 boot 6KRO（6 键上限，BIOS 直接认），
+// 所以 `n` 帧在固件里转成 6KRO 就完事，不需要再让用户切来切去。
+
+fn dispatch(cmd: &[u8]) {
+    let text = match str::from_utf8(cmd) {
+        Ok(s) => s.trim(),
+        Err(_) => return,
+    };
+    let mut it = text.split(' ');
+
+    match it.next() {
+        Some("n") => {
+            let mut rep = [0u8; 20];
+            if decode_hex(it.next().unwrap_or(""), &mut rep) != 20 {
+                return;
+            }
+            push_hid(HidEvent::Kbd(nkro_to_boot(&rep)));
+        }
+        Some("k") => {
+            let mut rep = [0u8; 8];
+            rep[0] = parse_u(it.next()) as u8;
+            for i in 0..6 {
+                rep[2 + i] = parse_u(it.next()) as u8;
+            }
+            push_hid(HidEvent::Kbd(rep));
+        }
+        Some("m") => {
+            let btn = parse_u(it.next()) as u8;
+            let dx = parse_i(it.next());
+            let dy = parse_i(it.next());
+            let w = parse_i(it.next());
+            push_hid(HidEvent::Mouse([btn, dx as u8, dy as u8, w as u8]));
+        }
+        Some("c") => {
+            let u = parse_u(it.next());
+            push_hid(HidEvent::Cc([(u & 0xFF) as u8, ((u >> 8) & 0xFF) as u8]));
+        }
+        // 网页上的「唤醒 / 睡眠」走电源那条老链路，远程唤醒的门禁兜底一起用
+        Some("p") => {
+            let c = match it.next().unwrap_or("") {
+                "wake" => PowerCmd::Wake,
+                "sleep" => PowerCmd::Sleep,
+                _ => PowerCmd::PowerDown,
+            };
+            dlog!("[web] 请求 {c:?}");
+            if CMD_CHAN.try_send(c).is_err() {
+                dlog!("[web] 电源指令队列满");
+            }
+        }
+        Some("r") => release_all(),
+        Some("_p") => {}
+        _ => {}
+    }
+}
+
+/// NKRO 20 字节报告（1 修饰键 + 152 位 bitmap）→ boot 6KRO 8 字节报告。
+///
+/// bitmap 是无序的，这里按 usage 从小到大取前 6 个 —— 超过 6 键同按会丢键，
+/// 这是 boot protocol 的硬上限，日常使用基本碰不到。
+fn nkro_to_boot(n: &[u8; 20]) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    out[0] = n[0];
+    let mut slot = 2usize;
+
+    for byte in 1..20 {
+        let bits = n[byte];
+        if bits == 0 {
+            continue;
+        }
+        for bit in 0..8 {
+            if bits & (1 << bit) == 0 {
+                continue;
+            }
+            let usage = ((byte - 1) * 8 + bit) as u8;
+            if usage == 0 {
+                continue;
+            }
+            if slot < 8 {
+                out[slot] = usage;
+                slot += 1;
+            }
+        }
+    }
+    out
+}
+
+/// 把 hex 串解进 out，返回解出的字节数
+fn decode_hex(s: &str, out: &mut [u8]) -> usize {
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    let mut n = 0usize;
+    while i + 1 < b.len() && n < out.len() {
+        let hi = match web::hex_val(b[i]) {
+            Some(v) => v,
+            None => break,
+        };
+        let lo = match web::hex_val(b[i + 1]) {
+            Some(v) => v,
+            None => break,
+        };
+        out[n] = (hi << 4) | lo;
+        n += 1;
+        i += 2;
+    }
+    n
+}
+
+fn parse_u(s: Option<&str>) -> u32 {
+    let s = s.unwrap_or("0").trim();
+    let mut v = 0u32;
+    for b in s.bytes() {
+        if !b.is_ascii_digit() {
+            break;
+        }
+        v = v * 10 + (b - b'0') as u32;
+    }
+    v
+}
+
+fn parse_i(s: Option<&str>) -> i16 {
+    let s = s.unwrap_or("0").trim();
+    let (neg, s) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s),
+    };
+    let v = parse_u(Some(s)) as i16;
+    if neg {
+        -v
+    } else {
+        v
+    }
 }
