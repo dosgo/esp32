@@ -193,15 +193,15 @@ espflash flash --monitor target\xtensa-esp32s3-none-elf\release\esp32s3-power-ke
 
 退出串口监视：`Ctrl + ]`
 
-已编译好的镜像有两个（都是可直接烧的 flash 镜像）：
+已编译好的镜像（可直接烧的 flash 镜像，app 分区，偏移 0x10000）：
 
 | 文件 | 说明 |
 |---|---|
-| `firmware-powerkey.bin`（约 676 KB） | **只有 USB**，不含蓝牙。稳定版，蓝牙出问题可以回滚到它 |
-| `firmware-ble-hid.bin`（约 1.0 MB） | USB + BLE HID（手机 / 平板当键鼠用），见第十节 |
+| `firmware-powerkey-20261025.bin`（1,057,024 B） | **当前版本**。USB + BLE HID，含十·五节「插上就睡」的修复、5 秒冷启动保护、Wake 去抖 |
+| `firmware-powerkey.bin` / `firmware-ble-hid.bin` | 历史版本，已从工作区移除；需要时 `git checkout -- <文件名>` 恢复 |
 
 ```bash
-espflash flash --chip esp32s3 firmware-ble-hid.bin
+espflash flash --chip esp32s3 firmware-powerkey-20261025.bin
 ```
 
 ### 烧完怎么让它自己进应用（重要）
