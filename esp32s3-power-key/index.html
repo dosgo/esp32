@@ -77,9 +77,21 @@
   .k.down { background: #2d6a4f; border-color: #2d6a4f; color: #fff; transform: translateY(1px); }
   .k.mod.on { background: #8a5a00; border-color: #8a5a00; color: #fff; }
   .k.dim { background: #1e2127; color: #6f7681; }
-  /* 键帽上下两层：上面是 Shift 后的符号，下面是主字符（长按出符号） */
-  .k .alt { font-size: 0.8em; opacity: 0.5; line-height: 1; }
+  /* 键帽上下两层：上面是 Shift 后的符号，下面是主字符（长按出符号）
+     —— 上排符号用橙色区分，一眼就能看出这个键还能打出什么；
+        按住/粘住 Shift 时整排符号会点亮，提示"现在输入的是符号" */
+  .k .alt {
+    font-size: max(9px, 0.82em); line-height: 1;
+    color: #ffbe5c; font-weight: 600;
+  }
   .k .base { line-height: 1; }
+  /* 带符号的键：顶部加一条橙色细边，和普通字母键区分开 */
+  .k.hasalt { border-top: 2px solid #7a5a22; padding-top: 1px; }
+  .k.hasalt:hover { border-top-color: #a8802f; }
+  body.shift .k .alt { color: #ffe6b0; }
+  body.shift .k.hasalt { border-top-color: #ffbe5c; background: #32291a; }
+  body.shift .k.hasalt .base { color: #8d8577; }   /* Shift 按下时压暗主字符 */
+  .k.down .alt, .k.hold .alt { color: #fff3d8; }
   .k.hold { background: #2a4a6a; border-color: #2a4a6a; }
 
   /* ---------- 日志 ---------- */
@@ -182,6 +194,8 @@ const stick = new Set();     // 虚拟键盘上粘住的修饰键 code
 // 只发 NKRO bitmap 帧（`n`）。固件那边会把它转成 6KRO 再写 USB，
 // 所以 BIOS / 无驱动环境一样能用，不需要再切模式。
 function sendKeys() {
+  // Shift 生效时点亮键帽上排的橙色符号，提示"这个键现在打的是符号"
+  document.body.classList.toggle('shift', (mods & (MOD.ShiftLeft | MOD.ShiftRight)) !== 0);
   const rep = new Uint8Array(20);
   rep[0] = mods;
   for (const u of keys) {
@@ -303,13 +317,14 @@ const MEDIALIST = [
 
 function mkKey(code, label, container, alt) {
   const el = document.createElement('div');
-  el.className = 'k' + (MOD[code] !== undefined ? ' mod' : '');
+  el.className = 'k' + (MOD[code] !== undefined ? ' mod' : '') + (alt ? ' hasalt' : '');
   if (alt) {
-    // 两层键帽：上排是 Shift 后的符号，下排是主字符
+    // 两层键帽：上排是 Shift 后的符号（橙色），下排是主字符
     el.dataset.alt = alt;
     const a = document.createElement('span'); a.className = 'alt'; a.textContent = alt;
     const b = document.createElement('span'); b.className = 'base'; b.textContent = label;
     el.appendChild(a); el.appendChild(b);
+    el.title = label + '（长按 = ' + alt + '）';
   } else {
     el.textContent = label;
   }
@@ -560,7 +575,7 @@ buildKb();
 bindKeys();
 $('#ip').textContent = location.host;
 connect();
-say('虚拟全键盘已就绪（点按键即发送，修饰键点一下粘住）');
+say('虚拟全键盘已就绪（橙色小字 = 按 Shift 才能输入的符号，长按对应键也能打出来）');
 setInterval(() => { if (ws && ws.readyState === 1) ws.send('_p'); }, 20000);
 </script>
 </body>
