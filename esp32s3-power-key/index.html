@@ -30,10 +30,12 @@
 
   /* ---------- 顶栏 ---------- */
   #bar {
-    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-    padding: 8px 12px; background: #1c1f25; border-bottom: 1px solid #2a2e36;
-    font-size: 12px; flex: none;
+    display: flex; align-items: center; gap: 5px; flex-wrap: wrap;
+    padding: 5px 8px; background: #1c1f25; border-bottom: 1px solid #2a2e36;
+    font-size: 11px; flex: none; min-width: 0;
   }
+  #bar button { padding: 4px 7px; font-size: 11px; }
+  #bar #wifiLink { padding: 4px 7px; font-size: 11px; }
   #dot { width: 9px; height: 9px; border-radius: 50%; background: #d9534f; flex: none; }
   #dot.on { background: #5cb85c; }
   #dot.warn { background: #f0ad4e; }
@@ -41,9 +43,9 @@
   #ip { color: #7d838d; font-family: ui-monospace, Consolas, monospace; }
 
   /* ---------- 鼠标区 ---------- */
-  #mouse { flex: none; display: flex; gap: 8px; padding: 8px 12px; }
+  #mouse { flex: none; display: flex; flex-direction: column; gap: 6px; padding: 6px 10px; }
   #pad {
-    flex: 1; height: clamp(90px, 22vh, 190px);
+    width: 100%; height: clamp(64px, 13vh, 150px);
     background: radial-gradient(circle at 50% 40%, #1e2228 0%, #14161a 70%);
     border: 1px dashed #2a2e36; border-radius: 10px;
     display: flex; align-items: center; justify-content: center;
@@ -52,44 +54,42 @@
   #pad.live { cursor: none; border-color: #2d6a4f; border-style: solid; }
   #padhint { color: #6f7681; font-size: 12px; text-align: center; padding: 8px; }
   #pad.live #padhint { display: none; }
-  #mbtns { display: flex; flex-direction: column; gap: 6px; width: 96px; flex: none; }
-  #mbtns .row { display: flex; gap: 6px; }
-  #mbtns button { flex: 1; height: 40px; font-size: 13px; }
-  #mbtns .row.two button { height: 34px; }
+  #mbtns { display: flex; flex-direction: row; gap: 6px; width: 100%; }
+  #mbtns button { flex: 1 1 0; min-width: 0; height: 30px; font-size: 12px; padding: 0 4px; }
 
   /* ---------- 键盘 ---------- */
-  #kbwrap { flex: 1; min-height: 0; display: flex; flex-direction: column;
-            padding: 0 12px 10px; gap: 6px; }
-  #media { display: flex; flex-wrap: wrap; gap: 5px; flex: none; }
-  #media button { font-size: 11px; padding: 4px 8px; }
-  #kb { display: flex; gap: 8px; flex: 1; min-height: 0; }
-  #main { flex: 1; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-  .row { display: flex; gap: 4px; flex: 1; min-height: 0; }
+  #kbwrap { flex: 1; min-height: 0; min-width: 0; display: flex; flex-direction: column;
+            padding: 0 8px 6px; gap: 4px; }
+  #media { display: flex; flex-wrap: wrap; gap: 4px; flex: none; }
+  #media button { font-size: 11px; padding: 3px 7px; line-height: 1.3; }
+  #kb { display: flex; gap: 6px; flex: 1; min-height: 0; min-width: 0; }
+  #main { flex: 1; display: flex; flex-direction: column; gap: 3px; min-width: 0; overflow: hidden; }
+  .row { display: flex; gap: 3px; flex: 1; min-height: 0; min-width: 0; overflow: hidden; }
   .k {
-    flex: 1 1 0; min-width: 0; display: flex; align-items: center; justify-content: center;
+    flex: 1 1 0; min-width: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 1px;
     background: #262a32; border: 1px solid #3a3f49; border-bottom-color: #1a1d22;
     border-radius: 5px; color: #d6dae0; cursor: pointer;
-    font-size: clamp(9px, 1.35vw, 13px); overflow: hidden; padding: 0 2px;
+    font-size: clamp(8px, 3vw, 13px); overflow: hidden; padding: 0 2px;
     text-align: center; line-height: 1.1;
   }
   .k:hover { background: #30353f; }
   .k.down { background: #2d6a4f; border-color: #2d6a4f; color: #fff; transform: translateY(1px); }
   .k.mod.on { background: #8a5a00; border-color: #8a5a00; color: #fff; }
   .k.dim { background: #1e2127; color: #6f7681; }
-  #num { flex: none; width: clamp(120px, 20%, 200px); display: grid;
-         grid-template-columns: repeat(4, 1fr); gap: 4px; }
-  #num .k { flex: none; }
-  #num .s2 { grid-row: span 2; }
-  #num .w2 { grid-column: span 2; }
+  /* 键帽上下两层：上面是 Shift 后的符号，下面是主字符（长按出符号） */
+  .k .alt { font-size: 0.8em; opacity: 0.5; line-height: 1; }
+  .k .base { line-height: 1; }
+  .k.hold { background: #2a4a6a; border-color: #2a4a6a; }
 
   /* ---------- 日志 ---------- */
   #log {
-    flex: none; height: 62px; overflow-y: auto; background: #101216;
+    flex: none; height: 46px; overflow-y: auto; background: #101216;
     border-top: 1px solid #2a2e36; padding: 5px 12px;
     font: 11px/1.6 ui-monospace, Consolas, monospace; color: #6f7681;
   }
   .hide { display: none !important; }
-  @media (max-width: 560px) { #num { display: none; } #mbtns { width: 76px; } }
+  @media (max-width: 560px) { #ip { display: none; } }
 </style>
 </head>
 <body>
@@ -109,11 +109,13 @@
 </div>
 
 <div id="mouse">
-  <div id="pad"><div id="padhint">点击此区域锁定鼠标 · 按 Esc 解锁<br>未锁定时可直接在区域内拖动</div></div>
+  <div id="pad"><div id="padhint">点此锁定鼠标 · Esc 解锁<br>未锁定时可直接拖动</div></div>
   <div id="mbtns">
-    <div class="row"><button id="mL" style="flex:2">左键</button><button id="mR" style="flex:2">右键</button></div>
-    <div class="row"><button id="mM">中键</button></div>
-    <div class="row two"><button id="wU">▲ 滚</button><button id="wD">▼ 滚</button></div>
+    <button id="mL">左键</button>
+    <button id="mM">中键</button>
+    <button id="mR">右键</button>
+    <button id="wU">▲ 滚</button>
+    <button id="wD">▼ 滚</button>
   </div>
 </div>
 
@@ -121,7 +123,6 @@
   <div id="media"></div>
   <div id="kb">
     <div id="main"></div>
-    <div id="num"></div>
   </div>
 </div>
 
@@ -260,82 +261,74 @@ function connect() {
 
 // ============ 虚拟键盘布局 ============
 // [code, 显示名, 宽度权重]  code=null 表示占位空格
-const D = (c, l, w) => [c, l, w || 1];
+const D = (c, l, w, alt) => [c, l, w || 1, alt];
 const S = w => [null, '', w];           // 间隔
 const LAYOUT = [
   [D('Escape','Esc',1.3), S(0.5),
    D('F1','F1'), D('F2','F2'), D('F3','F3'), D('F4','F4'), S(0.4),
    D('F5','F5'), D('F6','F6'), D('F7','F7'), D('F8','F8'), S(0.4),
-   D('F9','F9'), D('F10','F10'), D('F11','F11'), D('F12','F12'), S(0.5),
-   D('PrintScreen','PrtSc'), D('ScrollLock','ScrLk'), D('Pause','Pause')],
+   D('F9','F9'), D('F10','F10'), D('F11','F11'), D('F12','F12')],
 
-  [D('Backquote','`'), D('Digit1','1'), D('Digit2','2'), D('Digit3','3'), D('Digit4','4'),
-   D('Digit5','5'), D('Digit6','6'), D('Digit7','7'), D('Digit8','8'), D('Digit9','9'),
-   D('Digit0','0'), D('Minus','-'), D('Equal','='), D('Backspace','⌫',2), S(0.5),
-   D('Insert','Ins'), D('Home','Home'), D('PageUp','PgUp')],
+  [D('Backquote','`',1,'~'), D('Digit1','1',1,'!'), D('Digit2','2',1,'@'), D('Digit3','3',1,'#'), D('Digit4','4',1,'$'),
+   D('Digit5','5',1,'%'), D('Digit6','6',1,'^'), D('Digit7','7',1,'&'), D('Digit8','8',1,'*'), D('Digit9','9',1,'('),
+   D('Digit0','0',1,')'), D('Minus','-',1,'_'), D('Equal','=',1,'+'), D('Backspace','⌫',2)],
 
   [D('Tab','Tab',1.5), D('KeyQ','Q'), D('KeyW','W'), D('KeyE','E'), D('KeyR','R'),
    D('KeyT','T'), D('KeyY','Y'), D('KeyU','U'), D('KeyI','I'), D('KeyO','O'),
-   D('KeyP','P'), D('BracketLeft','['), D('BracketRight',']'), D('Backslash','\\',1.5), S(0.5),
-   D('Delete','Del'), D('End','End'), D('PageDown','PgDn')],
+   D('KeyP','P'), D('BracketLeft','[',1,'{'), D('BracketRight',']',1,'}'), D('Backslash','\\',1.5,'|')],
 
   [D('CapsLock','Caps',1.8), D('KeyA','A'), D('KeyS','S'), D('KeyD','D'), D('KeyF','F'),
    D('KeyG','G'), D('KeyH','H'), D('KeyJ','J'), D('KeyK','K'), D('KeyL','L'),
-   D('Semicolon',';'), D('Quote','\''), D('Enter','Enter',2.2)],
+   D('Semicolon',';',1,':'), D('Quote','\'',1,'"'), D('Enter','Enter',2.2)],
 
   [D('ShiftLeft','Shift',2.3), D('KeyZ','Z'), D('KeyX','X'), D('KeyC','C'), D('KeyV','V'),
-   D('KeyB','B'), D('KeyN','N'), D('KeyM','M'), D('Comma',','), D('Period','.'),
-   D('Slash','/'), D('ShiftRight','Shift',2.7), S(0.6), D('ArrowUp','↑')],
+   D('KeyB','B'), D('KeyN','N'), D('KeyM','M'), D('Comma',',',1,'<'), D('Period','.',1,'>'),
+   D('Slash','/',1,'?'), D('ShiftRight','Shift',2.7), S(0.6), D('ArrowUp','↑')],
 
   [D('ControlLeft','Ctrl',1.35), D('MetaLeft','Win',1.2), D('AltLeft','Alt',1.2),
    D('Space','Space',6.2), D('AltRight','Alt',1.2), D('MetaRight','Win',1.2),
    D('ContextMenu','☰',1.2), D('ControlRight','Ctrl',1.35), S(0.6),
    D('ArrowLeft','←'), D('ArrowDown','↓'), D('ArrowRight','→')],
 ];
-// 小键盘：显式指定网格位置 [code, 显示名, 列, 行, 占列, 占行]（4 列 5 行）
-const NUMLAYOUT = [
-  ['NumLock','Num',1,1], ['NumpadDivide','/',2,1], ['NumpadMultiply','*',3,1],
-  ['NumpadSubtract','-',4,1,1,2],
-  ['Numpad7','7',1,2], ['Numpad8','8',2,2], ['Numpad9','9',3,2],
-  ['NumpadAdd','+',4,3,1,2],
-  ['Numpad4','4',1,3], ['Numpad5','5',2,3], ['Numpad6','6',3,3],
-  ['Numpad1','1',1,4], ['Numpad2','2',2,4], ['Numpad3','3',3,4],
-  ['NumpadEnter','↵',4,4,1,2],
-  ['Numpad0','0',1,5,2,1], ['NumpadDecimal','.',3,5],
-];
+// 上面这条是媒体键（走 Consumer Control）+ 常用编辑键（走键盘），
+// 合成一组 chip：窄屏自动换行成两行，宽屏一行放得下。
+// 去掉了 后退/主页/前进/播放器/邮件/计算器 —— 手机上基本用不到，还白占两行。
 const MEDIALIST = [
   ['AudioVolumeDown','🔉'], ['AudioVolumeMute','🔇'], ['AudioVolumeUp','🔊'],
   ['MediaTrackPrevious','⏮'], ['MediaPlayPause','⏯'], ['MediaTrackNext','⏭'], ['MediaStop','⏹'],
   ['BrightnessDown','🔅'], ['BrightnessUp','🔆'],
-  ['BrowserBack','◀ 后退'], ['BrowserHome','🏠 主页'], ['BrowserForward','前进 ▶'],
-  ['MediaSelect','🎵 播放器'], ['LaunchMail','✉ 邮件'], ['LaunchApp2','🧮 计算器'],
+  ['Insert','Ins'], ['Delete','Del'], ['Home','Home'], ['End','End'],
+  ['PageUp','PgUp'], ['PageDown','PgDn'], ['PrintScreen','PrtSc'],
 ];
 
-function mkKey(code, label, container) {
+function mkKey(code, label, container, alt) {
   const el = document.createElement('div');
   el.className = 'k' + (MOD[code] !== undefined ? ' mod' : '');
-  el.textContent = label;
+  if (alt) {
+    // 两层键帽：上排是 Shift 后的符号，下排是主字符
+    el.dataset.alt = alt;
+    const a = document.createElement('span'); a.className = 'alt'; a.textContent = alt;
+    const b = document.createElement('span'); b.className = 'base'; b.textContent = label;
+    el.appendChild(a); el.appendChild(b);
+  } else {
+    el.textContent = label;
+  }
   el.dataset.code = code;
   container.appendChild(el);
   return el;
 }
 
 function buildKb() {
-  const main = $('#main'), num = $('#num'), media = $('#media');
+  const main = $('#main'), media = $('#media');
   for (const row of LAYOUT) {
     const r = document.createElement('div');
     r.className = 'row';
-    for (const [code, label, w] of row) {
+    for (const [code, label, w, alt] of row) {
       if (code === null) { const s = document.createElement('div'); s.style.flex = w; r.appendChild(s); continue; }
-      const el = mkKey(code, label, r);
+      const el = mkKey(code, label, r, alt);
       el.style.flex = w;
     }
     main.appendChild(r);
-  }
-  for (const [code, label, c, rw, cs, rs] of NUMLAYOUT) {
-    const el = mkKey(code, label, num);
-    el.style.gridColumn = c + ' / span ' + (cs || 1);
-    el.style.gridRow = rw + ' / span ' + (rs || 1);
   }
   for (const [code, label] of MEDIALIST) {
     const b = document.createElement('button');
@@ -349,6 +342,33 @@ function buildKb() {
 // pointer lock 状态下鼠标光标是隐藏的，点键盘时必须先解锁，否则点不到
 function unlockForKeyboard() {
   if (document.pointerLockElement) document.exitPointerLock();
+}
+
+// ============ 双层键帽：长按出 Shift 符号 ============
+// 数字/标点键上排是符号、下排是主字符。短按发主字符，按住 ~380ms 发符号。
+// 实现上，带 alt 的键改成"松手才算数"，这样长按不会先打出一个原字符。
+let altTimer = null, altCode = null, altFired = false;
+
+function typeKey(code, shifted) {
+  if (!shifted) { press(code); setTimeout(() => release(code), 60); return; }
+  // 临时补一个左 Shift，发完恢复原状（不动"粘住"的修饰键状态）
+  const saved = mods;
+  mods |= MOD.ShiftLeft;
+  sendKeys();
+  setTimeout(() => {
+    keys.add(MAP[code]); sendKeys();
+    setTimeout(() => {
+      keys.delete(MAP[code]);
+      mods = saved;
+      sendKeys();
+    }, 60);
+  }, 20);
+}
+
+function clearAlt() {
+  if (altTimer) { clearTimeout(altTimer); altTimer = null; }
+  altCode = null; altFired = false;
+  document.querySelectorAll('.k.hold').forEach(x => x.classList.remove('hold'));
 }
 
 function bindKeys() {
@@ -369,9 +389,34 @@ function bindKeys() {
       return;
     }
     el.classList.add('down');
+    if (el.dataset.alt) {                   // 双层键帽：先挂计时器，松手再决定发什么
+      clearAlt();
+      altCode = code;
+      el.classList.add('hold');
+      altTimer = setTimeout(() => {
+        if (altCode !== code) return;
+        altFired = true;
+        el.classList.remove('down');
+        typeKey(code, true);
+      }, 380);
+      return;
+    }
     press(code);
   });
   kb.addEventListener('pointerup', e => {
+    if (altCode) {                          // 双层键帽的收尾
+      const code = altCode, fired = altFired;
+      clearAlt();
+      document.querySelectorAll('.k.down').forEach(x => x.classList.remove('down'));
+      if (!fired) typeKey(code, false);     // 短按 -> 主字符；长按已经发过符号了
+      if (!lockMod && stick.size) {
+        stick.forEach(c => { mods &= ~MOD[c]; });
+        stick.clear();
+        document.querySelectorAll('.k.mod.on').forEach(x => x.classList.remove('on'));
+        sendKeys();
+      }
+      return;
+    }
     const el = e.target.closest('.k');
     if (!el || MOD[el.dataset.code] !== undefined) return;
     const code = el.dataset.code;
@@ -384,7 +429,7 @@ function bindKeys() {
       sendKeys();
     }
   });
-  kb.addEventListener('pointercancel', releaseAll);
+  kb.addEventListener('pointercancel', () => { clearAlt(); releaseAll(); });
   kb.addEventListener('contextmenu', e => e.preventDefault());
 }
 
