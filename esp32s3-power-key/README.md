@@ -172,24 +172,7 @@ const PC_MAC: [u8; 6] = [0xA4, 0xBB, 0x6D, 0x11, 0x22, 0x33];
 
 > 键名必须是**英文**：写「唤醒」不行，因为固件只在 JSON 里找 `wake` 这个字符串。
 
-### App 显示"离线"但其实连上了？这是心跳问题
 
-Blinker 的在线判定跟 MQTT 连接**不是一回事**：
-
-- App 打开时、进设备页时、之后每 30 秒，都会给设备发
-  `{"fromDevice":"<app id>","data":{"get":"state"}}`
-- 设备必须回到 `/device/<deviceName>/s` 一条
-  `{"toDevice":"<app id>","data":{"state":"online","timer":"000","version":"0.1.0"}}`
-- 不回就一直显示"离线"，**哪怕 MQTT 明明连着、按钮也能用**
-
-固件已经实现了这个回复（`blinker_task` 里，任何带 `fromDevice` 的消息都会回一次）。
-当初排查时踩了两个坑，记一下：
-
-1. `wait_publish` 用 `select(future, Timer)` 做 30 秒 PINGREQ 会**取消正在进行的读**，
-   读到半个报文就流错位，接着断线重连 —— 表现是 App 反复在线/离线。所以不要用 select 做保活，
-   靠"回心跳"本身就是客户端活动，broker 的 keepalive 自然被刷新。
-2. 解析 `fromDevice` 时，键名后面还有一个**收尾引号**才到冒号（`"fromDevice":"xxx"`），
-   少跳这一步就永远取不到值。
 
 ---
 
@@ -268,39 +251,11 @@ espflash flash --chip esp32s3 firmware-powerkey.bin
 
 ---
 
-## 七、常见问题
-
-| 现象                   | 处理                                                            |
-| -------------------- | ------------------------------------------------------------- |
-| 插上电脑没反应 / 识别不出键盘     | 换到标 "USB" 的口；换根带数据线的 USB 线                                    |
-| 找不到热点 `ESP32-POWER`  | 等 10 秒再刷 WiFi 列表；或者板子供电不足（换 USB 口）                            |
-| 手机连上热点一直「正在获取 IP 地址」 | DHCP 服务没起来，看串口有没有 `[dhcp] 启动：`                                |
-| 手机提示「无互联网」并自动断开      | 关掉手机的「自动切换网络 / 网络助理」；DNS 那块看 `src/dns.rs`                     |
-| 配网保存后一直连不上           | 名字/密码错了，或路由器是 5G 频段（ESP32-S3 只支持 2.4G）。回 192.168.4.1 重填       |
-| 串口一直刷 WiFi 连不上       | `[wifi] 连接失败` 多半是密码错；`连接超时` 多半是信号弱或 5G 频段                     |
-| 想换 WiFi / 忘了配过哪个     | 连热点重新配一次就行；或长按 BOOT 3 秒恢复出厂                                   |
-| MQTT 连不上             | 检查 deviceName / iotId / iotToken 三个值有没有复制全；Blinker App 里设备要在线 |
-| App 点了没反应            | 串口日志看有没有 `recv:` 这一行；没有说明云端没转发，检查 App 按钮的键名                   |
-| HID 写入超时警告           | 电脑没枚举设备（没插好 / 插错口），固件会自动跳过不会死机                                |
-| 短按 BOOT 没唤醒          | 短按是**松手时**触发的；按太久（≥3 秒）会变成恢复出厂                                |
+                       |
 
 ---
 
-## 八、第一次上真机踩到的 3 个坑（已修，别再踩）
-
-这三个 bug 的表现完全一样：**COM3 消失、设备管理器里也看不到 HID**。  
-原因是它们都 panic 在 `main` 第一次 `.await` 之前，  
-而 `builder.build()` 已经把 USB PHY 从 USB-Serial-JTAG 抢过去了 ——  
-于是既没有串口看日志，也没有 HID 枚举，看起来像"板子死了"。
-
-| # | 现象                  | 根因                                                                                                                                                                           | 修法                                                                                                                                       |
-| - | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| 1 | 第一次上电必崩             | `StationConfig::default()` 的 `auth_method` 是 `Wpa2Personal`，而首次开机 SSID 和密码都是空串。`esp_wifi_set_config(WIFI_IF_STA)` 返回 `ESP_ERR_WIFI_PASSWORD`，`wifi::new(...).unwrap()` panic | 没存过账号时只下发 `Config::AccessPoint`，配网成功后才切 `AccessPointStation`；`sta_config()` 里空密码一律按开放网络（`None`）处理；`wifi::new` 失败改为记日志 + 只跑 HID，不再 unwrap |
-| 2 | 第二次崩                | `net_task` 被 spawn 两次（AP 一个、STA 一个），而 `#[embassy_executor::task]` 默认 `pool_size = 1`，第二次 `spawn` 返回 `SpawnError::Busy`，`.expect()` panic                                     | 加 `#[embassy_executor::task(pool_size = 2)]`                                                                                             |
-| 3 | 第三次崩                | `StackResources<3>` 不够：联网侧要 web(TCP) + MQTT(TCP) + WOL(UDP) + DNS 查询(UDP) 共 **4** 个 socket，smoltcp 直接 `panic!("adding a socket to a full SocketSet")`                        | 两个 stack 都改成 `StackResources<6>`                                                                                                         |
-| 4 | 枚举时偶发「设备描述符请求失败」    | `builder.build()` 返回后 D+ 上拉已就绪，Windows 立刻开始枚举；但描述符是在**被轮询的**控制任务里回复的，而紧接着的 flash 读 + WiFi 射频校准是同步阻塞 1~2 秒，执行器回不到 `usb_task`                                                  | `build()` 之后先 `Timer::after(800ms).await`，把执行时间让给枚举，再去做别的事                                                                               |
-| 5 | **睡眠后按 BOOT 唤不醒电脑** | `embassy-usb` 的 `remote_wakeup()` 有门禁：必须 `suspended && remote_wakeup_enabled` 同时为真，否则直接返回 `InvalidState`，**一个字节都不往总线上打**。底层驱动本身是对的                                           | 失败时改为自己打 OTG 寄存器：`DCTL.RWUSIG` 拉高 10ms（USB 2.0 §7.1.7.7 规定的 resume K 状态），绕开门禁。见 `remote_wakeup_hw()`                                     |
-
+                                                                                                       
 ### 关于 USB 唤醒（重要）
 
 - 固件里 `usb_config.supports_remote_wakeup = true` **必须开**，否则配置描述符的 `bmAttributes` 不带 remote-wakeup 位，  
@@ -330,8 +285,7 @@ N16R8 dongle 板只有一个 USB-A 公头，`otg_fs` 一接管，USB-Serial-JTAG
 会输出 `[usb] enabled/configured/suspended/远程唤醒允许`、`[boot] 短按`、`[usb] 软唤醒失败…`  
 这类关键事件，最多 48 行、滚动的。`main.rs` 里的 `dlog!("…")` 往里面写。
 
-> 注意：这个响应**必须带 `Content-Length`**。早先试过"不写长度、靠关连接表示结束"，  
-> 结果手机浏览器死等 EOF、服务端死等下一个 accept，整个网页服务被堵死。
+
 
 ---
 
@@ -402,19 +356,7 @@ BOOT = wake
 
 这样屏幕平时是定住的，只有联网状态真的变化时才跳一下。
 
-### 这一路踩的坑（留个记录，省得重蹈）
 
-前面足足试了 70 多种错误接法才点亮，根因是**一直以为它是 T-Dongle-S3 克隆**。
-真正有用的三条结论：
-
-1. `init()` 返回 `Ok` **不能**证明屏收到了命令 —— SPI 写数据对面没接设备也永远成功，
-   唯一判据是画面。
-2. 屏是**黑的/暗蓝**但背光在亮 ≠ 屏坏。这块板背光硬连，所以"上电就亮、没内容"
-   只说明**引脚不对**，跟背光无关。
-3. 找板子引脚别硬猜。搜 **"板名 + github"** 往往有惊喜 —— 这次就是靠一个开源固件
-   （jcorp-nomad）的 `docs/PocketDongleS3.md` 一次定位，它还明确写了"这不是 LilyGO 克隆"。
-
----
 
 ## 九、技术栈（都在纯 Rust 里）
 
