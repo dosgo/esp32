@@ -10,6 +10,7 @@ resolver = "2"
 [dependencies]
 critical-section = "1.2.0"
 embassy-executor = { version = "0.10.0", features = ["executor-thread"] }
+embassy-futures = "0.1.2"
 embassy-net = { version = "0.9.1", features = [
     "proto-ipv4",
     "medium-ethernet",
@@ -20,6 +21,7 @@ embassy-net = { version = "0.9.1", features = [
 ] }
 embassy-sync = "0.8.0"
 embedded-io-async = "0.7"
+embedded-storage = "0.3.1"
 embassy-time = { version = "0.5.1", features = ["generic-queue-8"] }
 embassy-usb = { version = "0.6.0", features = [
     "max-handler-count-4",
@@ -33,10 +35,16 @@ esp-backtrace = { version = "0.19.0", features = [
     "println",
 ] }
 esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
-esp-hal = { version = "1.1.2", features = ["esp32s3", "unstable"] }
+# 锁死 =1.1.2：esp-radio 0.18 和 esp-storage 0.9 都只认 esp-hal 1.1.x，
+# 不锁的话 cargo 会解出 1.2 然后两边打架
+esp-hal = { version = "=1.1.2", features = ["esp32s3", "unstable"] }
 esp-println = { version = "0.17.0", features = ["esp32s3", "log-04"] }
 esp-radio = { version = "0.18.0", features = ["esp32s3", "wifi"] }
 esp-rtos = { version = "0.3.0", features = ["esp32s3", "embassy", "esp-radio"] }
+# 热点模式必须自己跑 DHCP：embassy-net 只有客户端，没有服务端
+esp-hal-dhcp-server = "0.4.3"
+# WiFi 账号密码存 flash，掉电不丢（换 WiFi 不用重新烧固件）
+esp-storage = { version = "0.9.0", features = ["esp32s3"] }
 heapless = "0.9.3"
 static_cell = "2.1.1"
 log = "0.4.34"

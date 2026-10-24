@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 电源键 · WiFi 设置</title>
+<style>
+  :root{--bg:#0c1016;--card:#151c26;--line:#26313f;--fg:#e8eef7;--dim:#889099;--acc:#40c8e0;--ok:#3ad06a;--bad:#e04040;}
+  *{box-sizing:border-box}
+  body{margin:0;padding:20px;background:var(--bg);color:var(--fg);
+       font:15px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif;}
+  .wrap{max-width:420px;margin:0 auto}
+  h1{font-size:19px;margin:0 0 4px}
+  .sub{color:var(--dim);font-size:13px;margin-bottom:18px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px}
+  .row{display:flex;justify-content:space-between;padding:6px 0;font-size:14px}
+  .row span:first-child{color:var(--dim)}
+  .row span:last-child{font-family:ui-monospace,Consolas,monospace}
+  .ok{color:var(--ok)} .bad{color:var(--bad)} .dim{color:var(--dim)}
+  label{display:block;font-size:13px;color:var(--dim);margin:12px 0 5px}
+  input{width:100%;padding:11px 12px;border-radius:9px;border:1px solid var(--line);
+        background:#0d131b;color:var(--fg);font-size:15px;outline:none}
+  input:focus{border-color:var(--acc)}
+  button{width:100%;margin-top:18px;padding:13px;border:0;border-radius:10px;
+         background:var(--acc);color:#06222a;font-size:16px;font-weight:600;cursor:pointer}
+  button:active{opacity:.8}
+  .tip{color:var(--dim);font-size:12.5px;margin-top:14px;line-height:1.7}
+  a{color:var(--acc)}
+  a.danger{display:block;text-align:center;padding:11px;border-radius:10px;
+    text-decoration:none;border:1px solid #7a2f2f;background:#2a1416;color:#f09595;font-size:14px}
+  a.danger:hover{background:#3a1b1e}
+  .cborder{border-color:#3a2226}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>WiFi 设置</h1>
+  <div class="sub">填家里 / 办公室的 WiFi，ESP32 会记住，以后开机自动连</div>
+
+  <div class="card">
+    <div class="row"><span>联网(STA)</span><span id="s-state" class="dim">查询中…</span></div>
+    <div class="row"><span>局域网 IP</span><span id="s-ip" class="dim">-</span></div>
+    <div class="row"><span>热点(AP)</span><span class="ok">192.168.4.1</span></div>
+  </div>
+
+  <div class="card">
+    <form action="/save" method="get" autocomplete="off">
+      <label for="ssid">WiFi 名称（SSID）</label>
+      <input id="ssid" name="ssid" placeholder="例如 MyHomeWiFi" required maxlength="32">
+
+      <label for="pass">WiFi 密码</label>
+      <input id="pass" name="pass" type="password" placeholder="没有密码就留空" maxlength="64">
+
+      <button type="submit">保存并连接</button>
+    </form>
+  </div>
+
+  <div class="tip">
+    · 热点 <b>ESP32-POWER</b> 一直开着，任何时候都能连回来改设置<br>
+    · 保存后约 10~20 秒出结果，上面「联网」会变成 已连接<br>
+    · <b>必须连上有外网的 WiFi</b>，否则连不上 Blinker 云，手机 App 就控制不了<br>
+    · 想清掉已存密码：长按板子上的 BOOT 键 3 秒（短按是唤醒电脑）
+  </div>
+
+  <div class="card cborder">
+    <div style="font-size:14px;font-weight:500;margin-bottom:6px">恢复出厂设置</div>
+    <div class="tip" style="margin-top:0;margin-bottom:12px">
+      清掉所有已保存的 WiFi，重启后只剩热点 ESP32-POWER / power1234。<br>
+      板子上长按 BOOT 键 3 秒效果一样（没有网页时的兜底）。
+    </div>
+    <a class="danger" href="/factory-reset"
+       onclick="return confirm('确定恢复出厂设置？已保存的 WiFi 会全部清掉，需要重新配网。')">恢复出厂设置</a>
+  </div>
+</div>
+
+<script>
+var STATE = {connected:'已连接', connecting:'连接中…', idle:'未配置', failed:'连接失败'};
+
+function refresh(){
+  fetch('/status').then(function(r){return r.text()}).then(function(t){
+    var d = {};
+    try { d = JSON.parse(t); } catch(e){ return; }
+    var st = d.sta || 'idle';
+    var el = document.getElementById('s-state');
+    el.textContent = STATE[st] || st;
+    el.className = (st === 'connected') ? 'ok' : (st === 'failed' ? 'bad' : 'dim');
+    var ip = document.getElementById('s-ip');
+    ip.textContent = d.ip || '-';
+    ip.className = d.ip ? 'ok' : 'dim';
+  }).catch(function(){});
+}
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
