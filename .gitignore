@@ -1,0 +1,30 @@
+# Rust 编译产物（每个 crate 几十万文件，绝不能进仓库）
+**/target/
+
+# 注意：**/vendor/ 不忽略。
+# vendor/ 里是打了本地补丁、且 build 时必须用 [patch.crates-io] 指过去的依赖
+# （目前是 trouble-host：外设侧主动索取 IRK，否则手机轮换随机地址后重连必然
+# Authentication Failure）。这种补丁一旦丢了，仓库 clone 下来照样能编过，
+# 但运行时会「第一次配对能用、断开后再也连不上」，极难排查。所以必须进版本库。
+# 将来若真的 vendor 了不需要改动的现成 crate，再单独加一条忽略规则。
+vendor/**/target/
+
+# 临时文件与预览
+tmp/
+.preview/
+
+# 备份 / 过程文件
+*.bak
+*.bak2
+*.orig
+*.orig-*
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 系统
+Thumbs.db
+.DS_Store
+desktop.ini
