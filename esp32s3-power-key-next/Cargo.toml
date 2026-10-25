@@ -1,0 +1,114 @@
+[package]
+name = "esp32s3-power-key"
+version = "0.2.0"
+edition = "2021"
+resolver = "2"
+
+# ESP32-S3 用 USB HID（Keyboard + System Control）+ WiFi 远程控制电脑休眠/唤醒
+#
+# ===================== 1.2 代依赖链（2026-10-25 迁移） =====================
+# esp-hal 1.1.2 -> 1.2.2 的连带升级。这一代的特点是：
+#   * esp-radio 只有 1.0.0-beta.1 能配 esp-hal ~1.2（beta.2 已被 yank）
+#   * esp-radio 1.0 把 HCI 传输层抽成了独立的 bt-hci-transport，
+#     BLE 控制器的拿法与 0.18 不同（见 ble.rs）
+#   * trouble-host 0.7 从 bt-hci 0.8 -> 0.9，embassy-sync 从 0.7 -> 0.8
+#     （所以本工程不再需要 embassy-sync 0.7 的别名了）
+#   * esp-hal 1.2 内部用 embassy-usb-synopsys-otg 0.4，S3 PAC 认 0.36；
+#     esp-radio 1.0-beta.1 认 S3 PAC 0.37 —— 两份 PAC 会同时存在，
+#     我们显式引 0.37 跟 radio 对齐（只读 SENS 寄存器，不影响 hal）
+# ==========================================================================
+
+[dependencies]
+critical-section = "1.2.0"
+embassy-executor = { version = "0.10.0", features = ["executor-thread"] }
+embassy-futures = "0.1.2"
+embassy-net = { version = "0.9.1", features = [
+    "proto-ipv4",
+    "medium-ethernet",
+    "dhcpv4",
+    "dns",
+    "tcp",
+    "udp",
+] }
+embassy-sync = "0.8.0"
+embedded-io-async = "0.7"
+embedded-storage = "0.3.1"
+embassy-time = { version = "0.5.1", features = ["generic-queue-8"] }
+embassy-usb = { version = "0.6.0", features = [
+    "max-handler-count-4",
+    "max-interface-count-4",
+] }
+# 只为了拿到 otg_v1::Otg，好直接操作 DCTL.RWUSIG 做硬件级远程唤醒。
+# 0.4 是 esp-hal 1.2 内部用的版本，必须一致，否则类型对不上。
+embassy-usb-synopsys-otg = "0.4.0"
+embassy-usb-driver = "0.2.2"
+esp-alloc = "0.11.0"
+esp-backtrace = { version = "0.20.0", features = [
+    "esp32s3",
+    "panic-handler",
+    "println",
+] }
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32s3"] }
+esp-hal = { version = "1.2.2", features = ["esp32s3", "unstable"] }
+esp-println = { version = "0.18.0", features = ["esp32s3", "log-04"] }
+# ble + coex：S3 的 Wi-Fi 与 BLE 共用一个射频，必须同时开 coex 才能并行跑
+esp-radio = { version = "1.0.0-beta.1", features = [
+    "esp32s3",
+    "wifi",
+    "ble",
+    "coex",
+    "unstable",
+] }
+# BLE 主机协议栈（纯 Rust，no_std）。0.7 依赖 bt-hci 0.9，
+# 正好是 esp-radio 1.0-beta.1 用的那个版本。
+# 不要 central/scan：这版只做外设（被手机连），省 flash 也省 RAM
+trouble-host = { version = "0.7.0", default-features = false, features = [
+    "peripheral",
+    "gatt",
+    "derive",
+    # 安卓/iOS 连 HID 会强制走 SMP 配对，不开这个就卡在「正在配对」
+    "security",
+    # 让 trouble 内部的 error!/warn! 真的被编进来（走 main.rs 的环形 logger，
+    # 没这行它内部的错误全都是空调用，排查配对问题时抓瞎）
+    "log",
+    "default-packet-pool",
+    # 包池 8 包 × 251 字节。**MTU 不能压到 64**：
+    # SMP 配对（Secure Connections 的 P-256 公钥）单个 PDU 要 65 字节，
+    # 64 的 MTU 会让 trouble 直接报 `InsufficientSpace`，
+    # 现象就是手机一直卡在「正在配对」。
+    "default-packet-pool-size-8",
+    "default-packet-pool-mtu-251",
+] }
+bt-hci = "0.9"
+# 注：不再需要 rand_core。trouble 0.6 要求应用层用 CryptoRng 播种，
+# 0.7 改成协议栈自己在 runner 初始化时用 HCI_LE_Rand 播种了。
+# 直接点 SENS 寄存器读片上温度。
+# esp-radio 1.0-beta.1 认 esp32s3 ^0.37，这里跟它对齐。
+esp32s3 = "0.37"
+esp-rtos = { version = "0.4.0", features = ["esp32s3", "embassy", "esp-radio"] }
+# 热点模式必须自己跑 DHCP：embassy-net 只有客户端，没有服务端
+esp-hal-dhcp-server = "0.4.3"
+# WiFi 账号密码存 flash，掉电不丢（换 WiFi 不用重新烧固件）
+# embedded-storage 是可选 feature，0.10 起不默认开，不写这行就取不到 NorFlash trait
+esp-storage = { version = "0.10.0", features = ["esp32s3", "embedded-storage"] }
+heapless = "0.9.3"
+static_cell = "2.1.1"
+log = "0.4.34"
+# WebSocket 握手要 SHA1（控制页走 WS 收键鼠），纯 no_std，无 alloc
+# 0.11 走 digest 0.11（hybrid-array），new/update/finalize 用法不变
+sha1 = { version = "0.11", default-features = false }
+
+# ---- LCD：0.96" ST7735S 80x160（T-Dongle-S3 同款接线）----
+mipidsi = { version = "0.10", default-features = false }
+embedded-graphics = "0.8"
+embedded-hal-bus = "0.3"
+
+[profile.release]
+opt-level = "s"
+codegen-units = 1
+
+# vendor 了一份 trouble-host（见 vendor/trouble-host），只为一处补丁：
+# 外设侧配对时主动索取对方的 IRK，否则手机轮换随机地址后重连必然 Authentication Failure。
+# 上游修好之后把这段删掉、改回 registry 版本即可。
+[patch.crates-io]
+trouble-host = { path = "vendor/trouble-host" }
