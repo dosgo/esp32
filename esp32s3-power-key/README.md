@@ -94,13 +94,17 @@ ESP32-S3 ──┤
 > ⚠️ **必须连上有外网的 WiFi** —— Blinker 走公网 MQTT，连不上就控制不了。  
 > 热点只是给你配网用的，它本身没有外网。
 
-热点名 / 密码在 `src/store.rs`：
+热点名 / 密码**网页里也能改**（设置页「热点（AP）设置」卡片 → 保存后重启生效），
+没改过时用 `src/store.rs` 里的出厂值：
 
 ```rust
-pub const AP_SSID: &str = "ESP32-POWER";
-pub const AP_PASSWORD: &str = "power1234";   // 留空 = 开放网络；否则必须 8~63 字符
-pub const AP_IP: IpV4Address = Ipv4Address::new(192, 168, 4, 1);
+pub const DEFAULT_AP_SSID: &str = "ESP32-POWER";
+pub const DEFAULT_AP_PASSWORD: &str = "power1234"; // 留空 = 开放网络；否则必须 8~63 字符
+pub const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
 ```
+
+改过的热点参数存在配置区第四块扇区（`0xC000`），和 STA 凭据 / Blinker / bond 各占一块，
+互不影响；恢复出厂会四块一起擦。
 
 > 如果你家路由器网段正好是 `192.168.4.x`，把 `AP_IP` 改成别的（比如 `192.168.71.1`）。
 
@@ -111,6 +115,7 @@ pub const AP_IP: IpV4Address = Ipv4Address::new(192, 168, 4, 1);
 | **键鼠控制页 `/kvm`** | 虚拟键盘 + 鼠标触控区 + 媒体键 + 唤醒按钮，见第零节 |
 | **电源控制：唤醒 / 睡眠** | 不用碰板子，手机点一下就唤醒电脑。走 USB 远程唤醒，电脑睡眠时也能用；不依赖外网 |
 | **WiFi 密码「明文」按钮** | 密码框右边，点一下切换明文/隐藏，方便核对有没有输错 |
+| **热点（AP）设置** | 改热点自己的 SSID / 密码（`/save-ap`），**重启一次**生效，当前连接会被踢掉 |
 | **Blinker 凭据（存 flash）** | 填 deviceName / iotId / iotToken，保存后**重启一次**生效，以后换 key 不用重烧固件 |
 | **清空蓝牙配对** | 只擦 `0xB000` 的配对信息并重启，WiFi / Blinker 都保留；手机上也要「忘记 ESP32-POWER-BLE」，见第十节 |
 | **诊断日志 `/log`** | 见第八节，没有串口时唯一的观测通道 |

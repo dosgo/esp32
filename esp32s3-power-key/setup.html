@@ -45,7 +45,7 @@
     <div class="row"><span>局域网 IP</span><span id="s-ip" class="dim">-</span></div>
     <div class="row"><span>路由器信号</span><span id="s-rssi" class="dim">-</span></div>
     <div class="row"><span>芯片温度</span><span id="s-temp" class="dim">-</span></div>
-    <div class="row"><span>热点(AP)</span><span class="ok">192.168.4.1</span></div>
+    <div class="row"><span>热点(AP)</span><span id="s-ap" class="ok">192.168.4.1</span></div>
     <div id="s-err-row" class="row" style="display:none">
       <span>失败原因</span><span id="s-err" class="bad" style="font-size:12.5px"></span>
     </div>
@@ -85,6 +85,40 @@
   </div>
 
   <div class="card">
+    <div style="font-size:14px;font-weight:500;margin-bottom:6px">热点（AP）设置</div>
+    <div class="row" style="padding-top:0">
+      <span>当前热点</span>
+      <span id="s-apname" class="dim">查询中…</span>
+    </div>
+    <div class="tip" style="margin-top:6px;margin-bottom:12px">
+      这是<b>板子自己开的</b>那个热点（192.168.4.1），不是要连的路由器。<br>
+      改完名字或密码后设备会<b>重启一次</b>，当前连接会断开，需要用新名字重连。
+    </div>
+    <form action="/save-ap" method="get" autocomplete="off" onsubmit="return apConfirm()">
+      <label for="ap-ssid">热点名称（SSID）</label>
+      <input id="ap-ssid" name="ssid" placeholder="ESP32-POWER" required maxlength="32">
+
+      <label for="ap-pass">热点密码（8~63 位）</label>
+      <div style="position:relative">
+        <input id="ap-pass" name="pass" type="password" placeholder="留空 = 保持当前密码"
+               minlength="8" maxlength="63" style="padding-right:74px">
+        <button type="button" id="ap-eye" onclick="toggleApPass()"
+                style="position:absolute;right:6px;top:50%;transform:translateY(-50%);width:auto;
+                       margin:0;padding:6px 12px;font-size:13px;font-weight:500;
+                       background:#22303f;color:#9fb3c8;border:1px solid #2f4054">明文</button>
+      </div>
+
+      <label style="display:flex;align-items:center;gap:8px;margin-top:12px;color:#f0b040;font-size:13px">
+        <input type="checkbox" id="ap-open" name="open" value="1" onchange="apOpenToggle()"
+               style="width:auto;margin:0">
+        不设密码（开放网络，谁都能连）
+      </label>
+
+      <button type="submit" style="background:#40c8e0">保存热点设置（会重启）</button>
+    </form>
+  </div>
+
+  <div class="card">
     <div style="font-size:14px;font-weight:500;margin-bottom:6px">Blinker 凭据</div>
     <div class="row" style="padding-top:0"><span>当前设备</span><span id="s-bdev" class="dim">查询中…</span></div>
     <div class="tip" style="margin-top:6px;margin-bottom:12px">
@@ -108,7 +142,7 @@
   </div>
 
   <div class="tip">
-    · 热点 <b>ESP32-POWER</b> 一直开着，任何时候都能连回来改设置<br>
+    · 热点 <b id="t-apname">ESP32-POWER</b> 一直开着，任何时候都能连回来改设置<br>
     · 保存后约 10~20 秒出结果，上面「联网」会变成 已连接<br>
     · <b>必须连上有外网的 WiFi</b>，否则连不上 Blinker 云，手机 App 就控制不了<br>
     · 想清掉已存密码：长按板子上的 BOOT 键 3 秒（短按是唤醒电脑）
@@ -131,7 +165,8 @@
   <div class="card cborder">
     <div style="font-size:14px;font-weight:500;margin-bottom:6px">恢复出厂设置</div>
     <div class="tip" style="margin-top:0;margin-bottom:12px">
-      清掉所有已保存的 WiFi，重启后只剩热点 ESP32-POWER / power1234。<br>
+      清掉所有已保存的 WiFi（含热点名/密码），重启后热点恢复成
+      <b>ESP32-POWER / power1234</b>。<br>
       板子上长按 BOOT 键 3 秒效果一样（没有网页时的兜底）。
     </div>
     <a class="danger" href="/factory-reset"
@@ -183,6 +218,19 @@ function refresh(){
     else { er.style.display = 'none'; }
     var bd = document.getElementById('s-bdev');
     if (d.bdev) { bd.textContent = d.bdev; bd.className = 'ok'; }
+    // 热点名（板子自己开的那个）+ 是不是开放网络
+    var an = document.getElementById('s-apname');
+    if (an && d.apssid) {
+      an.textContent = d.apssid + (d.apopen ? '（开放）' : '');
+      an.className = d.apopen ? 'dim' : 'ok';
+    }
+    var ah = document.getElementById('s-ap');
+    if (ah) { ah.textContent = (d.apssid || 'ESP32-POWER') + ' · 192.168.4.1'; }
+    var tn = document.getElementById('t-apname');
+    if (tn && d.apssid) { tn.textContent = d.apssid; }
+    // 首次进页面时把当前热点名填进输入框（用户不改就别动它）
+    var ai = document.getElementById('ap-ssid');
+    if (ai && d.apssid && !ai.dataset.touched) { ai.value = d.apssid; }
     var bo = document.getElementById('s-bond');
     if (bo) {
       if (d.bond === true)  { bo.textContent = '已配对 1 台'; bo.className = 'ok'; }
@@ -199,6 +247,46 @@ function togglePass(){
   var b = document.getElementById('eye');
   if (p.type === 'password') { p.type = 'text'; b.textContent = '隐藏'; }
   else { p.type = 'password'; b.textContent = '明文'; }
+}
+
+// 热点密码明文/隐藏
+function toggleApPass(){
+  var p = document.getElementById('ap-pass');
+  var b = document.getElementById('ap-eye');
+  if (p.type === 'password') { p.type = 'text'; b.textContent = '隐藏'; }
+  else { p.type = 'password'; b.textContent = '明文'; }
+}
+
+// 热点名一旦手动改过，就不再被 /status 回填覆盖
+(function(){
+  var ai = document.getElementById('ap-ssid');
+  if (ai) ai.addEventListener('input', function(){ ai.dataset.touched = '1'; });
+})();
+
+// 勾了"不设密码"就把密码框禁掉（disabled 的输入框不会被提交）
+function apOpenToggle(){
+  var c = document.getElementById('ap-open');
+  var p = document.getElementById('ap-pass');
+  p.disabled = c.checked;
+  if (c.checked) { p.value = ''; }
+}
+
+// 保存热点前确认：这一步会把当前连接直接断掉
+function apConfirm(){
+  var s = document.getElementById('ap-ssid').value.trim();
+  var open = document.getElementById('ap-open').checked;
+  var p = document.getElementById('ap-pass').value;
+  if (!s) { alert('热点名称不能为空'); return false; }
+  if (!open && p.length > 0 && p.length < 8) {
+    alert('热点密码至少 8 位（WPA2 要求）。不改密码就留空，或勾上"不设密码"。');
+    return false;
+  }
+  var pw;
+  if (open) { pw = '密码：无（开放网络，谁都能连）'; }
+  else if (p.length) { pw = '密码：' + p; }
+  else { pw = '密码：保持当前密码不变'; }
+  return confirm('保存热点设置并重启？\n\n新热点名：' + s + '\n' + pw +
+    '\n\n当前连接会立刻断开，重启后需要用新的热点名重新连接。\n已保存的路由器 WiFi / Blinker 凭据不受影响。');
 }
 
 // 唤醒 / 睡眠。唤醒后如果主机重新枚举 USB，这条 HTTP 可能来不及收完整，

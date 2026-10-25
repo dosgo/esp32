@@ -5,6 +5,7 @@
 //!   GET /kvm                      -> 键鼠控制页（虚拟键盘 + 鼠标 + 唤醒按钮）
 //!   GET /ws                       -> WebSocket 升级，之后收键鼠 + 电源指令
 //!   GET /save?ssid=..&pass=..     -> 保存 STA 账号密码（写 flash + 通知 wifi_task）
+//!   GET /save-ap?ssid=..&pass=..  -> 保存热点（AP）自己的名字/密码（&open=1 表示不要密码）+ 重启
 //!   GET /save-blinker?dev=..      -> 保存 Blinker 凭据
 //!   GET /status                   -> JSON，给设置页轮询连接结果
 //!   GET /log                      -> 诊断日志纯文本
@@ -336,6 +337,64 @@ async fn handle_save_blinker(path: &[u8]) -> bool {
     crate::save_blinker_cfg(c).await
 }
 
+/// 解析 /save-ap?ssid=..&pass=..，写进 flash。
+/// 热点参数是射频初始化时用的，所以保存后必须重启才生效（调用方负责）。
+async fn handle_save_ap(path: &[u8]) -> Option<store::ApCfg> {
+    let query = match find_seq(path, b"?") {
+        Some(i) => &path[i + 1..],
+        None => return None,
+    };
+
+    let mut raw = [0u8; 256];
+    let mut cfg = store::ApCfg::new();
+
+    // 现在的热点参数：密码没填时要沿用它（见下面的说明）
+    let cur = crate::AP_CFG.lock().await.clone();
+    // 勾了"不设密码"才是真正的开放网络
+    let want_open = matches!(query_value(query, b"open"), Some(v) if v == b"1");
+
+    for (key, is_ssid) in [(b"ssid".as_slice(), true), (b"pass".as_slice(), false)] {
+        let v = query_value(query, key).unwrap_or(b"");
+        let n = urldecode(v, &mut raw);
+        let s = match str::from_utf8(&raw[..n]) {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+        if is_ssid {
+            if cfg.ssid.push_str(s).is_err() {
+                return None;
+            }
+        } else if want_open {
+            // 明确要开放网络：密码留空，下面 pass_ok 会放行
+        } else if s.is_empty() {
+            // 没填密码、也没勾"开放网络" —— 沿用现有密码。
+            // 不然"只想改个热点名"就会把有密码的热点改成谁都能连的开放网络，
+            // 这个坑太容易踩了（浏览器空输入框总会提交 pass=）。
+            if cfg.pass.push_str(cur.pass_or_default()).is_err() {
+                return None;
+            }
+        } else if cfg.pass.push_str(s).is_err() {
+            return None;
+        }
+    }
+
+    // 热点名必须有；密码要么空（开放网络），要么 8~63 字符（WPA2 硬约束）
+    if !cfg.is_set() || !store::ApCfg::pass_ok(&cfg.pass) {
+        return None;
+    }
+
+    log::info!(
+        "[web] 保存热点配置: {} / {}",
+        cfg.ssid,
+        if cfg.pass.is_empty() { "开放" } else { "******" }
+    );
+    if crate::save_ap_cfg(cfg.clone()).await {
+        Some(cfg)
+    } else {
+        None
+    }
+}
+
 /// 解析 /save?ssid=..&pass=..，落盘，然后**只返回**解析出来的凭据。
 /// 通知 wifi_task 的活儿交给调用方，必须在 HTTP 响应发完之后再做。
 async fn handle_save(path: &[u8]) -> Option<store::Creds> {
@@ -409,6 +468,23 @@ pub async fn serve_once(socket: &mut TcpSocket<'_>) -> Served {
             esp_hal::system::software_reset();
         } else {
             let _ = write_html(socket, SAVED_FAIL).await;
+        }
+        return Served::Page;
+    }
+
+    // ---- 保存热点（AP）自己的名字/密码 ----
+    // 顺序同样关键：这个 handler 也必须排在 "/save" 之前（子串匹配会先命中 /save）。
+    // 热点参数是射频起来时用的，改完只能重启生效 —— 客户端本来也会被踢下线。
+    if find_seq(path, b"/save-ap").is_some() {
+        match handle_save_ap(path).await {
+            Some(cfg) => {
+                let _ = write_ap_saved(socket, &cfg).await;
+                embassy_time::Timer::after(embassy_time::Duration::from_millis(700)).await;
+                esp_hal::system::software_reset();
+            }
+            None => {
+                let _ = write_html(socket, AP_SAVED_FAIL).await;
+            }
         }
         return Served::Page;
     }
@@ -576,9 +652,112 @@ const RESET_OK: &str = "<!doctype html><meta charset=utf-8>\
 <p>已保存的 WiFi 全部清掉了。约 8 秒后重新连接热点 <b>ESP32-POWER</b> \
 （密码 <b>power1234</b>），再打开 http://192.168.4.1 重新配网。</p>";
 
+const AP_SAVED_FAIL: &str = "<!doctype html><meta charset=utf-8>\
+<meta name=viewport content='width=device-width,initial-scale=1'>\
+<title>保存失败</title><body style='font:16px system-ui;background:#0c1016;color:#e8eef7;padding:24px'>\
+<h2 style='color:#e04040'>热点参数保存失败</h2>\
+<p>可能的原因：<br>\
+· 热点名是空的，或超过 32 个字符<br>\
+· 密码只有 1~7 个字符（WPA2 要求至少 8 位，或者留空表示开放网络）<br>\
+· flash 写入失败</p>\
+<p><a href='/' style='color:#40c8e0'>返回重填</a></p>";
+
+const AP_SAVED_HEAD: &str = "<!doctype html><meta charset=utf-8>\
+<meta name=viewport content='width=device-width,initial-scale=1'>\
+<title>热点已保存</title><body style='font:16px system-ui;background:#0c1016;color:#e8eef7;padding:24px'>\
+<h2 style='color:#3ad06a'>热点参数已保存，设备正在重启…</h2>\
+<div style='background:#151c26;border:1px solid #26313f;border-radius:12px;padding:16px;margin:16px 0'>\
+<div style='margin-bottom:6px'>新的热点名：<b style='color:#7fd8ea'>";
+
+const AP_SAVED_MID: &str = "</b></div><div>密码：<b>";
+
+const AP_SAVED_TAIL: &str = "</b></div></div>\
+<p style='color:#f0b040'><b>注意</b>：约 8 秒后设备开始广播新热点，手机上的旧名字会消失，\
+需要重新搜索并连接新的热点。</p>\
+<p>连上后打开 <b>http://192.168.4.1</b> 继续设置。已保存的联网 WiFi 和 Blinker 凭据不受影响。</p>";
+
+/// 保存热点配置成功的提示页。新名字/密码要回显给用户，所以是动态拼的。
+///
+/// 不是把整页拼成一个 String：主栈上还有别的缓冲，1KB 的临时串没必要。
+/// 这里先算总长写 Content-Length，再分段写出去。
+async fn write_ap_saved(socket: &mut TcpSocket<'_>, cfg: &store::ApCfg) -> Result<(), ()> {
+    // 转义后的 SSID / 密码。最坏情况每个字符变成 6 字节（&quot;），
+    // 32 字符 SSID -> 192，63 字符密码 -> 378，各留一点余量。
+    let mut ssid: String<224> = String::new();
+    let mut pass: String<416> = String::new();
+    html_escape(cfg.ssid.as_str(), &mut ssid);
+    if cfg.pass.is_empty() {
+        let _ = pass.push_str("<span style='color:#f0b040'>无密码（开放网络）</span>");
+    } else {
+        html_escape(cfg.pass.as_str(), &mut pass);
+    }
+
+    write_parts(
+        socket,
+        &[AP_SAVED_HEAD, &ssid, AP_SAVED_MID, &pass, AP_SAVED_TAIL],
+    )
+    .await
+}
+
+/// 最小 HTML 转义：只处理会破坏结构/属性的几个字符，够用就行
+fn html_escape<const N: usize>(src: &str, out: &mut String<N>) {
+    for ch in src.chars() {
+        let r = match ch {
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            c => {
+                let mut tmp = [0u8; 4];
+                out.push_str(c.encode_utf8(&mut tmp))
+            }
+        };
+        if r.is_err() {
+            break; // 放不下就截断，别把页面拼成半截乱码
+        }
+    }
+}
+
+/// 分段版 write_html：各段拼起来就是正文，Content-Length 用总长度。
+///
+/// 用途是"正文里要插用户输入"的页面（比如回显热点名），这样不用先在栈上
+/// 拼出一个大 String。
+async fn write_parts(socket: &mut TcpSocket<'_>, parts: &[&str]) -> Result<(), ()> {
+    let total: usize = parts.iter().map(|p| p.len()).sum();
+
+    let mut head = [0u8; 128];
+    let hdr = {
+        let mut w = Cursor {
+            buf: &mut head,
+            pos: 0,
+        };
+        w.push(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ");
+        let mut num = [0u8; 12];
+        w.push(itoa(total, &mut num));
+        w.push(b"\r\nConnection: close\r\n\r\n");
+        w.done().len()
+    };
+    socket.write_all(&mut head[..hdr]).await.map_err(|_| ())?;
+
+    let mut chunk = [0u8; 512];
+    for p in parts {
+        let b = p.as_bytes();
+        let mut off = 0usize;
+        while off < b.len() {
+            let n = if b.len() - off < 512 { b.len() - off } else { 512 };
+            chunk[..n].copy_from_slice(&b[off..off + n]);
+            socket.write_all(&mut chunk[..n]).await.map_err(|_| ())?;
+            off += n;
+        }
+    }
+    let _ = socket.flush().await;
+    Ok(())
+}
+
 /// 当前网络状态 JSON，配网页轮询它来判断有没有连上
 async fn write_status(socket: &mut TcpSocket<'_>) -> Result<(), ()> {
-    let mut body: String<256> = String::new();
+    // 容量要够：sta/ip/rssi/err(56)/bdev(40)/temp/bond/apssid(32)/apopen 全塞进去
+    let mut body: String<384> = String::new();
     {
         let info = crate::NET.lock().await;
         let state = match info.state {
@@ -622,6 +801,26 @@ async fn write_status(socket: &mut TcpSocket<'_>) -> Result<(), ()> {
             let _ = core::fmt::Write::write_fmt(&mut body, format_args!("（固件内置）"));
         }
         let _ = core::fmt::Write::write_fmt(&mut body, format_args!("\""));
+    }
+    // 当前热点名 + 是不是开放网络：设置页用它回显，免得用户忘了自己改成了什么
+    {
+        let ap = crate::AP_CFG.lock().await;
+        let _ = core::fmt::Write::write_fmt(&mut body, format_args!(",\"apssid\":\""));
+        for ch in ap.ssid_or_default().chars() {
+            let c = if ch == '"' { '\'' } else { ch };
+            let _ = core::fmt::Write::write_char(&mut body, c);
+        }
+        let _ = core::fmt::Write::write_fmt(
+            &mut body,
+            format_args!(
+                "\",\"apopen\":{}",
+                if ap.pass_or_default().is_empty() {
+                    "true"
+                } else {
+                    "false"
+                }
+            ),
+        );
     }
     // 芯片温度（0.1℃，0 = 还没读到）
     let t = crate::TEMP_DECI.load(core::sync::atomic::Ordering::Relaxed);
