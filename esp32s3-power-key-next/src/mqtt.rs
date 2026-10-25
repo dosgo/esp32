@@ -15,6 +15,13 @@ const SUBACK: u8 = 9;
 const PINGREQ: u8 = 12;
 const PINGRESP: u8 = 13;
 
+/// 空闲多久发一次 PINGREQ。
+///
+/// 必须明显小于 keepalive（CONNECT 里填的 120s，broker 侧 1.5 倍 = 180s 才判死），
+/// 也要小于 socket 的读超时（main.rs 里 set_timeout(120s)），
+/// 这样"空闲 → 发心跳"永远走在"超时 → 断线"前面。
+const IDLE_PING: Duration = Duration::from_secs(45);
+
 #[derive(Debug)]
 pub enum MqttError {
     Socket,
@@ -190,9 +197,37 @@ impl<'a, 's> MqttClient<'a, 's> {
     /// 阻塞等待下一条 PUBLISH，返回其 payload（拷贝到 out，返回长度）
     /// 收到 PINGRESP 会自动跳过继续等
     pub async fn wait_publish(&mut self, out: &mut [u8]) -> Result<usize, MqttError> {
+        // 连续发了几次 PINGREQ 都没等到 PINGRESP。用于识别"半死"连接：
+        // 对端断电/换 IP 后，TCP 可能既不报错也不回包，写心跳看着是成功的。
+        let mut unanswered: u8 = 0;
         loop {
+            // ---- 空闲窗口：只等「下一个报文的第一个字节」 ----
+            //
+            // 这里超时是**正常现象**（没人发消息），必须发个 PINGREQ 保活后继续等，
+            // 绝不能当错误抛出去。之前的写法是 `read_exact` 包 90s 超时，
+            // 而 90s < socket 自身的 120s 超时 < keepalive 120s，
+            // 于是设备一空闲就必然 90s 整点断线重连一次 —— 就是日志里那串 Timeout。
+            //
+            // 为什么可以在这里"打断读"：只读 1 字节。1 字节的 read 要么拿到数据、
+            // 要么还在等，取消它不会吃掉半个报文（真正会错位的是下面的多字节 read_exact，
+            // 那些一个都不能取消，超时照样报错重连）。
             let mut hdr = [0u8; 1];
-            self.read_exact(&mut hdr).await?;
+            match with_timeout(IDLE_PING, self.socket.read(&mut hdr)).await {
+                Ok(Ok(0)) => return Err(MqttError::UnexpectedEof), // 对端正常关闭
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => return Err(MqttError::Socket),
+                Err(_) => {
+                    // 空闲超时 → 发心跳，然后接着等。
+                    // 但连发 3 次都没人回 PINGRESP，就认为这条连接已经是"半死"
+                    // （对端掉电/换 IP 时 TCP 可能静默不报错），主动断开重连。
+                    if unanswered >= 3 {
+                        return Err(MqttError::Timeout);
+                    }
+                    self.ping().await?;
+                    unanswered += 1;
+                    continue;
+                }
+            }
             let ptype = hdr[0] >> 4;
 
             // 读剩余长度
@@ -211,7 +246,8 @@ impl<'a, 's> MqttClient<'a, 's> {
             let len = rem as usize;
             if len == 0 {
                 if ptype == PINGRESP {
-                    continue;
+                    // 心跳有回应，说明连接是真的活着
+                    unanswered = 0;
                 }
                 continue;
             }
