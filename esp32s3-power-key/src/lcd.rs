@@ -130,10 +130,22 @@ pub async fn lcd_task(
     // 擦掉自己那一小块再重画，屏幕基本是稳定的。
     display.clear(BG).ok();
 
+    // 热点名/密码是网页可改的，开机时从 flash 读到的值（这里是启动后的静态显示）
+    let (ap_ssid, ap_pass) = {
+        let ap = crate::AP_CFG.lock().await;
+        let pass = if ap.pass_or_default().is_empty() {
+            String::<20>::try_from("（开放）").unwrap_or_default()
+        } else {
+            // 屏幕一行只放得下 13 个字符，密码太长就截断（完整值在网页里看）
+            String::<20>::try_from(ap.pass_or_default()).unwrap_or_default()
+        };
+        (String::<24>::try_from(ap.ssid_or_default()).unwrap_or_default(), pass)
+    };
+
     draw_str(&mut display, 2, 2, "WiFi AP", dim_style);
-    draw_str(&mut display, 2, 14, crate::store::AP_SSID, style);
+    draw_str(&mut display, 2, 14, ap_ssid.as_str(), style);
     line.clear();
-    let _ = write!(line, "pw {}", crate::store::AP_PASSWORD);
+    let _ = write!(line, "pw {}", ap_pass);
     draw_str(&mut display, 2, 26, line.as_str(), style);
     draw_hline(&mut display, 40);
 

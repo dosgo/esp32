@@ -5,7 +5,8 @@
 //!
 //! ## 网络：AP + STA 同时开，不用切模式
 //!
-//!   - **热点（AP）永远开着**：`ESP32-POWER` / 192.168.4.1，用来配网和救急
+//!   - **热点（AP）永远开着**：默认 `ESP32-POWER` / 192.168.4.1（名字和密码可在网页里改），
+//!     用来配网和救急
 //!   - **联网（STA）**：配过就开机自动连；MQTT 需要外网，没连上就控制不了
 //!   - **配网**：连热点 → 浏览器开 192.168.4.1 → 填 WiFi 账号密码 → 保存
 //!   - **恢复出厂**：长按 BOOT 3 秒（短按是唤醒电脑）
@@ -393,18 +394,40 @@ pub async fn save_blinker_cfg(c: store::BlinkerCreds) -> bool {
     ok
 }
 
+/// 网页保存热点（AP）名字/密码：写 flash + 更新内存。**调用方负责重启**，
+/// 因为热点参数是射频初始化时用的，改完必须重新 start 才会广播新名字。
+pub async fn save_ap_cfg(c: store::ApCfg) -> bool {
+    let mut g = FLASH.lock().await;
+    let ok = match g.as_mut() {
+        Some(f) => store::save_ap(f, &c),
+        None => false,
+    };
+    drop(g);
+    if ok {
+        *AP_CFG.lock().await = c;
+    }
+    ok
+}
+
 /// 网页提交了新的 WiFi 账号密码 → 通知 wifi_task 去连
 pub static NEW_CREDS: Signal<CriticalSectionRawMutex, store::Creds> = Signal::new();
 
-/// 热点（AP）的固定配置。每次改 WiFi 模式都得带上它，否则热点会被关掉。
-fn ap_config() -> AccessPointConfig {
+/// 当前生效的热点（AP）配置。开机时从 flash 读一次，网页改完写 flash + 重启生效。
+pub static AP_CFG: Mutex<CriticalSectionRawMutex, store::ApCfg> = Mutex::new(store::ApCfg::new());
+
+/// 热点（AP）的配置。每次改 WiFi 模式都得带上它，否则热点会被关掉。
+///
+/// 名字/密码来自 flash（网页可改），没配过就用出厂值 `ESP32-POWER` / `power1234`。
+fn ap_config(c: &store::ApCfg) -> AccessPointConfig {
     let base = AccessPointConfig::default()
-        .with_ssid(store::AP_SSID)
+        .with_ssid(c.ssid_or_default())
         .with_max_connections(4);
-    if store::AP_PASSWORD.is_empty() {
+    let pass = c.pass_or_default();
+    if pass.is_empty() {
+        // 开放网络：不能带 auth_method，否则 esp_wifi 会报参数错误
         base
     } else {
-        base.with_password(store::AP_PASSWORD.into())
+        base.with_password(pass.into())
             .with_auth_method(AuthenticationMethod::Wpa2Personal)
     }
 }
@@ -1307,19 +1330,22 @@ async fn main(spawner: Spawner) -> ! {
 
     // ---------------- 读上次存的 WiFi 账号密码 ----------------
     let mut flash = FlashStorage::new(peripherals.FLASH).multicore_auto_park();
+    // 热点自己的名字/密码（网页里改过的）
+    let apcfg = store::load_ap(&mut flash).unwrap_or_default();
     let creds = match store::load(&mut flash) {
         Some(c) => {
             info!("[store] 已存 WiFi: {}", c.ssid);
             Some(c)
         }
         None => {
-            info!("[store] 没配过 WiFi，先用热点 {} 配网", store::AP_SSID);
+            info!("[store] 没配过 WiFi，先用热点 {} 配网", apcfg.ssid_or_default());
             None
         }
     };
     // Blinker 凭据也顺手读一下（网页改过就用网页的，没改过就用固件内置的）
     let bcred = store::load_blinker(&mut flash);
     FLASH.lock().await.replace(flash);
+    *AP_CFG.lock().await = apcfg;
     match bcred {
         Some(b) => {
             info!("[store] 已存 Blinker 设备: {}", b.device);
@@ -1338,11 +1364,17 @@ async fn main(spawner: Spawner) -> ! {
     //
     // 坑2：模式从 AP 变 APSTA 会让射频 stop/start，热点瞬断，正在提交配网表单的
     // 手机连接被掐。所以没配网时也用 APSTA + 占位 STA，模式全程不变。
-    let initial = match creds.as_ref() {
-        Some(c) if c.is_set() => WifiConfig::AccessPointStation(sta_config(c), ap_config()),
-        _ => {
-            info!("[wifi] 还没配过网，APSTA + 占位 STA（热点 {}）", store::AP_SSID);
-            WifiConfig::AccessPointStation(placeholder_sta(), ap_config())
+    let initial = {
+        let ap = AP_CFG.lock().await.clone();
+        match creds.as_ref() {
+            Some(c) if c.is_set() => WifiConfig::AccessPointStation(sta_config(c), ap_config(&ap)),
+            _ => {
+                info!(
+                    "[wifi] 还没配过网，APSTA + 占位 STA（热点 {}）",
+                    ap.ssid_or_default()
+                );
+                WifiConfig::AccessPointStation(placeholder_sta(), ap_config(&ap))
+            }
         }
     };
 
@@ -1476,12 +1508,19 @@ async fn main(spawner: Spawner) -> ! {
         .spawn(ble::ble_task(peripherals.BT).expect("failed to spawn ble task"));
 
     println!("USB HID ready. Plug USB(GPIO19/20) into the PC.");
-    println!(
-        "热点已开: {} / {}  -> 配网请打开 http://{}",
-        store::AP_SSID,
-        store::AP_PASSWORD,
-        store::AP_IP
-    );
+    {
+        let ap = AP_CFG.lock().await;
+        println!(
+            "热点已开: {} / {}  -> 配网请打开 http://{}",
+            ap.ssid_or_default(),
+            if ap.pass_or_default().is_empty() {
+                "（开放网络）"
+            } else {
+                ap.pass_or_default()
+            },
+            store::AP_IP
+        );
+    }
     println!("BOOT: 短按唤醒 / 长按 {BOOT_RESET_MS}ms 恢复出厂");
 
     // LCD：GNPE Pocket-Dongle-S3-0.96 的真实接线（官方原理图）
@@ -1591,7 +1630,11 @@ async fn connect_sta(controller: &mut WifiController<'static>, c: &store::Creds)
         return false;
     }
 
-    let cfg = WifiConfig::AccessPointStation(sta_config(c), ap_config());
+    let cfg = WifiConfig::AccessPointStation(sta_config(c), {
+        // 热点参数随时可能被网页改过，每次切配置都从内存里取最新的
+        let ap = AP_CFG.lock().await.clone();
+        ap_config(&ap)
+    });
 
     if let Err(e) = controller.set_config(&cfg) {
         error!("[wifi] 设置 AP+STA 失败: {e:?}");

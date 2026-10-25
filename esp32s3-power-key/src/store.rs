@@ -32,12 +32,133 @@ pub const MAX_PASS: usize = 64;
 
 // ---------------- 热点参数 ----------------
 
-/// 和 KVM 那个热点区分开，免得两个设备搞混
-pub const AP_SSID: &str = "ESP32-POWER";
-/// 留空 = 开放网络（不用密码）；否则必须 8~63 个字符（WPA2 的硬性要求）
-pub const AP_PASSWORD: &str = "power1234";
+/// 出厂热点名（和 KVM 那个热点区分开，免得两个设备搞混）。
+/// 网页里改过之后以 flash 里的为准，这里只是"没配过 / 恢复出厂后"的兜底。
+pub const DEFAULT_AP_SSID: &str = "ESP32-POWER";
+/// 出厂热点密码。留空 = 开放网络；否则必须 8~63 个字符（WPA2 的硬性要求）
+pub const DEFAULT_AP_PASSWORD: &str = "power1234";
 /// 热点模式下 ESP32 自己的地址（也是配网页面的访问地址）
 pub const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
+
+// =============== 热点（AP）自己的 SSID / 密码（网页里可改） ===============
+//
+// 为什么单独存：热点名/密码原来是编译期常量，想换个名字就得改代码重烧。
+// 存进配置区第四块扇区（0xC000），网页改完重启一次就生效。
+// 注意 WPA2 的密码长度硬约束：要么留空（开放网络），要么 8~63 个字符。
+// 1~7 个字符 wifi 初始化会直接失败，所以校验放在写入前。
+
+pub const AP_CFG_FLASH_ADDR: u32 = CREDS_FLASH_ADDR + 3 * FlashStorage::SECTOR_SIZE;
+
+/// WPA2 密码的最小长度；0 表示开放网络
+pub const AP_PASS_MIN: usize = 8;
+pub const AP_PASS_MAX: usize = 63;
+
+#[derive(Clone, Default)]
+pub struct ApCfg {
+    pub ssid: String<MAX_SSID>,
+    pub pass: String<MAX_PASS>,
+}
+
+impl ApCfg {
+    pub const fn new() -> Self {
+        Self {
+            ssid: String::new(),
+            pass: String::new(),
+        }
+    }
+    /// flash 里存过没有
+    pub fn is_set(&self) -> bool {
+        !self.ssid.is_empty()
+    }
+    /// 实际用的热点名：没配过就用出厂值
+    pub fn ssid_or_default(&self) -> &str {
+        if self.ssid.is_empty() {
+            DEFAULT_AP_SSID
+        } else {
+            self.ssid.as_str()
+        }
+    }
+    /// 实际用的热点密码：没配过就用出厂值
+    pub fn pass_or_default(&self) -> &str {
+        if self.ssid.is_empty() {
+            DEFAULT_AP_PASSWORD
+        } else {
+            self.pass.as_str()
+        }
+    }
+    /// 密码长度是否合法（空 = 开放网络，也算合法）
+    pub fn pass_ok(pass: &str) -> bool {
+        pass.is_empty() || (pass.len() >= AP_PASS_MIN && pass.len() <= AP_PASS_MAX)
+    }
+}
+
+/// 布局：[0..4] magic [4] ssid 长度 [5] 密码长度 [6..] 数据 [末尾] 校验和
+pub fn load_ap(f: &mut FlashStorage<'_>) -> Option<ApCfg> {
+    let mut b = Buf([0; 128]);
+    if ReadNorFlash::read(f, AP_CFG_FLASH_ADDR, &mut b.0).is_err() {
+        return None;
+    }
+    if u32::from_le_bytes([b.0[0], b.0[1], b.0[2], b.0[3]]) != MAGIC {
+        return None;
+    }
+    let sl = b.0[4] as usize;
+    let pl = b.0[5] as usize;
+    if sl == 0 || sl > MAX_SSID || pl > MAX_PASS || 6 + sl + pl + 1 > b.0.len() {
+        return None;
+    }
+    let mut sum: u8 = 0;
+    for i in 0..(6 + sl + pl) {
+        sum = sum.wrapping_add(b.0[i]);
+    }
+    if sum != b.0[6 + sl + pl] {
+        return None;
+    }
+
+    let mut c = ApCfg::new();
+    c.ssid.push_str(str::from_utf8(&b.0[6..6 + sl]).ok()?).ok()?;
+    c.pass
+        .push_str(str::from_utf8(&b.0[6 + sl..6 + sl + pl]).ok()?)
+        .ok()?;
+    // flash 里的旧数据万一不合法（比如 5 位密码），当作没配过，用出厂值更安全
+    if !ApCfg::pass_ok(&c.pass) {
+        warn!("[store] 存的热点密码长度不合法，忽略");
+        return None;
+    }
+    Some(c)
+}
+
+pub fn save_ap(f: &mut FlashStorage<'_>, c: &ApCfg) -> bool {
+    let sl = c.ssid.len();
+    let pl = c.pass.len();
+    if sl == 0 || sl > MAX_SSID || pl > MAX_PASS || !ApCfg::pass_ok(&c.pass) {
+        warn!("[store] 热点 SSID/密码长度不合法，不写");
+        return false;
+    }
+
+    let mut b = Buf([0u8; 128]);
+    b.0[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+    b.0[4] = sl as u8;
+    b.0[5] = pl as u8;
+    b.0[6..6 + sl].copy_from_slice(c.ssid.as_bytes());
+    b.0[6 + sl..6 + sl + pl].copy_from_slice(c.pass.as_bytes());
+
+    let mut sum: u8 = 0;
+    for i in 0..(6 + sl + pl) {
+        sum = sum.wrapping_add(b.0[i]);
+    }
+    b.0[6 + sl + pl] = sum;
+
+    let sector = FlashStorage::SECTOR_SIZE;
+    if NorFlash::erase(f, AP_CFG_FLASH_ADDR, AP_CFG_FLASH_ADDR + sector).is_err() {
+        warn!("[store] 热点配置扇区擦除失败");
+        return false;
+    }
+    if NorFlash::write(f, AP_CFG_FLASH_ADDR, &b.0).is_err() {
+        warn!("[store] 热点配置写入失败");
+        return false;
+    }
+    true
+}
 
 // ---------------- 凭证 ----------------
 
