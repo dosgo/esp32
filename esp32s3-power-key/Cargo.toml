@@ -6,6 +6,15 @@ resolver = "2"
 
 # ESP32-S3 用 USB HID（Keyboard + System Control）+ WiFi 远程控制电脑休眠/唤醒
 # 生态版本参考 esparrier：esp-hal 1.1.2 + esp-radio 0.18 + embassy-usb 0.6
+#
+# 为什么 esp-* 这一组停在 1.1 线（2026-10 核查过最新版）：
+#   esp-hal 最新是 1.2.2，但 esp-radio 唯一能配 1.2 的版本是 1.0.0-beta.1，
+#   beta.2 已被 yank。升 1.2 等于把整个 Wi-Fi/BLE 栈押在 beta 上，还要重写
+#   ble.rs / otg_v1 / psram 那一堆 API，并重新移植 vendor 里的 trouble 补丁。
+#   所以 esp-* 全家（hal / radio / rtos / alloc / storage / bootloader）
+#   按同一代锁定：1.1.2 / 0.18 / 0.3 / 0.10 / 0.9 / 0.5。
+# 其余与 esp-hal 无线耦合的（sha1 / esp-println / esp-backtrace / embedded-hal-bus）
+# 已全部跟到最新。
 
 [dependencies]
 critical-section = "1.2.0"
@@ -32,7 +41,7 @@ embassy-usb = { version = "0.6.0", features = [
 embassy-usb-synopsys-otg = "0.3.3"
 embassy-usb-driver = "0.2.2"
 esp-alloc = "0.10.0"
-esp-backtrace = { version = "0.19.0", features = [
+esp-backtrace = { version = "0.20.0", features = [
     "esp32s3",
     "panic-handler",
     "println",
@@ -41,7 +50,7 @@ esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
 # 锁死 =1.1.2：esp-radio 0.18 和 esp-storage 0.9 都只认 esp-hal 1.1.x，
 # 不锁的话 cargo 会解出 1.2 然后两边打架
 esp-hal = { version = "=1.1.2", features = ["esp32s3", "unstable"] }
-esp-println = { version = "0.17.0", features = ["esp32s3", "log-04"] }
+esp-println = { version = "0.18.0", features = ["esp32s3", "log-04"] }
 # ble + coex：S3 的 Wi-Fi 与 BLE 共用一个射频，必须同时开 coex 才能并行跑
 # unstable 是拿到 `ble::controller::BleConnector`（HCI 通道）的前置
 esp-radio = { version = "0.18.0", features = [
@@ -89,12 +98,13 @@ heapless = "0.9.3"
 static_cell = "2.1.1"
 log = "0.4.34"
 # WebSocket 握手要 SHA1（控制页走 WS 收键鼠），纯 no_std，无 alloc
-sha1 = { version = "0.10", default-features = false }
+# 0.11 走 digest 0.11（hybrid-array），new/update/finalize 用法不变
+sha1 = { version = "0.11", default-features = false }
 
 # ---- LCD：0.96" ST7735S 80x160（T-Dongle-S3 同款接线）----
 mipidsi = { version = "0.10", default-features = false }
 embedded-graphics = "0.8"
-embedded-hal-bus = "0.2"
+embedded-hal-bus = "0.3"
 
 [profile.release]
 opt-level = "s"
