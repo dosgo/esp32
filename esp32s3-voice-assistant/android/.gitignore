@@ -1,0 +1,14 @@
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# 47MB 的官方 AAR，自己下：见 README
+app/libs/*.aar
+
+# 模型不进货仓（200MB+）
+models/

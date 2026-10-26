@@ -1,0 +1,273 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="本地测试 · 不用板子"
+            android:textSize="20sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="在手机上直接验证 识别 / 合成 / 大模型 三段，不接 ESP32 也能确认整条链路。"
+            android:textSize="12sp"
+            android:textColor="#888780" />
+
+        <!-- ============================ ① 模型自检 ============================ -->
+        <Button
+            android:id="@+id/btnCheck"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="① 检查模型文件" />
+
+        <TextView
+            android:id="@+id/tvStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:background="#F1EFE8"
+            android:fontFamily="monospace"
+            android:padding="8dp"
+            android:text="还没检查"
+            android:textColor="#2C2C2A"
+            android:textIsSelectable="true"
+            android:textSize="11sp" />
+
+        <!-- ============================ ② 录音识别 ============================ -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="14dp"
+            android:background="#D3D1C7" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="② 录音识别（麦克风 → ASR）"
+            android:textSize="13sp"
+            android:textStyle="bold" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/btnRecord"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="只识别" />
+
+            <Button
+                android:id="@+id/btnChain"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:layout_weight="1.4"
+                android:text="全链路（听到回答）" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/tvLevel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:fontFamily="monospace"
+            android:text="音量：—（门限 500）"
+            android:textColor="#888780"
+            android:textSize="11sp" />
+
+        <TextView
+            android:id="@+id/tvAsr"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:background="#F1EFE8"
+            android:padding="8dp"
+            android:text="识别结果会显示在这里"
+            android:textColor="#2C2C2A"
+            android:textIsSelectable="true"
+            android:textSize="13sp" />
+
+        <!-- ============================ ③ 合成播放 ============================ -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="14dp"
+            android:background="#D3D1C7" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="③ 合成播放（TTS → 手机喇叭）"
+            android:textSize="13sp"
+            android:textStyle="bold" />
+
+        <EditText
+            android:id="@+id/etSay"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="要合成的文字"
+            android:inputType="text"
+            android:text="北京今天多云转晴，气温十五到二十三度。"
+            android:textSize="13sp" />
+
+        <EditText
+            android:id="@+id/etSpeaker"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="音色编号（0 起，换个数再点合成就能听差别）"
+            android:inputType="number"
+            android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/btnSay"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="合成并播放" />
+
+        <TextView
+            android:id="@+id/tvTts"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:background="#F1EFE8"
+            android:padding="8dp"
+            android:text="合成结果会显示在这里"
+            android:textColor="#2C2C2A"
+            android:textIsSelectable="true"
+            android:textSize="13sp" />
+
+        <!-- ============================ ④ 大模型 ============================ -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="14dp"
+            android:background="#D3D1C7" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="④ 大模型（用主界面保存的配置）"
+            android:textSize="13sp"
+            android:textStyle="bold" />
+
+        <Button
+            android:id="@+id/btnLlm"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="发一句「你好」试试" />
+
+        <TextView
+            android:id="@+id/tvLlm"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:background="#F1EFE8"
+            android:padding="8dp"
+            android:text="大模型回复会显示在这里"
+            android:textColor="#2C2C2A"
+            android:textIsSelectable="true"
+            android:textSize="13sp" />
+
+        <!-- ============================ ⑤ 下载模型 ============================ -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="14dp"
+            android:background="#D3D1C7" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="⑤ 下载模型（可换源 / 看明细）"
+            android:textSize="13sp"
+            android:textStyle="bold" />
+
+        <EditText
+            android:id="@+id/etMirror"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="自定义源（可留空，默认 hf-mirror.com）"
+            android:inputType="textUri"
+            android:textSize="12sp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/btnDownload"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1.6"
+                android:text="下载缺失的模型" />
+
+            <Button
+                android:id="@+id/btnDlCancel"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:layout_weight="1"
+                android:enabled="false"
+                android:text="取消" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/tvDl"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:background="#F1EFE8"
+            android:fontFamily="monospace"
+            android:minHeight="80dp"
+            android:padding="8dp"
+            android:text="还没检查。点上面的按钮会先列出缺哪些文件。"
+            android:textColor="#2C2C2A"
+            android:textIsSelectable="true"
+            android:textSize="11sp" />
+
+        <!-- ============================ 日志 ============================ -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="日志"
+            android:textSize="13sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/tvLog"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:background="#2C2C2A"
+            android:fontFamily="monospace"
+            android:minHeight="120dp"
+            android:padding="8dp"
+            android:textColor="#E8E6DF"
+            android:textIsSelectable="true"
+            android:textSize="11sp" />
+
+    </LinearLayout>
+</ScrollView>

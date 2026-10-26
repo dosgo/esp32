@@ -1,0 +1,5 @@
+# 基础依赖 —— 电脑和手机（Termux）都装这个
+aiohttp>=3.9
+websockets>=12.0
+numpy>=1.24
+pypinyin>=0.51        # 唤醒词同音容错（"小智"可能被识别成"小芝"）
