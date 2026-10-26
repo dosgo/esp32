@@ -21,8 +21,10 @@ mod dns;
 mod hid;
 mod lcd;
 mod mqtt;
-mod msc;
-mod sdcard;
+// 注意：msc.rs（USB U 盘）和 sdcard.rs（TF 卡）目前**未启用**，见下方说明。
+// 文件保留在仓库里，想恢复时把这两行 mod 打开、按 git 历史 1ef6b7c 的集成方式接回即可。
+// mod msc;
+// mod sdcard;
 mod soc_temp;
 mod store;
 mod web;
@@ -561,12 +563,6 @@ impl Handler for MyDeviceHandler {
     fn remote_wakeup_enabled(&mut self, enabled: bool) {
         dlog!("[usb] 远程唤醒允许={enabled}");
     }
-}
-
-/// U 盘任务：TF 卡 + USB MSC。和 HID 完全独立，互不阻塞。
-#[embassy_executor::task]
-async fn msc_task(msc: msc::Msc<'static, Driver<'static>>) {
-    msc.run().await
 }
 
 #[embassy_executor::task]
@@ -1248,38 +1244,6 @@ async fn main(spawner: Spawner) -> ! {
 
     println!("\n=== ESP32-S3 USB HID power key ===");
 
-    // ---------------- TF 卡（USB U 盘的介质） ----------------
-    //
-    // 必须在 build() 之前挂好：MSC 的 interface 描述符里要写容量相关信息
-    // （其实不用，但设备对象要拿到卡句柄）。挂卡是阻塞操作（几十到一百多毫秒），
-    // 此刻 USB 还没上线，不影响枚举。
-    //
-    // 没插卡不算致命错误：设备照样是键鼠 + 唤醒器，U 盘那边显示"请插入磁盘"。
-    let sd = match sdcard::SdStorage::mount(
-        peripherals.SPI3,
-        peripherals.GPIO17, // SCLK
-        peripherals.GPIO18, // MOSI
-        peripherals.GPIO16, // MISO
-        peripherals.GPIO47, // CS
-    ) {
-        Ok(s) if s.blocks() > 0 => {
-            info!(
-                "[sd] TF 卡就绪：{} 块，约 {} MB",
-                s.blocks(),
-                s.blocks() / 2048
-            );
-            Some(s)
-        }
-        Ok(_) => {
-            warn!("[sd] 没插卡或卡不认（U 盘会显示无介质，其它功能正常）");
-            None
-        }
-        Err(e) => {
-            warn!("[sd] {e}（U 盘会显示无介质，其它功能正常）");
-            None
-        }
-    };
-
     // ---------------- USB HID ----------------
     // esp-hal 1.2：otg_fs 模块改名为 usb::otg，外设 USB0 改名为 USB_FS，
     // 且 Usb::new 拆成了 new_fs / new_hs（S3 只有全速口，用 new_fs）。
@@ -1357,20 +1321,7 @@ async fn main(spawner: Spawner) -> ! {
         },
     );
 
-    // ④ 大容量存储：把 TF 卡直接挂成电脑里的 U 盘（第 4 个 interface）
-    //
-    // 和上面三个 HID 共用同一根 USB、同一个 configuration。HID 是 interrupt 端点，
-    // MSC 是 bulk 端点，互不干扰 —— 插上电脑会同时出现键鼠和可移动磁盘。
-    // 注意 max-interface-count 必须 ≥ 4（Cargo.toml 里已经是 4）。
-    let msc_handler = mk_static!(msc::MscHandler, msc::MscHandler);
-    builder.handler(msc_handler);
-    let msc_dev = msc::Msc::new(&mut builder, sd);
-
     let device = builder.build();
-
-    spawner.spawn(
-        msc_task(msc_dev).expect("failed to spawn msc task"),
-    );
 
     spawner
         .spawn(usb_task(device).expect("failed to spawn usb task"));

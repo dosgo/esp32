@@ -33,24 +33,17 @@ embassy-net = { version = "0.9.1", features = [
 embassy-sync = "0.8.0"
 embedded-io-async = "0.7"
 embedded-storage = "0.3.1"
-# SD 卡（TF）驱动：SPI 模式下的卡初始化 + 块读写。
-# 0.10 的 SdCard 实现了 BlockDevice，读写在内部用 RefCell 串行化，&self 即可。
-#
-# default-features = false 是为了关掉它自带的 `log` feature：
-# 没插卡时它会在 CMD0 超时循环里狂刷 `[spi/WARN] Timed out, trying again..`，
-# 而这段代码跑在 USB 之前（日志还走 USB-Serial-JTAG），
-# 几条 warn 就能把 JTAG 的 64 字节 FIFO 灌满 —— 主机一旦不读串口，
-# 写日志变成死等，整个固件卡在这里，USB 永远枚举不出来。
-embedded-sdmmc = { version = "0.10.0", default-features = false }
-# 上面两个 crate 都是按 embedded-hal 1.0 的 trait 写的；
-# esp-hal 1.2 的 Spi 也实现了 1.0 的 SpiBus，所以不用额外适配层。
-embedded-hal = "1.0.0"
+# 曾经为「TF 卡 → USB U 盘」引过 embedded-sdmmc 0.10 和 embedded-hal 1.0。
+# 2026-10-26 实测：U 盘能让 Windows 认出来（枚举成可移动磁盘、3 个 HID 共存正常），
+# 但 SD 卡槽要拆外壳才能插，且 SPI 20MHz + USB 全速双重瓶颈把速度锁在 ~1MB/s，
+# 做 PE 启动盘要 1.5 分钟以上、还卡电脑，所以整体撤掉。
+# 源码保留在 src/sdcard.rs 和 src/msc.rs（未 mod，不参与编译）。
+# 想恢复：把这两个依赖加回来，按 git 提交 1ef6b7c 的方式接进 main.rs。
 embassy-time = { version = "0.5.1", features = ["generic-queue-8"] }
 embassy-usb = { version = "0.6.0", features = [
     # 3 个 HID 各占 1 个 handler（HidWriter::new 内部会注册自己的状态 handler）
-    # + MyDeviceHandler（远程唤醒/总线状态）+ MSC 的 MscHandler = 5 个。
-    # 原来设 4，加 MSC 时 build() 直接 panic：
-    # "handler list full. Increase the max_handler_count"
+    # + MyDeviceHandler（远程唤醒/总线状态）= 4 个。
+    # 留 8 而不改回 4，是为了以后重新接回 MSC（会用到第 5 个 handler）时不用再动这里。
     "max-handler-count-8",
     "max-interface-count-4",
 ] }
