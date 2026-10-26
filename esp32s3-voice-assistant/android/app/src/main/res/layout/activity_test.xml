@@ -129,19 +129,61 @@
             android:text="北京今天多云转晴，气温十五到二十三度。"
             android:textSize="13sp" />
 
-        <EditText
-            android:id="@+id/etSpeaker"
+        <Spinner
+            android:id="@+id/spVoice"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="音色编号（0 起，换个数再点合成就能听差别）"
-            android:inputType="number"
-            android:textSize="12sp" />
+            android:layout_marginTop="4dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/btnPrevVoice"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="◀ 上一个女声" />
+
+            <Button
+                android:id="@+id/btnNextVoice"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:layout_weight="1"
+                android:text="下一个女声 ▶" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/tvVoiceInfo"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="音色信息：—"
+            android:textColor="#5F5E5A"
+            android:textSize="11sp" />
 
         <Button
             android:id="@+id/btnSay"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="合成并播放" />
+
+        <Button
+            android:id="@+id/btnDownloadVoice"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="下载音色模型（约 121MB，157 个音色）" />
+
+        <ProgressBar
+            android:id="@+id/pbVoiceDl"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:max="100"
+            android:progress="0"
+            android:visibility="gone" />
 
         <TextView
             android:id="@+id/tvTts"

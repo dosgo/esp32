@@ -93,6 +93,12 @@ object Models {
     /** 模型文件被替换（比如刚下载完）时调用，下次访问会重新加载 */
     fun invalidate() = releaseAll()
 
+    /** 只丢弃 TTS：单独下载音色模型后用它，别把已经加载好的 ASR 也释放掉 */
+    fun invalidateTts() = synchronized(lock) {
+        ttsInst?.release()
+        ttsInst = null
+    }
+
     /** 模型文件清单检查，给测试页和启动日志用 */
     data class FileCheck(val name: String, val path: File, val required: Boolean) {
         val ok: Boolean get() = path.exists() && path.length() > 0
@@ -111,6 +117,17 @@ object Models {
      */
     fun checkTtsFiles(ctx: Context): List<FileCheck> {
         val base = ttsDir(ctx)
+        val fanchen = File(base, "fanchen")
+        if (File(fanchen, "model.onnx").exists()) {
+            return listOf(
+                FileCheck("model.onnx", File(fanchen, "model.onnx"), true),
+                FileCheck("lexicon.txt", File(fanchen, "lexicon.txt"), true),
+                FileCheck("tokens.txt", File(fanchen, "tokens.txt"), true),
+                FileCheck("phone.fst", File(fanchen, "phone.fst"), false),
+                FileCheck("date.fst", File(fanchen, "date.fst"), false),
+                FileCheck("number.fst", File(fanchen, "number.fst"), false),
+            )
+        }
         val kok = File(base, "kokoro")
         // 有 Kokoro 就看 Kokoro，否则看老布局
         if (File(kok, "model.onnx").exists() || File(kok, "voices.bin").exists()) {

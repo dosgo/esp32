@@ -249,6 +249,67 @@ hello: pcm 16000Hz/16bit/60ms 一帧
 | 编译报 `Unresolved reference: OfflineTts` | AAR 没加载，检查 `app/libs/sherpa-onnx.aar` |
 | 编译报 JDK / Gradle 版本 | `JAVA_HOME` 要指向 Android Studio 的 `jbr`（JDK 25），Gradle 用 9.x |
 
+### TTS 音色：187 个，其中 151 个女声
+
+之前默认那套 VITS 是 **8kHz** 训练的（电话音质），采样率训练时定死，参数怎么调都上不去。
+现在默认换成 **fanchen-C**：187 个中文音色、16kHz、121MB。
+
+| 引擎 | 目录 | 采样率 | 音色 | 体积 | 实测（Redmi 2602BRT18C） |
+|---|---|---|---|---|---|
+| **fanchen-C（默认）** | `tts/fanchen/` | 16kHz | **187（151 女声）** | 121MB | 3.6s 音频，首块 **2689ms** |
+| VITS-LL | `tts/vits/` | 16kHz | 5 | 121MB | 3.2s 音频，首块 1742ms |
+| Kokoro | `tts/kokoro/` | **24kHz** | 54 | 340MB | 4.56s 音频，**7785ms（1.71x，太慢）** |
+| 旧 VITS | `tts/legacy-8k/` | 8kHz | 174 | 39MB | 音质最差 |
+
+#### 女声是怎么分出来的
+
+187 个音色没人愿意一个个试。这里的做法是**在 PC 上先量一遍**：
+
+```
+每个 sid 合成同一句话 → 自相关估基频（25ms 窗，70~300Hz）取中位数
+→ ≥165Hz 判为女声
+```
+
+结果：**151 个女声、36 个男声**，按音高从低到高排序，写进
+`app/src/main/assets/female_voices.txt`（格式 `sid,f0`）。
+
+测试页 ③ 区有「◀ 上一个女声 / 下一个女声 ▶」，翻到就自动合成一遍直接听，
+下面一行显示 `女声 43/151 · sid=128 · 基频 239Hz`。翻到的音色会写进设置，网关也用它。
+
+试听：`android/compare/女声1_sid72_172Hz.wav` ~ `女声6_sid39_284Hz.wav`（从低到高 6 档）。
+
+### 流式合成：首块出声
+
+手机上 16kHz 模型约 1.0x 实时，整句算完再播要等 3 秒。现在用
+`OfflineTts.generateWithCallback` **边算边发**，实测：
+
+```
+合成 3.0s 音频（vits 16kHz 5音色 音色 0，首块 1742ms）
+```
+
+等待从「整句 3s」降到「第一块 1.7s」。发送端按「已发音频时长」节流（最多领先播放 200ms），
+既不会把设备端 8 帧队列撑爆，也不会插静音。
+
+### 已知坑：JNI 回调不能用 Kotlin lambda
+
+`sherpa-onnx` 的 native 层是这样找流式回调的：
+
+```c
+GetMethodID(cls, "invoke", "([F)Ljava/lang/Integer;")
+```
+
+它要求类上真的有一个 `java.lang.Integer invoke(float[])` 方法。而 **Kotlin lambda 编译出来是
+`invoke(Object): Object`**，签名对不上，native 直接：
+
+```
+JNI DETECTED ERROR IN APPLICATION: JNI NewFloatArray called with pending exception
+java.lang.NoSuchMethodError: no non-static method "...$$ExternalSyntheticLambda;.invoke([F)Ljava/lang/Integer;"
+→ SIGABRT，整个进程被杀
+```
+
+所以回调单独写成 Java 类 `TtsChunkCallback.java`（javac 会同时生成 `Integer invoke(float[])`
+和 bridge `Object invoke(Object)`）。**以后接任何 sherpa-onnx 的 Java 回调都照这个来。**
+
 ### 已知坑：AssetManager 不能传
 
 `sherpa-onnx` 的 Kotlin 构造函数是 `OfflineRecognizer(assetManager: AssetManager?, config: ...)`。

@@ -43,12 +43,16 @@ class Tts(private val modelDir: File) {
     /** Kokoro 单独一个子目录，避免和 VITS 的 model.onnx / tokens.txt 撞名 */
     private val kokoroDir = File(modelDir, "kokoro")
 
-    /** VITS 目录：优先 tts/vits/，再兼容早期直接放 tts/ 根下的布局 */
-    private val vitsDir = if (File(modelDir, "vits/model.onnx").exists()) {
-        File(modelDir, "vits")
-    } else {
-        modelDir
-    }
+    /**
+     * VITS 目录，按优先级找：
+     *   tts/fanchen/  187 个音色（151 个女声），16kHz  ← 优先
+     *   tts/vits/     5 个音色，16kHz
+     *   tts/          早期直接放根下的布局（8kHz 老模型）
+     */
+    private val vitsDir: File = listOf("fanchen", "vits")
+        .map { File(modelDir, it) }
+        .firstOrNull { File(it, "model.onnx").exists() }
+        ?: modelDir
 
     val isReady: Boolean
         get() = tts != null

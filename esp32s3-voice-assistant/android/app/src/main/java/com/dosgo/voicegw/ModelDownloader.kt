@@ -32,8 +32,10 @@ object ModelDownloader {
     )
 
     private const val ASR_REPO = "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
-    /** Kokoro 多语种 v1.0，中文 24kHz、54 个音色 */
-    private const val KOKORO_REPO = "csukuangfj/kokoro-multi-lang-v1_0"
+    /** fanchen-C：187 个中文音色（其中 151 个女声），16kHz，121MB */
+    private const val FANCHEN_REPO = "csukuangfj/vits-zh-hf-fanchen-C"
+    /** fanchen 仓库没带文本规则，借 vits-zh-ll 的（数字/日期/电话读法） */
+    private const val RULES_REPO = "csukuangfj/sherpa-onnx-vits-zh-ll"
 
     /**
      * @param remote 远端文件名
@@ -56,14 +58,20 @@ object ModelDownloader {
             Spec("ASR", "model.int8.onnx", "model.int8.onnx", ASR_REPO, 228.2, File(asrDir, "model.int8.onnx")),
             Spec("ASR", "tokens.txt", "tokens.txt", ASR_REPO, 0.3, File(asrDir, "tokens.txt")),
 
-            // Kokoro 放 tts/kokoro/ 子目录，别和老 VITS 的 model.onnx / tokens.txt 撞名
-            Spec("TTS", "model.onnx", "model.onnx", KOKORO_REPO, 310.5, File(ttsDir, "kokoro/model.onnx")),
-            Spec("TTS", "voices.bin", "voices.bin", KOKORO_REPO, 26.9, File(ttsDir, "kokoro/voices.bin")),
-            Spec("TTS", "lexicon-zh.txt", "lexicon-zh.txt", KOKORO_REPO, 2.3, File(ttsDir, "kokoro/lexicon-zh.txt")),
-            Spec("TTS", "tokens.txt", "tokens.txt", KOKORO_REPO, 0.0, File(ttsDir, "kokoro/tokens.txt")),
-            Spec("TTS", "phone-zh.fst", "phone-zh.fst", KOKORO_REPO, 0.1, File(ttsDir, "kokoro/phone-zh.fst")),
-            Spec("TTS", "date-zh.fst", "date-zh.fst", KOKORO_REPO, 0.1, File(ttsDir, "kokoro/date-zh.fst")),
-            Spec("TTS", "number-zh.fst", "number-zh.fst", KOKORO_REPO, 0.1, File(ttsDir, "kokoro/number-zh.fst")),
+            // fanchen-C：187 个音色，16kHz。放 tts/fanchen/ 子目录避免撞名
+            Spec("TTS", "vits-zh-hf-fanchen-C.onnx", "model.onnx", FANCHEN_REPO, 115.6,
+                File(ttsDir, "fanchen/model.onnx")),
+            Spec("TTS", "lexicon.txt", "lexicon.txt", FANCHEN_REPO, 2.3,
+                File(ttsDir, "fanchen/lexicon.txt")),
+            Spec("TTS", "tokens.txt", "tokens.txt", FANCHEN_REPO, 0.0,
+                File(ttsDir, "fanchen/tokens.txt")),
+            // 数字/日期规则文件（fanchen 仓库没有，从 vits-zh-ll 取）
+            Spec("TTS", "phone.fst", "phone.fst", RULES_REPO, 0.1,
+                File(ttsDir, "fanchen/phone.fst")),
+            Spec("TTS", "date.fst", "date.fst", RULES_REPO, 0.1,
+                File(ttsDir, "fanchen/date.fst")),
+            Spec("TTS", "number.fst", "number.fst", RULES_REPO, 0.1,
+                File(ttsDir, "fanchen/number.fst")),
         )
     }
 
@@ -89,6 +97,8 @@ object ModelDownloader {
     fun downloadAll(
         ctx: Context,
         customMirror: String?,
+        /** 只下某一组（"ASR" / "TTS"）；null = 全都下 */
+        onlyGroups: Set<String>? = null,
         cancelled: () -> Boolean,
         onProgress: (Progress) -> Unit,
         onLog: (String) -> Unit,
@@ -99,7 +109,9 @@ object ModelDownloader {
             addAll(DEFAULT_MIRRORS)
         }.distinct()
 
-        val specs = specs(ctx)
+        val specs = specs(ctx).let { all ->
+            if (onlyGroups == null) all else all.filter { it.group in onlyGroups }
+        }
         // 大文件先下：万一半路放弃，至少小的已经齐了
         val ordered = specs.sortedByDescending { it.expectMb }
         val missing = ordered.filter { !it.dest.exists() || it.dest.length() == 0L }
