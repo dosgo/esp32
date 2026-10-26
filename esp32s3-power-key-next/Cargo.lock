@@ -912,7 +912,6 @@ dependencies = [
  "embedded-sdmmc-types",
  "heapless 0.9.3",
  "hex-literal",
- "log",
  "thiserror",
 ]
 
