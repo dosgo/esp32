@@ -9,8 +9,12 @@ import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.os.Bundle
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ProgressBar
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -42,8 +46,9 @@ class TestActivity : AppCompatActivity() {
     private lateinit var tvLlm: TextView
     private lateinit var tvLog: TextView
     private lateinit var etSay: EditText
-    private lateinit var etSpeaker: EditText
+    private lateinit var spVoice: Spinner
     private lateinit var tvVoiceInfo: TextView
+    private lateinit var pbVoiceDl: ProgressBar
     private lateinit var btnRecord: Button
     private lateinit var btnChain: Button
     private lateinit var tvDl: TextView
@@ -85,19 +90,15 @@ class TestActivity : AppCompatActivity() {
         tvLlm = findViewById(R.id.tvLlm)
         tvLog = findViewById(R.id.tvLog)
         etSay = findViewById(R.id.etSay)
-        etSpeaker = findViewById(R.id.etSpeaker)
+        spVoice = findViewById(R.id.spVoice)
         tvVoiceInfo = findViewById(R.id.tvVoiceInfo)
-        etSpeaker.setText(currentSpeaker().toString())
-        updateVoiceInfo()
-        etSpeaker.setOnFocusChangeListener { _, hasFocus ->
-            if (!hasFocus) {
-                currentSpeaker()
-                updateVoiceInfo()
-            }
-        }
+        pbVoiceDl = findViewById(R.id.pbVoiceDl)
+        setupVoiceSpinner()
 
         findViewById<Button>(R.id.btnPrevVoice).setOnClickListener { stepVoice(-1) }
         findViewById<Button>(R.id.btnNextVoice).setOnClickListener { stepVoice(1) }
+        findViewById<Button>(R.id.btnDownloadVoice).setOnClickListener { downloadVoiceModel() }
+        refreshVoiceDownloadButton()
         btnRecord = findViewById(R.id.btnRecord)
         btnChain = findViewById(R.id.btnChain)
         tvDl = findViewById(R.id.tvDl)
@@ -645,6 +646,39 @@ class TestActivity : AppCompatActivity() {
         }
     }
 
+    /** 下拉里放 151 个女声，标签带序号和基频，选哪个一目了然 */
+    private fun setupVoiceSpinner() {
+        val list = VoiceCatalog.females(this)
+        val labels = if (list.isEmpty()) {
+            listOf("（没有女声列表资源）")
+        } else {
+            list.mapIndexed { i, v -> "${i + 1}. sid=${v.sid} · ${"%.0f".format(v.f0)}Hz" }
+        }
+        val adapter = ArrayAdapter(
+            this, android.R.layout.simple_spinner_item, labels,
+        )
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        spVoice.adapter = adapter
+
+        val sid = currentSpeaker()
+        val idx = VoiceCatalog.indexOf(list, sid)
+        if (idx >= 0) spVoice.setSelection(idx, false)
+
+        spVoice.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(
+                parent: AdapterView<*>?, view: android.view.View?, position: Int, id: Long,
+            ) {
+                if (position in list.indices) {
+                    saveSpeaker(list[position].sid)
+                    updateVoiceInfo()
+                }
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+        updateVoiceInfo()
+    }
+
     /** 在 151 个女声里前后翻，翻到就顺手合成一遍直接听 */
     private fun stepVoice(delta: Int) {
         val list = VoiceCatalog.females(this)
@@ -652,9 +686,10 @@ class TestActivity : AppCompatActivity() {
             Toast.makeText(this, "没有女声列表资源", Toast.LENGTH_SHORT).show()
             return
         }
-        val cur = etSpeaker.text.toString().toIntOrNull() ?: 0
-        val next = VoiceCatalog.step(list, cur, delta) ?: return
-        etSpeaker.setText(next.sid.toString())
+        val next = VoiceCatalog.step(list, currentSpeaker(), delta) ?: return
+        val idx = VoiceCatalog.indexOf(list, next.sid)
+        if (idx >= 0) spVoice.setSelection(idx)   // 触发 onItemSelected → 保存 + 刷新
+        saveSpeaker(next.sid)
         updateVoiceInfo()
         synthAndPlay(etSay.text.toString())
     }
@@ -662,25 +697,102 @@ class TestActivity : AppCompatActivity() {
     private fun updateVoiceInfo() {
         val list = VoiceCatalog.females(this)
         if (list.isEmpty()) {
-            tvVoiceInfo.text = "音色信息：没有女声列表（首次需要联网/内置资源）"
+            tvVoiceInfo.text = "音色信息：没有女声列表资源"
             return
         }
-        val sid = etSpeaker.text.toString().toIntOrNull() ?: 0
+        val sid = currentSpeaker()
         val idx = VoiceCatalog.indexOf(list, sid)
+        val engine = if (Models.ttsLoaded()) Models.ttsInfo() else "（未加载）"
         tvVoiceInfo.text = if (idx >= 0) {
-            "女声 ${idx + 1}/${list.size} · sid=$sid · 基频 ${"%.0f".format(list[idx].f0)}Hz"
+            "女声 ${idx + 1}/${list.size} · sid=$sid · 基频 ${"%.0f".format(list[idx].f0)}Hz · $engine"
         } else {
-            "sid=$sid 不在女声列表里（共 ${list.size} 个女声可翻）"
+            "sid=$sid 不在女声列表里（共 ${list.size} 个女声可翻）· $engine"
         }
     }
 
-    /** 界面上的音色编号，同时写进设置（网关那边也读这个值） */
-    private fun currentSpeaker(): Int {
-        val v = etSpeaker.text.toString().toIntOrNull() ?: 0
-        val sid = v.coerceAtLeast(0)
+    /** 音色模型齐了就把按钮改成「已就位」，缺就显示要下多大 */
+    private fun refreshVoiceDownloadButton() {
+        val btn = findViewById<Button>(R.id.btnDownloadVoice)
+        val ttsSpecs = ModelDownloader.specs(this).filter { it.group == "TTS" }
+        val missing = ttsSpecs.filter { !it.dest.exists() || it.dest.length() == 0L }
+        btn.text = if (missing.isEmpty()) {
+            "音色模型已就位（点一下重新检查）"
+        } else {
+            val mb = missing.sumOf { it.expectMb }
+            "下载音色模型（${missing.size} 个文件，约 ${"%.0f".format(mb)}MB）"
+        }
+    }
+
+    /** 只下载音色模型（TTS），下完只重载 TTS，不动已经加载好的 ASR */
+    private fun downloadVoiceModel() {
+        if (downloading) {
+            Toast.makeText(this, "正在下载，稍等", Toast.LENGTH_SHORT).show()
+            return
+        }
+        downloading = true
+        dlCancelled = false
+        findViewById<Button>(R.id.btnDownloadVoice).isEnabled = false
+        pbVoiceDl.visibility = android.view.View.VISIBLE
+        pbVoiceDl.progress = 0
+        log("开始下载音色模型（只下 TTS）")
+
+        worker.execute {
+            val ok = try {
+                ModelDownloader.downloadAll(
+                    this,
+                    customMirror = null,
+                    onlyGroups = setOf("TTS"),
+                    cancelled = { dlCancelled },
+                    onProgress = { pr ->
+                        ui {
+                            if (pr.totalBytes > 0) pbVoiceDl.progress = pr.percent
+                            tvVoiceInfo.text = "【${pr.index}/${pr.count}】${pr.label}  " +
+                                "%.1f/%.1fMB".format(
+                                    pr.doneBytes / 1048576.0, pr.totalBytes / 1048576.0,
+                                )
+                        }
+                    },
+                    onLog = { line -> log(line) },
+                )
+            } catch (t: Throwable) {
+                log("下载异常：${t.javaClass.simpleName} ${t.message}")
+                false
+            }
+
+            downloading = false
+            ui {
+                findViewById<Button>(R.id.btnDownloadVoice).isEnabled = true
+                pbVoiceDl.visibility = android.view.View.GONE
+                tvStatus.text = Models.report(this)
+                refreshVoiceDownloadButton()
+            }
+
+            if (ok) {
+                Models.invalidateTts()
+                val tts = Models.tts(this)
+                ui {
+                    updateVoiceInfo()
+                    Toast.makeText(
+                        this,
+                        if (tts.isReady) "音色模型就绪：${tts.engineName()}" else "模型就位但加载失败，看日志",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+                log("音色模型就绪：${tts.engineName()}，音色 ${tts.numSpeakers()} 个")
+            } else {
+                ui { Toast.makeText(this, "没下完，日志里有原因", Toast.LENGTH_LONG).show() }
+            }
+        }
+    }
+
+    /** 当前音色：以设置里的值为准（下拉只是它的视图），网关也读这个值 */
+    private fun currentSpeaker(): Int =
+        getSharedPreferences(GatewayService.PREFS, Context.MODE_PRIVATE)
+            .getInt("ttsSpeaker", 0)
+
+    private fun saveSpeaker(sid: Int) {
         getSharedPreferences(GatewayService.PREFS, Context.MODE_PRIVATE)
             .edit().putInt("ttsSpeaker", sid).apply()
-        return sid
     }
 
     private fun llmConfig(): Llm.Config {

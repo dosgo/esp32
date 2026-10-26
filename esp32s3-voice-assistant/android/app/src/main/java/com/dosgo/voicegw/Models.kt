@@ -82,6 +82,11 @@ object Models {
 
     fun ttsLoaded(): Boolean = ttsInst?.isReady == true
 
+    /** 当前 TTS 引擎描述，给界面显示（"vits 16kHz 187音色"） */
+    fun ttsInfo(): String = ttsInst?.let {
+        if (it.isReady) it.engineName() else "加载失败"
+    } ?: "未加载"
+
     /** 只在服务/界面都退出时调用 */
     fun releaseAll() = synchronized(lock) {
         asrInst?.release()
