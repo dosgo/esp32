@@ -13,6 +13,14 @@ vendor/**/target/
 tmp/
 .preview/
 
+# 语音助手的大模型（onnx / voices 动辄几百 MB，GitHub 单文件硬上限 100MB，
+# 一旦进历史就会让 push 直接失败，且必须重写历史才能清掉）。
+# 2026-10-26 已经踩过一次：96afd89 误提交 399MB 模型，push 被 GitHub 拒绝，
+# 最后用 filter-branch 剔除。模型文件放本地/网盘，不要进库。
+esp32s3-voice-assistant/server/models/
+*.onnx
+*.onnx.json
+
 # 备份 / 过程文件
 *.bak
 *.bak2
