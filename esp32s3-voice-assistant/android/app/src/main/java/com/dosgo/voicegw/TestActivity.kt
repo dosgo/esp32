@@ -43,6 +43,7 @@ class TestActivity : AppCompatActivity() {
     private lateinit var tvLog: TextView
     private lateinit var etSay: EditText
     private lateinit var etSpeaker: EditText
+    private lateinit var tvVoiceInfo: TextView
     private lateinit var btnRecord: Button
     private lateinit var btnChain: Button
     private lateinit var tvDl: TextView
@@ -85,7 +86,18 @@ class TestActivity : AppCompatActivity() {
         tvLog = findViewById(R.id.tvLog)
         etSay = findViewById(R.id.etSay)
         etSpeaker = findViewById(R.id.etSpeaker)
+        tvVoiceInfo = findViewById(R.id.tvVoiceInfo)
         etSpeaker.setText(currentSpeaker().toString())
+        updateVoiceInfo()
+        etSpeaker.setOnFocusChangeListener { _, hasFocus ->
+            if (!hasFocus) {
+                currentSpeaker()
+                updateVoiceInfo()
+            }
+        }
+
+        findViewById<Button>(R.id.btnPrevVoice).setOnClickListener { stepVoice(-1) }
+        findViewById<Button>(R.id.btnNextVoice).setOnClickListener { stepVoice(1) }
         btnRecord = findViewById(R.id.btnRecord)
         btnChain = findViewById(R.id.btnChain)
         tvDl = findViewById(R.id.tvDl)
@@ -630,6 +642,35 @@ class TestActivity : AppCompatActivity() {
             val dt = System.currentTimeMillis() - t0
             ui { tvLlm.text = "$reply\n\n耗时 ${dt}ms" }
             log("大模型 ${dt}ms → $reply")
+        }
+    }
+
+    /** 在 151 个女声里前后翻，翻到就顺手合成一遍直接听 */
+    private fun stepVoice(delta: Int) {
+        val list = VoiceCatalog.females(this)
+        if (list.isEmpty()) {
+            Toast.makeText(this, "没有女声列表资源", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val cur = etSpeaker.text.toString().toIntOrNull() ?: 0
+        val next = VoiceCatalog.step(list, cur, delta) ?: return
+        etSpeaker.setText(next.sid.toString())
+        updateVoiceInfo()
+        synthAndPlay(etSay.text.toString())
+    }
+
+    private fun updateVoiceInfo() {
+        val list = VoiceCatalog.females(this)
+        if (list.isEmpty()) {
+            tvVoiceInfo.text = "音色信息：没有女声列表（首次需要联网/内置资源）"
+            return
+        }
+        val sid = etSpeaker.text.toString().toIntOrNull() ?: 0
+        val idx = VoiceCatalog.indexOf(list, sid)
+        tvVoiceInfo.text = if (idx >= 0) {
+            "女声 ${idx + 1}/${list.size} · sid=$sid · 基频 ${"%.0f".format(list[idx].f0)}Hz"
+        } else {
+            "sid=$sid 不在女声列表里（共 ${list.size} 个女声可翻）"
         }
     }
 
