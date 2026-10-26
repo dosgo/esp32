@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 和界面主色一致，启动器图标背景 -->
+    <color name="ic_launcher_bg">#1F6F5C</color>
+</resources>

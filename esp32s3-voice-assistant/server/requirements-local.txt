@@ -1,0 +1,29 @@
+# 本地模型额外依赖 —— 想要完全免费 + 离线就装这个
+#
+# sherpa-onnx : 本地 ASR，跑 SenseVoice int8（和云端同一个模型），纯 CPU 不需要 PyTorch
+# piper-tts   : 本地 TTS，最快（325ms 合成 4.6s 音频），音质中等
+# kokoro-onnx : 本地 TTS，82M 参数，音质比 piper 好一档，但慢 6 倍
+# misaki[zh]  : Kokoro 的中文前端（jieba 分词 + 拼音转 IPA 音素）
+#
+# ---------------------------------------------------------------------------
+# 手机上（Termux）装法不一样，分能力看：
+#
+#   SenseVoice ASR  ✅ 能跑 —— 用 sensevoice_lite.py（纯 Python 实现），
+#                           只需要 onnxruntime + numpy，不要 sherpa-onnx
+#   Kokoro TTS      ✅ 能跑 —— 纯 Python + onnxruntime
+#   Piper TTS       ⚠️ 装不上（phonemize 是 manylinux 预编译包）
+#   sherpa-onnx     ⚠️ 装不上（同样是 manylinux wheel）
+#
+#   手机上一行命令：
+#     pkg install python python-onnxruntime python-numpy
+#     pip install kokoro-onnx "misaki[zh]"
+# ---------------------------------------------------------------------------
+
+# --- 电脑专用 ---
+sherpa-onnx>=1.10          # ASR，最快（手机上装不上，手机用 sensevoice_lite.py）
+piper-tts>=1.2             # TTS，最快（手机上装不上）
+
+# --- 电脑 + 手机都能用 ---
+kokoro-onnx>=0.4
+misaki[zh]>=0.9
+onnxruntime>=1.16          # sensevoice_lite.py 和 kokoro 都依赖它（手机上由 pkg 提供）

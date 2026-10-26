@@ -1,0 +1,199 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="16dp">
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="语音网关"
+        android:textSize="22sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:id="@+id/tvStatus"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:text="未启动"
+        android:textSize="15sp"
+        android:textColor="#0F6E56"
+        android:textIsSelectable="true" />
+
+    <!-- ==================== 模型下载（首次使用点这里） ==================== -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="10dp"
+        android:background="#F1EFE8"
+        android:orientation="vertical"
+        android:padding="10dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/btnDownload"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="2"
+                android:text="下载模型（约 268MB）" />
+
+            <Button
+                android:id="@+id/btnDlCancel"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:layout_weight="1"
+                android:enabled="false"
+                android:text="取消" />
+        </LinearLayout>
+
+        <ProgressBar
+            android:id="@+id/pbDownload"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:max="100"
+            android:progress="0"
+            android:visibility="gone" />
+
+        <TextView
+            android:id="@+id/tvDlProgress"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:fontFamily="monospace"
+            android:text="点上面按钮下载识别和合成模型，不用连电脑"
+            android:textColor="#5F5E5A"
+            android:textSize="11sp" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/btnToggle"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="启动网关" />
+
+        <Button
+            android:id="@+id/btnBattery"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="8dp"
+            android:text="免电池优化" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/btnTest"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="2"
+            android:text="本地测试（不用板子）" />
+
+        <Button
+            android:id="@+id/btnLog"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:layout_weight="1"
+            android:text="运行日志" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/tvModelPath"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="10dp"
+        android:textSize="11sp"
+        android:textColor="#888780"
+        android:textIsSelectable="true" />
+
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:layout_marginTop="12dp"
+        android:background="#D3D1C7" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="10dp"
+        android:text="大模型配置（OpenAI 兼容接口）"
+        android:textSize="13sp"
+        android:textStyle="bold" />
+
+    <EditText
+        android:id="@+id/etKey"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="API Key（sk-…）"
+        android:inputType="textPassword"
+        android:textSize="13sp" />
+
+    <EditText
+        android:id="@+id/etBase"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="接口地址"
+        android:inputType="textUri"
+        android:textSize="13sp" />
+
+    <EditText
+        android:id="@+id/etModel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="模型 ID"
+        android:inputType="text"
+        android:textSize="13sp" />
+
+    <Button
+        android:id="@+id/btnSave"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="保存配置（重启网关生效）" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="日志"
+        android:textSize="13sp"
+        android:textStyle="bold" />
+
+    <ScrollView
+        android:id="@+id/svLog"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:background="#F1EFE8"
+        android:padding="8dp">
+
+        <TextView
+            android:id="@+id/tvLog"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textSize="11sp"
+            android:fontFamily="monospace"
+            android:textColor="#2C2C2A" />
+    </ScrollView>
+
+</LinearLayout>

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 自适应图标：麦克风轮廓，108dp 画布，安全区是中间 72dp -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 话筒头 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,30 m-9,0 a9,9 0 1,0 18,0 a9,9 0 1,0 -18,0" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M45,30 h18 v16 a9,9 0 0,1 -18,0 z" />
+
+    <!-- 支架 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M36,44 h3 v2 a15,15 0 0,0 30,0 v-2 h3 v2 a18,18 0 0,1 -16.5,17.9 V70 h7 v3 H45.5 v-3 h7 v-6.1 A18,18 0 0,1 36,46 z" />
+</vector>
