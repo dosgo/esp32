@@ -155,6 +155,11 @@ impl SdStorage {
         miso: esp_hal::peripherals::GPIO16<'static>,
         cs: esp_hal::peripherals::GPIO47<'static>,
     ) -> Result<Self, MountError> {
+        use log::{info, warn};
+
+        // 注意：这一段跑在 USB 初始化之前，日志还走 USB-Serial-JTAG。
+        // 启动阶段日志必须极简，否则 FIFO 灌满会死等（详见 Cargo.toml 里的说明）。
+        // 所以这里只在**结束时**打一条，中途一句都不打。
         let cfg = SpiConfig::default()
             .with_frequency(Rate::from_hz(FREQ_INIT_HZ))
             .with_mode(Mode::_0);
@@ -164,13 +169,11 @@ impl SdStorage {
             .with_sck(sclk)
             .with_mosi(mosi)
             .with_miso(miso);
-
         let cs = Output::new(cs, Level::High, OutputConfig::default());
         let mut dev = SdSpi::new(spi, cs, cfg);
 
         // 74+ 时钟让卡进 SPI 模式（CS 高电平下先打 80 个），随后 CS 常低
         dev.enter_spi_mode();
-
         let card = SdCard::new_with_options(
             dev,
             Delay::new(),
@@ -188,13 +191,18 @@ impl SdStorage {
         // 第一次访问触发真正的卡初始化（CMD0/CMD8/ACMD41/CMD58），全程仍是 400kHz。
         // 失败就当没插卡 —— 注意 card_type 仍是 None，之后每次读写都会再试一次，
         // 所以插着卡热启动也能自己认回来。
-        if let Ok(bytes) = storage.card.num_bytes() {
+        let probe = storage.card.num_bytes();
+        if let Ok(bytes) = probe {
             let b = (bytes / BLOCK_SIZE as u64) as u32;
             if b > 0 {
                 storage.blocks.set(b);
                 // 初始化完了才提速
                 storage.card.spi(|d| d.set_freq(FREQ_FAST_HZ));
             }
+        }
+        match &probe {
+            Ok(bytes) => info!("[sd] 就绪：{} 字节，{} 块", bytes, storage.blocks.get()),
+            Err(e) => warn!("[sd] 初始化失败：{e:?}"),
         }
 
         Ok(storage)
