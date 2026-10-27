@@ -86,6 +86,24 @@ pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
     let mut preroll: [Option<AudioFrame>; 2] = [None, None];
     let mut preroll_idx = 0usize;
 
+    // ---- VADNet ----
+    // 加载失败就整个回落到能量 VAD，不影响语音链路能用
+    let vad_ok = crate::vad::init();
+    let vad_chunk = crate::vad::chunk_size();
+    // 唤醒判定：VADNet 内部已有 200ms 防抖，外面再要 2 帧（64ms）
+    let hot_needed = if vad_ok { 2 } else { 3 };
+
+    // ---- AEC ----
+    // 吃 ~122KiB 内部内存，失败就直通（播放期间不收音，等于回到改造前）
+    let aec_ok = crate::aec::init();
+
+    // ---- WakeNet 本地唤醒 ----
+    // 必须在 VAD 之后初始化：两者共用同一个 ModelList，由 esp_sr 首次访问时加载。
+    // 失败就回落到「VAD 判到人声即唤醒」，行为和加唤醒词之前一样。
+    let wn_ok = crate::wakenet::init();
+    // 用来检测「刚回到 Idle」这个时刻，好复位唤醒词状态
+    let mut was_idle = true;
+
     loop {
         let transfer = match rx.read(dma) {
             Ok(t) => t,
@@ -108,27 +126,87 @@ pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
 
         let st = state();
 
+        // 刚回到待机：清掉唤醒词的残留状态，否则上一轮对话的尾音还在
+        // 累积缓冲里，可能立刻就误触发一次。
+        if st == State::Idle && !was_idle && wn_ok {
+            crate::wakenet::reset();
+        }
+        was_idle = st == State::Idle;
+
+        // ---- VAD 判定 ----
+        // 只在需要时算：Thinking / Speaking 既不上传也不判静音。
+        // Idle 且有 WakeNet 时也不跑 VAD —— 唤醒交给唤醒词，省一份算力。
+        let speech = match st {
+            State::Idle if !wn_ok && vad_ok && vad_chunk > 0 => {
+                // detect() 会原地处理样本，所以用副本，不能污染待上传的 mono
+                let mut pcm = [0i16; FRAME_SAMPLES];
+                let n = pcm_from_bytes(&mono, &mut pcm);
+                let mut any = false;
+                let mut off = 0usize;
+                while off + vad_chunk <= n {
+                    if crate::vad::detect(&mut pcm[off..off + vad_chunk]) {
+                        any = true;
+                        break;
+                    }
+                    off += vad_chunk;
+                }
+                any
+            }
+            State::Listening if vad_ok && vad_chunk > 0 => {
+                let mut pcm = [0i16; FRAME_SAMPLES];
+                let n = pcm_from_bytes(&mono, &mut pcm);
+                let mut any = false;
+                let mut off = 0usize;
+                while off + vad_chunk <= n {
+                    if crate::vad::detect(&mut pcm[off..off + vad_chunk]) {
+                        any = true;
+                        break;
+                    }
+                    off += vad_chunk;
+                }
+                any
+            }
+            _ => false,
+        };
+
         match st {
             State::Idle => {
-                // 噪声底慢跟随：只在安静帧更新，避免人声把阈值顶上去
-                if energy < noise_floor * 2 {
-                    noise_floor = (noise_floor * 15 + energy) / 16;
-                }
-                let threshold = (noise_floor * 3).max(400);
-
-                if energy > threshold {
-                    hot_frames = hot_frames.saturating_add(1);
+                // ---- 判定唤醒 ----
+                // 三条路径按优先级回落：
+                //   1. WakeNet：喊「小特小特」才唤醒，命中前不上传任何音频
+                //   2. VADNet：有人说话就唤醒（加唤醒词之前的行为）
+                //   3. 能量阈值：连模型都加载不了时的最后兜底
+                let hit = if wn_ok {
+                    // 命中即唤醒，不需要额外防抖 —— WakeNet 内部已经做了
+                    crate::wakenet::detect(&mono)
+                } else if vad_ok {
+                    if speech {
+                        hot_frames = hot_frames.saturating_add(1);
+                    } else {
+                        hot_frames = 0;
+                    }
+                    hot_frames >= hot_needed
                 } else {
-                    hot_frames = 0;
-                }
+                    // 噪声底慢跟随：只在安静帧更新，避免人声把阈值顶上去
+                    if energy < noise_floor * 2 {
+                        noise_floor = (noise_floor * 15 + energy) / 16;
+                    }
+                    let threshold = (noise_floor * 3).max(400);
+                    if energy > threshold {
+                        hot_frames = hot_frames.saturating_add(1);
+                    } else {
+                        hot_frames = 0;
+                    }
+                    hot_frames >= hot_needed
+                };
 
-                // 存 pre-roll
+                // 存 pre-roll：唤醒后要补发，避免用户紧接着说的第一个字被切掉
                 let mut f = AudioFrame::new();
                 let _ = f.extend_from_slice(&mono);
                 preroll[preroll_idx] = Some(f);
                 preroll_idx = (preroll_idx + 1) % 2;
 
-                if hot_frames >= 3 {
+                if hit {
                     // 唤醒：把 pre-roll 按时间顺序补发
                     set_state(State::Listening);
                     quiet_frames = 0;
@@ -138,7 +216,11 @@ pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
                             let _ = MIC_CH.try_send(f);
                         }
                     }
-                    log::info!("[vad] 检测到人声，开始上传");
+                    if wn_ok {
+                        log::info!("[wake] 唤醒词命中，开始上传");
+                    } else {
+                        log::info!("[vad] 检测到人声，开始上传");
+                    }
                 }
             }
 
@@ -153,8 +235,13 @@ pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
                     let _ = MIC_CH.try_send(f2);
                 }
 
-                let threshold = (noise_floor * 3).max(400);
-                if energy < threshold {
+                let quiet = if vad_ok {
+                    !speech
+                } else {
+                    let threshold = (noise_floor * 3).max(400);
+                    energy < threshold
+                };
+                if quiet {
                     quiet_frames += 1;
                 } else {
                     quiet_frames = 0;
@@ -168,13 +255,40 @@ pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
                 }
             }
 
+            State::Speaking => {
+                hot_frames = 0;
+                quiet_frames = 0;
+
+                // 播放期间跑 AEC。参考信号只有这段时间才有内容，而且 AEC 很贵
+                // （单块约 12.5ms / 32ms 周期，接近四成 CPU），不该全程开着。
+                //
+                // 现在只统计 ERLE、不外发。等实机确认消得干净（15dB 以上），
+                // 再把 clean 送进 MIC_CH + 通知网关打断，就是语音打断。
+                if aec_ok {
+                    let mut clean = [0i16; FRAME_SAMPLES];
+                    crate::aec::process(&mono, &mut clean);
+                    if let Some(erle) = crate::aec::take_erle() {
+                        log::info!("[aec] ERLE {erle:.1} dB");
+                    }
+                }
+            }
+
             _ => {
-                // Thinking / Speaking：继续跑 DMA 但不外发
+                // Thinking：继续跑 DMA 但不外发
                 hot_frames = 0;
                 quiet_frames = 0;
             }
         }
     }
+}
+
+/// u8 小端 PCM → i16 样本。返回写入了多少个样本。
+fn pcm_from_bytes(pcm: &[u8], out: &mut [i16]) -> usize {
+    let n = (pcm.len() / 2).min(out.len());
+    for i in 0..n {
+        out[i] = i16::from_le_bytes([pcm[2 * i], pcm[2 * i + 1]]);
+    }
+    n
 }
 
 /// 播放任务：从 `SPK_CH` 取单声道 PCM，展开成立体声喂 I2S
@@ -221,6 +335,18 @@ pub async fn speaker_task(mut tx: I2sTx<'static, Async>) {
         // 剩余部分补静音，避免把上一帧的尾巴播出来
         for b in &mut buf[samples * 4..] {
             *b = 0;
+        }
+
+        // ---- AEC 参考信号 ----
+        // 必须在写进 I2S **之前**：参考要代表「这一刻送进 DMA 的东西」。
+        // 没有音频时也要推满一帧静音 —— 写指针一停，参考和麦克风的时间轴
+        // 就错位了，延迟再也对不上。
+        if crate::aec::ready() {
+            let mut mono = [0i16; FRAME_SAMPLES];
+            if let Some(f) = &frame {
+                let _ = pcm_from_bytes(f, &mut mono);
+            }
+            crate::aec::push_reference(&mono);
         }
 
         dma.as_mut_slice().copy_from_slice(&buf[..]);

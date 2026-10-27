@@ -15,7 +15,10 @@
 //! 不占 flash，而且远看就懂。
 
 use embedded_graphics::{
-    mono_font::{ascii::FONT_6X10, MonoTextStyle},
+    mono_font::{
+        ascii::{FONT_10X20, FONT_6X10},
+        MonoTextStyle,
+    },
     pixelcolor::Rgb565,
     prelude::*,
     primitives::{
@@ -23,7 +26,6 @@ use embedded_graphics::{
     },
     text::{Baseline, Text},
 };
-use embassy_futures::select::{select, Either};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::{
@@ -113,8 +115,14 @@ pub async fn display_task(
 
     let mut display = match Builder::new(ST7789, di)
         .display_size(LCD_WIDTH, LCD_HEIGHT)
-        // 240x240 的 ST7789 面板内部显存是 240x320，要偏置 80 行
-        .display_offset(0, 80)
+        // offset 必须是 0，不能用常见的 (0, 80)。
+        //
+        // ST7789 显存 240x320，而这块 240x240 面板显示的是 GRAM 的 **0~239 行**。
+        // 之前按 (0, 80) 写，`clear()` 只清了 GRAM 80~319，面板顶部 80 行从未
+        // 被写过，上电就是一片雪花噪点（照片里那条）。改成 0 后全屏都被覆盖。
+        .display_offset(0, 0)
+        // Inverted 是**全局**的，必须保持 —— 关掉后兔子会变成黑白。
+        // 这块 IPS 面板就是需要反色，别为了调某一页的底色去动它。
         .invert_colors(ColorInversion::Inverted)
         .color_order(ColorOrder::Rgb)
         .reset_pin(rst_pin)
@@ -133,20 +141,45 @@ pub async fn display_task(
     boot_screen(&mut display);
     log::info!("[lcd] 开机画面已显示");
 
-    // 等 Wi-Fi 拿到 IP，最多 12 秒（进度条期间一直挂着兔子脸）
-    let ip = match select(IP_READY.wait(), Timer::after(Duration::from_secs(12))).await {
-        Either::First(ip) => Some(ip),
-        Either::Second(_) => {
-            log::warn!("[lcd] 等 IP 超时，先切状态页");
-            None
+    // 等 Wi-Fi 拿到 IP。
+    //
+    // 【为什么不用 select(IP_READY.wait(), Timer::after(..))】
+    // 原来用 select 时，屏幕永远停在开机画面不切状态页。改成分两步：
+    // 先非阻塞取（配网模式下 main 早在 spawn 前就 signal 了，这里能直接拿到），
+    // 再退化成定时等待。拆开写既好排查，也不依赖 select 对这两个 future 的唤醒。
+    let mut ip = IP_READY.try_take();
+    if ip.is_none() {
+        log::info!("[lcd] 尚未收到 IP，最多等 3 秒");
+        Timer::after(Duration::from_secs(3)).await;
+        ip = IP_READY.try_take();
+    }
+    log::info!(
+        "[lcd] 结束等待 IP：{}",
+        if ip.is_some() {
+            "已拿到"
+        } else {
+            "超时，显示 no wifi"
         }
-    };
+    );
 
     // 开机画面至少停 1.5 秒，否则网快的时候会一闪而过
     let min_show = Duration::from_millis(1500);
     let shown = boot_at.elapsed();
     if shown < min_show {
         Timer::after(min_show - shown).await;
+    }
+
+    // ---------------- 配网模式：引导页 ----------------
+    // 进到这里说明设备没连上家里 WiFi，正在等用户配网。
+    // 这时候绝不能画「VOICE ASSISTANT + 表情」—— 那等于告诉用户"我好了"，
+    // 但实际它什么都没法干。必须明确告诉用户连哪个热点、密码多少、去哪儿填。
+    if SETUP_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+        setup_screen(&mut display);
+        log::info!("[lcd] 配网引导页已显示（热点 + 密码 + 配置地址）");
+        // 静态提示，不需要动画。睡长一点省电，也不折腾 SPI。
+        loop {
+            Timer::after(Duration::from_secs(1800)).await;
+        }
     }
 
     // ---------------- 状态页 ----------------
@@ -169,8 +202,7 @@ pub async fn display_task(
     let mut last_temp = crate::soc_temp::last();
     draw_temp(&mut display, last_temp);
 
-    let mut last: Option<State> = None;
-    // 说话时的声波动画相位
+    // 动画相位：驱动眨眼、省略号、说话口型
     let mut phase = 0u8;
 
     loop {
@@ -182,15 +214,16 @@ pub async fn display_task(
         }
 
         let st = audio::state();
-        if last != Some(st) || st == State::Speaking || st == State::Thinking {
-            draw_face(&mut display, st, phase);
-            last = Some(st);
-        }
+
+        // 状态没变也要重绘 —— 眨眼动画需要持续刷新。
+        // 代价：240x160 区域约 38KB，SPI 40MHz 传 7ms，300ms 一帧占 2% 左右。
+        draw_face(&mut display, st, phase);
+        phase = phase.wrapping_add(1);
+
         if st == State::Speaking || st == State::Thinking {
-            phase = phase.wrapping_add(1);
-            embassy_time::Timer::after(embassy_time::Duration::from_millis(120)).await;
+            Timer::after(Duration::from_millis(120)).await;
         } else {
-            embassy_time::Timer::after(embassy_time::Duration::from_millis(300)).await;
+            Timer::after(Duration::from_millis(300)).await;
         }
     }
 }
@@ -339,6 +372,95 @@ where
     .ok();
 }
 
+// ============================================================================
+// 配网引导画面
+// ============================================================================
+
+/// 当前是不是配网模式。`main` 决定进配网后置 true，屏幕据此改画引导页。
+///
+/// 为什么用原子量而不是消息：这个标志在开机时只写一次，读一次，
+/// 不值得为它建一个 channel。
+pub static SETUP_MODE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// 按字符宽度估算居中位置。`FONT_6X10` 每字符 6px，`FONT_10X20` 每字符 10px。
+///
+/// embedded-graphics 没有直接取文本宽度的 API（`Text::bounding_box` 要构造
+/// 完整对象），而这些字都是等宽 ASCII，直接算更快。
+fn centered_x(text: &str, ch_w: i32) -> i32 {
+    let w = text.chars().count() as i32 * ch_w;
+    (LCD_WIDTH as i32 - w) / 2
+}
+
+/// 配网引导画面：告诉用户「连哪个热点、密码多少、去哪配置」。
+///
+/// 240x240 上只能用英文 —— 内置点阵字库只有 ASCII，中文要自己烧字库（几 MB），
+/// 对一块配网提示屏不值得。用户此时看的是手机，屏幕只是辅助。
+pub fn setup_screen<D>(d: &mut D)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    d.clear(BG).ok();
+
+    // ---- 标题 ----
+    let title = "SETUP MODE";
+    Text::with_baseline(
+        title,
+        Point::new(centered_x(title, 10), 34),
+        MonoTextStyle::new(&FONT_10X20, FG),
+        Baseline::Top,
+    )
+    .draw(d)
+    .ok();
+
+    let sub = "Connect phone to this Wi-Fi";
+    Text::with_baseline(
+        sub,
+        Point::new(centered_x(sub, 6), 62),
+        MonoTextStyle::new(&FONT_6X10, DIM),
+        Baseline::Top,
+    )
+    .draw(d)
+    .ok();
+
+    // ---- 分隔线 ----
+    Line::new(Point::new(30, 84), Point::new(LCD_WIDTH as i32 - 30, 84))
+        .into_styled(PrimitiveStyle::with_stroke(DIM, 1))
+        .draw(d)
+        .ok();
+
+    // ---- 三行「标签 + 值」----
+    //
+    // 之前用的是 Arc 画 WiFi 图标，结果 embedded-graphics 把 208°~332°
+    // 渲染成了三个完整同心圆（看着像靶心），尺寸还压住了标题。
+    // 240x240 上图标性价比太低，直接去掉，把空间留给文字。
+    let mut row = |label: &str, value: &str, y: i32, col: Rgb565| {
+        let lw = label.chars().count() as i32 * 6;
+        let vw = value.chars().count() as i32 * 10;
+        let x0 = (LCD_WIDTH as i32 - (lw + 8 + vw)) / 2;
+        Text::with_baseline(
+            label,
+            Point::new(x0, y + 7), // 6x10 标签相对 10x20 的值垂直居中
+            MonoTextStyle::new(&FONT_6X10, DIM),
+            Baseline::Top,
+        )
+        .draw(d)
+        .ok();
+        Text::with_baseline(
+            value,
+            Point::new(x0 + lw + 8, y),
+            MonoTextStyle::new(&FONT_10X20, col),
+            Baseline::Top,
+        )
+        .draw(d)
+        .ok();
+    };
+
+    row("SSID", "ESP32-VOICE", 104, FG);
+    row("Pass", "voice1234", 144, FG);
+    row("Web", "192.168.4.1", 184, ACCENT);
+}
+
 fn draw_face<D>(d: &mut D, st: State, phase: u8)
 where
     D: DrawTarget<Color = Rgb565>,
@@ -396,8 +518,20 @@ where
             }
         }
         _ => {
-            // 睁眼
+            // 睁眼 —— 但每隔约 6 秒眨一次（20 帧 × 300ms）
+            let blink = phase % 20 == 0;
             for dx in [-eye_dx, eye_dx] {
+                if blink {
+                    // 眨下去：一条横线
+                    Line::new(
+                        Point::new(cx + dx - 13, eye_y),
+                        Point::new(cx + dx + 13, eye_y),
+                    )
+                    .into_styled(PrimitiveStyle::with_stroke(FG, 5))
+                    .draw(d)
+                    .ok();
+                    continue;
+                }
                 Circle::new(Point::new(cx + dx - 13, eye_y - 13), 26)
                     .into_styled(PrimitiveStyleBuilder::new().stroke_width(4).stroke_color(FG).build())
                     .draw(d)
