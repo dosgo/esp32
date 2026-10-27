@@ -25,9 +25,18 @@ use crate::board::{FRAME_BYTES, FRAME_SAMPLES, I2S_FRAME_BYTES};
 pub type AudioFrame = heapless::Vec<u8, FRAME_BYTES>;
 
 /// 录音帧：audio_task → ws_task
-pub static MIC_CH: Channel<CriticalSectionRawMutex, AudioFrame, 4> = Channel::new();
+///
+/// 【深度 4 → 16】原来 4 帧（128ms）太浅，ws_task 只要有一帧 `await` 卡在
+/// TCP 写上，队列立刻满，mic_task 就开始「丢最旧帧」—— 实测上行音频变成
+/// 「一帧有声、两三帧静音」的碎块，ASR 只能识别出一个字。
+/// 16 帧（512ms）给网络抖动留足缓冲。固件裁掉 VADNet 后省出约 670KB，
+/// 这 16KB 静态内存完全负担得起。
+pub static MIC_CH: Channel<CriticalSectionRawMutex, AudioFrame, 16> = Channel::new();
 /// 播放帧：ws_task → audio_task
-pub static SPK_CH: Channel<CriticalSectionRawMutex, AudioFrame, 8> = Channel::new();
+///
+/// 【深度 8 → 12】配合网关侧的水位控制（目标 4 帧），留出更多余量，
+/// 避免 WiFi 抖动时丢帧。
+pub static SPK_CH: Channel<CriticalSectionRawMutex, AudioFrame, 12> = Channel::new();
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -99,10 +108,21 @@ pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
 
     // ---- VADNet ----
     // 加载失败就整个回落到能量 VAD，不影响语音链路能用
-    let vad_ok = if SR_ENABLE { crate::vad::init() } else { false };
+    // 【2026-10-28 临时禁用 VADNet】
+    //
+    // 实测 VADNet 在这块板上会卡在「一直判有人声」：设备一进 Listening 就再也
+    // 出不来，持续上传静音，而网关收到的全是静音、永远凑不够语音时长，于是
+    // 两边互相卡死 —— 用户体感就是「它完全不理我」。
+    //
+    // 串口铁证：rms 掉到 35~57（纯静音）时，hot 仍然是 2/2、st 一直=1。
+    //
+    // 现在只用能量阈值（200，落在「安静上限 105」和「说话下限 350」之间），
+    // 触发和回退用同一个量，不会自相矛盾。想再试 VADNet 就把下面改成 true。
+    const VADNET_ENABLE: bool = false;
+    let vad_ok = VADNET_ENABLE && SR_ENABLE && crate::vad::init();
     let vad_chunk = crate::vad::chunk_size();
-    // 唤醒判定：VADNet 内部已有 200ms 防抖，外面再要 2 帧（64ms）
-    let hot_needed = if vad_ok { 2 } else { 3 };
+    // 唤醒判定要连续 2 帧（64ms）超阈值，滤掉单帧的爆音/碰触
+    let hot_needed = 2;
 
     // ---- AEC ----
     // 吃 ~122KiB 内部内存，失败就直通（播放期间不收音，等于回到改造前）
@@ -138,19 +158,22 @@ pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
         // 里面是 interleaved L/R 的 i16。只取左声道。
         let mono = extract_left(dma.as_slice());
         let energy = rms_energy(&mono);
+        let st = state();
 
         // 麦克风电平诊断：每 32 帧（约 1 秒）打一次。
-        // 静音底噪通常是个位数，正常说话能到几百甚至上千。
-        // 如果一直贴着 0~2，说明 ES7210 没出数据或 I2S RX 接错。
+        //
+        // 除了 rms，还把 VAD 的内部状态一起打出来 —— 排查「不说话就没反应」
+        // 时这几个数能直接定位：
+        //   底噪   噪声底噪的慢跟随值，能量阈值 = max(底噪×2, 200)
+        //   hot    连续超阈值帧计数，到 hot_needed 就唤醒
+        //   st     当前状态（0=Idle 才会判唤醒）
         mic_tick = mic_tick.wrapping_add(1);
         if mic_tick % 32 == 0 {
             log::info!(
-                "[mic] rms={energy}  已判 {} 块唤醒",
-                crate::wakenet::chunks_total()
+                "[mic] rms={energy} 底噪={noise_floor} hot={hot_frames}/{hot_needed} st={}",
+                st as u8
             );
         }
-
-        let st = state();
 
         // 刚回到待机：清掉唤醒词的残留状态，否则上一轮对话的尾音还在
         // 累积缓冲里，可能立刻就误触发一次。
@@ -205,20 +228,35 @@ pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
                 let hit = if wn_ok {
                     // 命中即唤醒，不需要额外防抖 —— WakeNet 内部已经做了
                     crate::wakenet::detect(&mono)
-                } else if vad_ok {
-                    if speech {
-                        hot_frames = hot_frames.saturating_add(1);
-                    } else {
-                        hot_frames = 0;
-                    }
-                    hot_frames >= hot_needed
                 } else {
-                    // 噪声底慢跟随：只在安静帧更新，避免人声把阈值顶上去
-                    if energy < noise_floor * 2 {
-                        noise_floor = (noise_floor * 15 + energy) / 16;
-                    }
-                    let threshold = (noise_floor * 3).max(400);
-                    if energy > threshold {
+                    // 【2026-10-28 改】VADNet 与能量阈值改成**并联**，任一成立即可。
+                    //
+                    // 原来是 `if vad_ok { 用模型 } else { 用能量 }` 的二选一。
+                    // 实机暴露出问题：VADNet 装是装上了，但真机上经常一直判否
+                    // （麦克风增益/环境不匹配时它就是不认人声），于是用户正常说话
+                    // 设备毫无反应 —— 体感就是「它又不理我」，而且没有任何报错。
+                    //
+                    // 漏判是致命的（用户以为设备坏了），误判只是多送一次 ASR，
+                    // 所以这里宁可激进：模型说有人声 或 能量超过阈值，都算有人说话。
+                    let by_energy = {
+                        // 噪声底慢跟随：只在安静帧更新，避免人声把阈值顶上去
+                        if energy < noise_floor * 2 {
+                            noise_floor = (noise_floor * 15 + energy) / 16;
+                        }
+                        // 【阈值取 200，不是 400】
+                        //
+                        // 实测这台机器的麦克风电平：安静环境 rms 37~105，
+                        // 正常说话 350~1450，但说话时起伏很大，一半以上的帧
+                        // 落在 350~450 之间。原来的 `.max(400)` 会把这些人声帧
+                        // 判成静音，连续 2 帧的门槛就永远凑不齐 —— 表现就是
+                        // 「我明明说话了，它一动不动」。
+                        //
+                        // 200 位于「安静上限 105」和「说话下限 350」之间，
+                        // 留了足够的余量，也不会被环境底噪误触发。
+                        energy > (noise_floor * 2).max(200)
+                    };
+                    let any_speech = speech || by_energy;
+                    if any_speech {
                         hot_frames = hot_frames.saturating_add(1);
                     } else {
                         hot_frames = 0;
@@ -245,7 +283,12 @@ pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
                     if wn_ok {
                         log::info!("[wake] 唤醒词命中，开始上传");
                     } else {
-                        log::info!("[vad] 检测到人声，开始上传");
+                        // 打印触发来源，方便判断是模型在起作用还是兜底在救场：
+                        //   模型=true  → VADNet 认出来了
+                        //   模型=false → 是能量阈值兜住的，说明 VADNet 没起作用
+                        log::info!(
+                            "[vad] 检测到人声（rms={energy} 模型={speech} 底噪={noise_floor}），开始上传"
+                        );
                     }
                 }
             }
@@ -261,11 +304,15 @@ pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
                     let _ = MIC_CH.try_send(f2);
                 }
 
+                // 静音判定和唤醒判定必须用**同一个量**（能量）。
+                //
+                // 原来这里用 `!speech`（VADNet 的结果）。一旦模型卡在「一直判
+                // 有人声」，这个条件就永远不成立，设备永远停在 Listening ——
+                // 和唤醒端用能量、回退端用模型，两边标准不一致就会死锁。
                 let quiet = if vad_ok {
                     !speech
                 } else {
-                    let threshold = (noise_floor * 3).max(400);
-                    energy < threshold
+                    energy < (noise_floor * 2).max(200)
                 };
                 if quiet {
                     quiet_frames += 1;
