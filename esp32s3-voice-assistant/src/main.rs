@@ -32,16 +32,21 @@
 
 extern crate alloc;
 
+mod aec;
 mod audio;
 mod board;
 mod config;
 mod display;
 mod es8311;
+mod esp_sr;
 mod json;
+mod keys;
 mod sdcard;
 mod sensors;
 mod soc_temp;
 mod store;
+mod vad;
+mod wakenet;
 mod web;
 mod ws;
 
@@ -56,6 +61,7 @@ use esp_hal::{
     gpio::AnyPin,
     i2c::master::{Config as I2cConfig, I2c},
     i2s::master::{Channels, DataFormat, I2s, TdmConfig},
+    ram,
     rng::Rng,
     time::Rate,
     timer::timg::TimerGroup,
@@ -94,15 +100,47 @@ macro_rules! mk_static {
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
+    // 最早的一行。放在 esp_hal::init 之前 —— esp-println 直接写 USB-Serial-JTAG
+    // 寄存器，不依赖 esp-hal。有这一行就说明「固件跑起来了 + USB 日志通道通了」，
+    // 后面任何一步卡住都能靠它区分"没启动"和"启动了但挂在某处"。
+    println!("\n[boot] firmware start");
+
     esp_println::logger::init_logger_from_env();
 
-    // Wi-Fi 协议栈会从内部堆 malloc，128KB 是实测够用的值
-    esp_alloc::heap_allocator!(size: 128 * 1024);
+    // Wi-Fi 协议栈会从内部堆 malloc。
+    //
+    // 【关键：堆不能全放 .bss】
+    // `heap_allocator!(size: N)` 是个 `static mut HEAP: [u8; N]`，N 字节全进 .bss。
+    // 而 esp-hal 的 stack.x 里栈大小 = RWDATA 区域剩下的空间：
+    //     _stack_end   = BSS 结束处
+    //     _stack_start = ORIGIN(RWDATA) + LENGTH(RWDATA)
+    // 最初 128KB 全放 .bss，把栈从 160KB 挤到只剩 32KB，启动直接 panic：
+    //     stack pointer out of range: sp=0x3fcd2ea0, bottom=0x3fcd37a8
+    //
+    // 现在分两块：
+    //   1. bootloader 归还的 IRAM（0x403B9000~0x403E0000，约 72KB 可用）——
+    //      这段本来闲置，走 `#[ram(reclaimed)]`，完全不占 BSS
+    //   2. 剩下 48KB 才放 .bss
+    // 总 112KB，栈保住 110KB+。
+    esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
+    esp_alloc::heap_allocator!(size: 48 * 1024);
+    println!("[boot] heap ok");
 
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CPU_CLOCK));
+    println!("[boot] hal ok");
 
     // PSRAM 挂进全局堆（esp-radio 内部走 malloc_internal，拿不到 PSRAM）
     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
+    println!(
+        "[boot] psram ok, {} B",
+        esp_alloc::HEAP.free_caps(esp_alloc::MemoryCapability::External.into())
+    );
+
+    // rtos 必须跑在任何 await 之前：Timer、任务调度、软件中断都靠它。
+    // 原来这段在第 130 行（在 load_into_memory().await 之后），属于顺序错误。
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
+    println!("[boot] rtos ok");
 
     // ---------------- 0. 从 flash 读配置 ----------------
     // WiFi 账号、网关地址、各家 API key 全在这里。没配过就是空的，
@@ -121,9 +159,6 @@ async fn main(spawner: Spawner) -> ! {
             "<未配置，进配网模式>"
         },
     );
-
-    let timg0 = TimerGroup::new(peripherals.TIMG0);
-    esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
 
     println!("\n=== ESP32-S3 语音助手 ===");
     println!(
@@ -147,7 +182,11 @@ async fn main(spawner: Spawner) -> ! {
     // 后面用 RefCellDevice 派生出多个设备句柄。
     let i2c = I2c::new(
         peripherals.I2C0,
-        I2cConfig::default().with_frequency(Rate::from_khz(100)),
+        // 实测 100kHz 下这条总线不稳定：多次上电分别扫到 3 / 4 / 6 个设备，
+        // ES8311 的 CHIPID 时而 0x83 时而 0x00。总线上挂着 codec + IMU + 触摸，
+        // 0x5E/0x66/0x6F 那几个幽灵地址说明有反射/上拉不足导致的误应答。
+        // 降到 50kHz 先求稳 —— 配置和轮询都是低频操作，降速没有副作用。
+        I2cConfig::default().with_frequency(Rate::from_khz(50)),
     )
     .expect("I2C 初始化失败")
     .with_sda(unsafe { AnyPin::steal(board::PIN_I2C_SDA) })
@@ -228,6 +267,9 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(audio::speaker_task(i2s_tx).expect("speaker_task"));
     spawner.spawn(audio::mic_task(i2s_rx).expect("mic_task"));
 
+    // 三个板载按键：PWR 打断 / PLUS/MINUS 音量
+    spawner.spawn(keys::keys_task().expect("keys_task"));
+
     // ---------------- 3. 屏幕（Wi-Fi 之前就点上）----------------
     // 放在这里而不是 Wi-Fi 之后，是为了开机画面能尽早出现：
     // 连 Wi-Fi 通常要 2~5 秒，屏幕要是等连上再初始化，这段时间就是黑屏。
@@ -253,6 +295,21 @@ async fn main(spawner: Spawner) -> ! {
     //      ESP_ERR_WIFI_PASSWORD，init 直接失败。所以没配网时要用**占位 STA**
     //      （假 SSID + Open），而不是留空。
     //
+    // 把实际要用的 AP 凭据打出来：手机提示"密码错误"时，先确认发出去的
+    // 到底是不是预期值（flash 里残留脏数据会表现为密码对不上）。
+    println!(
+        "[wifi] AP 凭据：ssid='{}'({}B) pass='{}'({}B) auth={:?}",
+        boot_cfg.ap_ssid_or_default(),
+        boot_cfg.ap_ssid_or_default().len(),
+        boot_cfg.ap_pass_or_default(),
+        boot_cfg.ap_pass_or_default().len(),
+        if boot_cfg.ap_pass_or_default().is_empty() {
+            "Open"
+        } else {
+            "WPA/WPA2"
+        },
+    );
+    //
     // 坑2：模式从 AP 变 APSTA 会让射频 stop/start，热点瞬断，正在提交配网表单的
     //      手机就被掐了。所以**开机就是 APSTA**，模式全程不变。
     let ap_cfg = ap_config(&boot_cfg);
@@ -275,6 +332,17 @@ async fn main(spawner: Spawner) -> ! {
             }
         }
     };
+
+    // 【发射功率必须手动提高】
+    // esp-radio 的 WifiController::new() 内部写死了 esp_wifi_set_max_tx_power(20)，
+    // 单位是 0.25dBm，也就是只有 5dBm —— 正常值是 78~84（19.5~21dBm）。
+    // 5dBm 下手机能扫到信标，但握手/DHCP 交互会失败，表现就是「搜到但连不上」。
+    // 78 = 19.5dBm，是 ESP32-S3 的常用满功率档。
+    if let Err(e) = controller.set_max_tx_power(78) {
+        println!("[wifi] 设置发射功率失败: {e:?}");
+    } else {
+        println!("[wifi] 发射功率已提到 19.5dBm");
+    }
 
     let rng = Rng::new();
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
@@ -369,6 +437,9 @@ async fn main(spawner: Spawner) -> ! {
             use core::fmt::Write;
             let _ = write!(ap_ip_text, "{}", store::AP_IP);
         }
+        // 先置标志再发信号：屏幕收到信号后会立刻读这个标志决定画哪页，
+        // 顺序反了会先闪一下状态页再跳引导页。
+        display::SETUP_MODE.store(true, core::sync::atomic::Ordering::Relaxed);
         display::IP_READY.signal(ap_ip_text);
         loop {
             Timer::after(Duration::from_secs(3600)).await;
@@ -418,6 +489,10 @@ async fn sensors_task(bus: RefCell<I2c<'static, esp_hal::Blocking>>) {
 
     let mut imu = Qmi8658::new(RefCellDevice::new(&bus), board::QMI8658_ADDR);
     let mut touch = Touch::probe(RefCellDevice::new(&bus));
+    // 音量也要经常量写进 codec，所以这里再拿一个 codec 句柄。
+    // 和 main 里初始化时用的是同一条 I2C，靠 RefCell 顺序访问，不会冲突。
+    let mut codec = Es8311::new(RefCellDevice::new(&bus), board::ES8311_ADDR);
+    let mut last_vol = keys::VOLUME.load(core::sync::atomic::Ordering::Relaxed);
 
     // ---- IMU ----
     let mut imu_ok = false;
@@ -462,6 +537,15 @@ async fn sensors_task(bus: RefCell<I2c<'static, esp_hal::Blocking>>) {
             }
         }
 
+        // 音量变了就写进 codec（按键任务只改原子变量，不直接碰 I2C）
+        let vol = keys::VOLUME.load(core::sync::atomic::Ordering::Relaxed);
+        if vol != last_vol {
+            if codec.set_volume(vol).is_ok() {
+                last_vol = vol;
+                println!("[vol] 已设为 {vol}");
+            }
+        }
+
         if imu_ok {
             if let Ok(m) = imu.read() {
                 if tick % 8 == 0 {
@@ -486,7 +570,7 @@ async fn sensors_task(bus: RefCell<I2c<'static, esp_hal::Blocking>>) {
 /// 网页任务的 socket 缓冲和页面缓冲都走这里。直接放 BSS 的话，
 /// 内部 RAM 会被撑爆 —— 链接器报 `cannot move location counter backwards`，
 /// 意思是栈的位置被 BSS 顶穿了。S3R8 有 8MB PSRAM，不用白不用。
-fn alloc_psram_buf(len: usize) -> &'static mut [u8] {
+pub(crate) fn alloc_psram_buf(len: usize) -> &'static mut [u8] {
     unsafe {
         let layout = core::alloc::Layout::from_size_align_unchecked(len, 4);
         let mut p = esp_alloc::HEAP.alloc_caps(esp_alloc::MemoryCapability::External.into(), layout);
@@ -520,7 +604,9 @@ fn ap_config(c: &store::Config) -> AccessPointConfig {
         base
     } else {
         match Password::try_from(pass) {
-            Ok(pw) => base.with_authentication(AuthenticationMethodConfig::Wpa2Personal(pw)),
+            // 用 WPA/WPA2 兼容模式，不要只给 Wpa2Personal：
+            // 部分手机/系统对「纯 WPA2」的 AP 兼容差，会直接提示"密码错误"。
+            Ok(pw) => base.with_authentication(AuthenticationMethodConfig::WpaWpa2Personal(pw)),
             // 长度不在 8~63：降级成开放网络，总比起不来强
             Err(_) => base,
         }
@@ -560,8 +646,9 @@ async fn dhcp_task(stack: embassy_net::Stack<'static>) {
         gateways: &GATEWAYS,
         subnet: Some(DhcpIp::new(255, 255, 255, 0)),
         dns: &DNS,
-        // 让安卓弹"登录到此网络"，点一下就能打开配置页
-        use_captive_portal: true,
+        // 关掉 captive portal：部分手机会因此反复重连/直接放弃。
+        // 配网页本来就要用户手动打开 192.168.4.1，不需要自动弹窗。
+        use_captive_portal: false,
     };
     let mut leaser = SimpleDhcpLeaser {
         start: DhcpIp::new(192, 168, 4, 2),
@@ -575,7 +662,8 @@ async fn dhcp_task(stack: embassy_net::Stack<'static>) {
     }
 }
 
-#[embassy_executor::task]
+// pool_size = 2：AP 和 STA 各有一个 embassy-net runner，各要跑一份
+#[embassy_executor::task(pool_size = 2)]
 async fn net_task(mut runner: Runner<'static, Interface>) {
     runner.run().await
 }
@@ -625,7 +713,7 @@ async fn run_session(stack: embassy_net::Stack<'static>) -> Result<(), &'static 
             hello,
             concat!(
                 r#"{{"type":"hello","version":2,"format":"pcm","sample_rate":16000,"#,
-                r#""channels":1,"bits":16,"frame_ms":60,"config":{{"#,
+                r#""channels":1,"bits":16,"frame_ms":{frame_ms},"config":{{"#,
                 r#""llm":{{"backend":"{llm_backend}","key":"{llm_key}","model":"{llm_model}","base":"{llm_base}"}},"#,
                 r#""asr":{{"chain":"{asr_chain}","key":"{asr_key}","model":"{asr_model}"}},"#,
                 r#""tts":{{"chain":"{tts_chain}","voice":"{tts_voice}"}}#,
@@ -640,6 +728,7 @@ async fn run_session(stack: embassy_net::Stack<'static>) -> Result<(), &'static 
             asr_model = cfg.asr_model_or_default(),
             tts_chain = cfg.tts_chain_or_default(),
             tts_voice = cfg.tts_voice_or_default(),
+            frame_ms = board::FRAME_MS,
         );
     }
     c.send_text(hello.as_str())
@@ -650,6 +739,18 @@ async fn run_session(stack: embassy_net::Stack<'static>) -> Result<(), &'static 
     let mut text_buf = [0u8; 1024];
 
     loop {
+        // ---- 0. PWR 键请求打断 ----
+        // 按键任务已经把本地播放队列清空、状态打回 Idle 了，
+        // 但网关那边还在往下推 TTS 数据，不告诉它就会立刻把队列重新灌满。
+        if keys::take_abort() {
+            c.send_text(r#"{"type":"abort"}"#)
+                .await
+                .map_err(|_| "abort 发送失败")?;
+            // 网关收到 abort 后可能已经又发了几帧，再清一次
+            while SPK_CH.try_receive().is_ok() {}
+            log::info!("[key] 已通知网关打断");
+        }
+
         // ---- 1. 把录音队列发出去 ----
         // 只有 Listening 状态才上传。语音帧本身带时间顺序，
         // 网关靠连续帧的到达判断"说完了没有"。

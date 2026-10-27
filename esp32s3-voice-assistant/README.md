@@ -23,14 +23,20 @@ esp32s3-voice-assistant/
 │   ├── board.rs      ★ 所有引脚定义都在这里，换板子只改这个文件
 │   ├── config.rs     ★ Wi-Fi 账号密码、网关 IP
 │   ├── es8311.rs     ES8311 codec 驱动（I2C 寄存器序列）
-│   ├── audio.rs      I2S 全双工 + 能量 VAD + 播放队列
+│   ├── audio.rs      I2S 全双工 + VAD 门控 + 播放队列
+│   ├── aec.rs        AEC 回声消除（esp-sr 官方算法，裸机移植）
 │   ├── ws.rs         手写 WebSocket 客户端（握手 + 帧编解码）
 │   ├── json.rs       极简 JSON 取值器（替代 serde，省几十 KB）
 │   ├── store.rs      配置持久化（flash 0x9000，TLV 格式）
 │   ├── web.rs        网页配置界面（AP 192.168.4.1 + 局域网 IP）
 │   ├── sensors.rs    I2C 扫描 + QMI8658 IMU + 电容触摸
+│   ├── esp_sr.rs     esp-sr 模型注册表（VADNet / WakeNet 共用一个 ModelList）
+│   ├── vad.rs        esp-sr VADNet（神经网络 VAD，替代能量阈值）
+│   ├── wakenet.rs    esp-sr WakeNet（本地唤醒词「小特小特」）
 │   ├── sdcard.rs     TF 卡（SD 卡的 SPI 兼容模式）
 │   └── display.rs    ST7789 240x240 状态表情 + 兔子开机画面
+├── scripts/
+│   └── patch_esp_sr_literals.sh   esp-sr 预编译库补丁（见「AEC」一节）
 └── server/
     ├── gateway.py         网关主程序（ASR/TTS 都是可插拔 + 自动降级）
     ├── .env.example       配置模板
@@ -87,6 +93,136 @@ flash 的 `0x9000`（默认分区表里的 nvs 区，裸机固件不用 NVS）�
 不再是早期那套猜测值。完整引脚表、和旧版的差异、strapping 脚注意事项
 都写在文件开头。烧进去先看串口 `[i2c] 扫描` 那几行：能扫到 `0x18`(ES8311)
 就说明 I2C 对了，扫到的其余地址就是 IMU 和触摸芯片。
+
+## 一·五、VADNet（神经网络 VAD）
+
+`mic_task` 原来的判据是每帧 RMS 能量，超过自适应噪声底就算"有人在说话"。
+问题是**它分不清人声和噪音**——关门、咳嗽、敲桌子、电视，只要够响全算语音，
+等于白白上传 + 白烧一次 ASR 调用。
+
+现在换成 esp-sr 的 **VADNet**（乐鑫训练的小型二分类网络）。
+
+### 模型从哪来
+
+用 [`ember_esp_sr`](https://crates.io/crates/ember_esp_sr)（bare-metal 版 esp-sr，
+不需要 ESP-IDF / FreeRTOS / esp-idf-sys）。它把官方预编译 `.a` 和自己的
+FreeRTOS 桩一起 vendored 进来了。
+
+但它的 `ModelList::load_default()` 会把**全部**模型打包成 3.4MB
+（中文命令词 `mn5q8_cn` 独占 2.2MB），固件直接飙到 3.95MB，
+刚好超出 4MB 默认 app 分区 10KB。
+
+所以只打用得上的两个模型：
+
+```bash
+cd assets && python pack_models.py
+# 生成 srmodels.bin，565KB
+#   vadnet1_medium          281KB  VADNet 神经网络 VAD
+#   wn9_xiaotexiaote_tts2   284KB  WakeNet 唤醒词「小特小特」
+```
+
+`pack_models.py` 复现了官方 `pack_model.py` 的二进制格式（定长 32 字节字段 +
+绝对偏移 + 连续数据区），逐字节与 `esp_sr_sys/build.rs` 里的 `pack_models()` 一致。
+**换模型时改 `assets/models/` 下的目录再跑一次脚本即可**，脚本末尾会回读校验偏移。
+
+### 想换回能量 VAD
+
+`vad::init()` 返回 false 时会自动回落，不用改代码。
+手动禁用在 `audio.rs` 里把 `let vad_ok = crate::vad::init();` 改成 `false` 即可。
+
+### 还能加什么
+
+同一套库还能开：nsnet2 降噪、AGC 自动增益。
+
+## 一·六、WakeNet 本地唤醒词
+
+**唤醒词是「小特小特」。** 代码在 `src/wakenet.rs`。
+
+加这个之前，唤醒靠「VAD 判到有人说话 → 上传 → 服务端 ASR 结果里匹配关键词」，
+两个毛病：环境噪音也要传一轮、烧一次 ASR 调用；而且要等 ASR 出结果才知道
+是不是在叫它。WakeNet 把这一步搬到本地，**命中之前一个字节都不上传**。
+
+### 三条唤醒路径（按优先级回落）
+
+| 情况 | 行为 |
+|---|---|
+| WakeNet 正常 | 必须喊「小特小特」 |
+| 模型加载失败 | 回落到 VADNet：有人说话就唤醒（旧行为） |
+| 连 VADNet 也没有 | 回落到能量阈值 |
+
+串口启动时会打印实际生效的那条，以及模型里读出来的唤醒词：
+
+```
+[srmodel] 模型包已加载 565 KB
+[vad] VADNet 就绪，每帧 512 样本（32ms）
+[wake] 唤醒词 = 小特小特
+[wake] 就绪，每块 480 样本（30ms）
+```
+
+### 为什么要有累积缓冲
+
+WakeNet 的块长由模型决定（这块是 **480 = 30ms**），而 I2S 帧长是 512（32ms，
+为了对齐 AEC）。512 除不尽 480，直接丢余数会每帧丢 6% 的音频，唤醒率会掉。
+`wakenet::detect()` 内部跨帧累积，凑够一块判一块。
+
+### 换唤醒词
+
+1. 把新模型目录（`vendor/models/` 里找）拷进 `assets/models/`
+2. 删掉不想用的旧模型目录
+3. `cd assets && python pack_models.py`
+4. 改 `src/wakenet.rs` 里的 `models.find(c"wakenet", None)` 前缀（一般不用改）
+
+可选模型目前只有两个：`wn9_xiaotexiaote_tts2`（中文「小特小特」）和
+`wn9_hiesp`（英文「Hi, ESP」）。
+
+### 误触发 / 漏检
+
+`src/wakenet.rs` 里 `WakeNetMode::Normal` 比 `Aggressive` 保守：
+- **漏检**（喊了没反应）→ 改 `Aggressive`
+- **误触发**（没喊也应）→ 保持 `Normal`，或换更长的唤醒词
+
+### 和 VAD 的关系
+
+有 WakeNet 时，**待机状态下不再跑 VAD**（少一份算力）；但进入 Listening 后
+仍用 VADNet 判「说完了没有」，10 秒没人声自动回待机。
+
+## 一之二、AEC 回声消除
+
+AEC 已经集成，代码在 `src/aec.rs`。它把「即将送去播放的音频」当参考信号，
+从麦克风里减掉，从而**播放时也能继续收音** —— 这是语音打断的前提。
+
+### 为什么帧长从 60ms 改成了 32ms
+
+esp-sr 的 AEC 固定按 **512 样本（32ms @16kHz）** 一块处理，且 `Aec::new()`
+会校验块长。`FRAME_MS = 60` 的 960 样本除不尽 512，会周期性丢样本或插静音，
+所以改成 32ms（也可以 64ms）。顺带把队列内存压小了：`.bss` 从 249KB 降到 228KB。
+
+### 参考延迟必须实测校准
+
+`board.rs` 的 `AEC_REF_DELAY` 是「从样本写进 DMA，到它绕一圈被麦克风收回来」
+隔了多少样本。**填错的表现是"看起来在跑，但一点也没消掉"。**
+
+看串口周期性打印的 `[aec] ERLE xx.x dB`：
+
+- **15~25dB** —— 正常，消得干净
+- **0~5dB** —— 延迟没对上，按 160（10ms）为步长调 `AEC_REF_DELAY` 再试
+
+### 一个必须打的补丁
+
+`esp-sr` 的预编译库在这里**链接不过**，报
+`l32r: literal target out of range`。原因是那些 `.a` 里的字面量放在独立的
+`.literal` 段，被链接器摆到离代码 30MB 远的地方（IRAM vs flash），
+而 Xtensa 的 `l32r` 只能寻址 ±256KB。
+
+解法是把段名并回去，脚本已备好：
+
+```bash
+# vendor/esp_sr_sys 只需做一次
+bash scripts/patch_esp_sr_literals.sh vendor/esp_sr_sys/vendor/esp-sr/lib/esp32s3
+```
+
+完整的根因分析和试过的其它方案见 `docs/issue-l32r-literal.md`。
+**不要开 LTO** —— 它会改变库的链接顺序，把这个补丁的效果又搞回去。
 
 ## 二、编译烧录
 
@@ -481,11 +617,11 @@ WebSocket，文本帧走 JSON，二进制帧走 PCM。和供应商完全解耦�
 
 **握手**
 ```json
-{"type":"hello","version":1,"format":"pcm","sample_rate":16000,"channels":1,"bits":16,"frame_ms":60}
+{"type":"hello","version":2,"format":"pcm","sample_rate":16000,"channels":1,"bits":16,"frame_ms":32}
 ```
 
-**上行**：每帧 1920 字节 16kHz/16bit/单声道 PCM（60ms）
-**下行**：同样的 PCM，每帧 ≤1920 字节，按 60ms 节奏发
+**上行**：每帧 1024 字节 16kHz/16bit/单声道 PCM（32ms）
+**下行**：同样的 PCM，每帧 ≤1024 字节，按 32ms 节奏发
 
 **下行 JSON**
 ```json

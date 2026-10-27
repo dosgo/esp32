@@ -763,6 +763,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ember_esp_sr"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "048bdade9cc6728769e503024166611554a83f2b41887db1d9e6ac9ec2fd0858"
+dependencies = [
+ "esp_sr_sys",
+]
+
+[[package]]
 name = "enumset"
 version = "1.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1225,6 +1234,7 @@ dependencies = [
  "embedded-io-async 0.7.0",
  "embedded-sdmmc",
  "embedded-storage",
+ "ember_esp_sr",
  "esp-alloc",
  "esp-backtrace",
  "esp-bootloader-esp-idf",
@@ -1236,6 +1246,7 @@ dependencies = [
  "esp-storage",
  "esp32s3 0.37.0",
  "heapless 0.9.3",
+ "libm",
  "log",
  "mipidsi",
  "sha1",
@@ -1250,6 +1261,14 @@ checksum = "d8b4f101d37c233fe88b2b5e6d27fedab934a52f804e34f52b4b9d4d5ba2ea63"
 dependencies = [
  "critical-section",
  "vcell",
+]
+
+[[package]]
+name = "esp_sr_sys"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "libm",
 ]
 
 [[package]]
@@ -1490,6 +1509,12 @@ name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+
+[[package]]
+name = "libm"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "linked_list_allocator"

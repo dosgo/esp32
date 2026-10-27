@@ -54,7 +54,17 @@ esp-storage = { version = "0.10.0", features = ["esp32s3", "embedded-storage"] }
 embedded-storage = "0.3.1"
 # 热点侧要自己跑 DHCP，否则手机连上会显示"无互联网"然后自动断开
 esp-hal-dhcp-server = "0.4.3"
-esp-println = { version = "0.18.0", features = ["esp32s3", "log-04"] }
+# 日志走原生 USB-Serial-JTAG（GPIO19/20）
+# 不能用默认的 auto：它靠读 USB_DEVICE_INT_RAW 的 SOF 标志判断，
+# 而 esp-println 0.18 给 ESP32-S3 的地址写的是 0x60038000（少了 +0x08 偏移），
+# 判断永远为假，日志会全部走去 UART0（GPIO43/44），USB 口一行都看不到。
+esp-println = { version = "0.18.0", default-features = false, features = [
+    "esp32s3",
+    "log-04",
+    "jtag-serial",
+    "critical-section",
+    "colors",
+] }
 esp-radio = { version = "1.0.0-beta.1", features = [
     "esp32s3",
     "wifi",
@@ -69,6 +79,10 @@ sha1 = { version = "0.11", default-features = false }
 # 直接点 SENS 寄存器读片上温度：esp-hal 1.2.2 的 tsens 模块不带 S3。
 # 版本必须跟 esp-radio 1.0-beta.1 内部用的一致（0.37），否则寄存器类型对不上。
 esp32s3 = "0.37"
+# no_std 没有 log10，AEC 算 ERLE 要用
+libm = "0.2"
+# 试验：bare-metal 版 esp-sr（AEC/VAD/唤醒词），vendor 了官方 .a + 自写 FreeRTOS 桩
+ember_esp_sr = { version = "0.1.0", features = ["esp32s3"] }
 
 # ---- 1.54" ST7789 240x240 屏 ----
 mipidsi = { version = "0.10", default-features = false }
@@ -78,3 +92,10 @@ embedded-hal-bus = "0.3"
 [profile.release]
 opt-level = "s"
 codegen-units = 1
+
+# esp_sr_sys 本地补丁：dl_lib 的对象把 .literal 段改名为 .text。
+# 原因：Xtensa 的 l32r 只能寻址 ±256KB，而 libdl_lib.a 是预编译的，
+# 它的汇编被放进 IRAM、literal 留在 flash，两者差 30MB，AEC 一引用就炸。
+# 改名后代码和 literal 落在同一输出段，距离由段内偏移决定，与固件大小无关。
+[patch.crates-io]
+esp_sr_sys = { path = "vendor/esp_sr_sys" }
