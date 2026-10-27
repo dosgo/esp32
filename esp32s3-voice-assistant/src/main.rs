@@ -877,6 +877,16 @@ async fn run_session(stack: embassy_net::Stack<'static>) -> Result<(), &'static 
     let mut text_buf = [0u8; 1024];
     // 应用层心跳的最后发送时刻
     let mut last_hb = Instant::now();
+    // 最后一次**收到**下行数据的时刻。
+    //
+    // 【为什么必须有】网关被强杀（Stop-Process）时不会发 TCP FIN，设备这边
+    // 的 socket 毫不知情，往发送缓冲里继续写还以为一切正常 —— 实测要等
+    // smoltcp 的 socket timeout（现在 120 秒）才会报错重连。用户看到的就是
+    // 「网关重启了一下，设备哑了两分钟」。
+    //
+    // 网关现在每 10 秒发一个 {"type":"ping"}，只要 30 秒什么都没收到，
+    // 就认定这条连接死了，主动断开重连（3 秒后重连成功）。
+    let mut last_rx = Instant::now();
 
     loop {
         // ---- 0. 应用层心跳 ----
@@ -910,18 +920,46 @@ async fn run_session(stack: embassy_net::Stack<'static>) -> Result<(), &'static 
         }
 
         // ---- 1. 把录音队列发出去 ----
-        // 只有 Listening 状态才上传。语音帧本身带时间顺序，
-        // 网关靠连续帧的到达判断"说完了没有"。
-        while let Ok(f) = MIC_CH.try_receive() {
-            if audio::state() == State::Listening {
-                c.send_binary(&f).await.map_err(|_| "上行发送失败")?;
+        //
+        // 合并成一批再发。每帧单独 send 一次的话，一次 `await` 就要等一轮
+        // TCP 写完成，WiFi 稍慢就积压；队列一满，mic_task 立刻开始丢最旧帧，
+        // 上行音频就被切成「一帧有声、两三帧静音」的碎片（实测 ASR 只认得出
+        // 一个字）。两帧合一个 WS 消息，写入次数和协议开销都砍一半。
+        //
+        // 只有 Listening 状态才上传；其它状态把队列清空，免得重连后发旧声音。
+        if audio::state() == State::Listening {
+            let mut batch = [0u8; board::FRAME_BYTES * 2];
+            let mut blen = 0usize;
+            while let Ok(f) = MIC_CH.try_receive() {
+                if blen + f.len() > batch.len() {
+                    c.send_binary(&batch[..blen])
+                        .await
+                        .map_err(|_| "上行发送失败")?;
+                    blen = 0;
+                }
+                batch[blen..blen + f.len()].copy_from_slice(&f);
+                blen += f.len();
             }
+            if blen > 0 {
+                c.send_binary(&batch[..blen])
+                    .await
+                    .map_err(|_| "上行发送失败")?;
+            }
+        } else {
+            while MIC_CH.try_receive().is_ok() {}
         }
 
         // ---- 2. 读 20ms ----
         // 超时是正常路径（没有下行数据），不是错误；只有断开才重连
         match c.fill(Duration::from_millis(20)).await {
-            Ok(()) | Err(ws::ReadErr::Timeout) => {}
+            Ok(()) => last_rx = Instant::now(),
+            Err(ws::ReadErr::Timeout) => {
+                // 超时是正常节拍（网关没话说时就是没数据）。但安静太久
+                // 就得怀疑这条连接已经死了，见 last_rx 的说明。
+                if last_rx.elapsed() > Duration::from_secs(30) {
+                    return Err("30 秒没收到任何下行数据，判为断线");
+                }
+            }
             Err(ws::ReadErr::Closed) => return Err("连接已关闭"),
         }
 

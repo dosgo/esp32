@@ -303,10 +303,19 @@ SYSTEM_PROMPT = (
 # 音频，静音计时被加速了 1.875 倍 —— 配 700 实际只有 373ms 就切句。
 # FRAME_MS 改成 32 之后累加才是真毫秒，所以这里同步回调：
 # 450ms 是中文自然换气停顿（200~300ms）之上、又不至于让人觉得"说完半天没反应"的值。
-VAD_RMS_THRESHOLD = 500
+# 能量阈值必须和固件里 audio.rs 的 `(noise_floor * 2).max(200)` **大致对齐**。
+#
+# 曾经这里是 500，而固件那边是 400/200。同一段音频，设备判「这是人声，上传」，
+# 网关却判「这是静音，不理」—— 两边打架，用户看到的就是设备明明在传数据，
+# 却永远得不到回应。现在统一到 250：安静环境实测 rms 37~105，正常说话 350+。
+VAD_RMS_THRESHOLD = 250
+# 连续多响才算「开口」。真实说话是持续的，噪音是断续的 —— 这是两者最可靠的差别。
+VAD_ONSET_MS = 96
 VAD_SILENCE_MS = 450
 VAD_MIN_SPEECH_MS = 300
-VAD_MAX_UTTERANCE_MS = 15000
+# 最长一段语音。设 8 秒而不是 15：环境吵的时候 VAD 可能一直判「还在说」，
+# 拖到 15 秒才强制截断，那一段音频已经混了几十句噪音，识别必然失败。
+VAD_MAX_UTTERANCE_MS = 8000
 AWAKE_TIMEOUT_S = 90
 
 
@@ -879,16 +888,25 @@ class Session:
     buf: bytearray = field(default_factory=bytearray)
     speech_ms: int = 0
     silence_ms: int = 0
+    # 连续超阈值的累计时长。用来区分「真的在说话」和「碰了一下桌子」：
+    # 环境里的短促噪音每 1~2 秒冒一次，如果单帧就判 in_speech，
+    # 静音计时会被永远清零，网关永远等不到「说完」——表现为设备一直在传，
+    # 但就是不给任何回应。
+    hot_ms: int = 0
     in_speech: bool = False
     busy: bool = False
     # 下行发送器。按连接复用 —— 它记着设备端播放队列的水位估算，
     # 跨句子、跨轮次都要接着算，不能每次 respond 新建。
     sender: object = None
+    # 上行统计：排查「设备明明在传却收不到」时看这两个数
+    rx_msgs: int = 0
+    rx_bytes: int = 0
 
     def reset_utterance(self):
         self.buf.clear()
         self.speech_ms = 0
         self.silence_ms = 0
+        self.hot_ms = 0
         self.in_speech = False
 
 
@@ -1179,6 +1197,7 @@ async def device_handler(ws, asr, tts):
                 sess.reset_utterance()
 
         try:
+            last_msg_t = time.time()
             # 用 recv() + 超时循环，而不是 `async for msg in ws`。
             #
             # 关掉 WS 控制帧 ping 之后，网关没有别的手段能发现「对端已经死了
@@ -1187,20 +1206,53 @@ async def device_handler(ws, asr, tts):
             # 设备每 8 秒发一次心跳，所以 40 秒什么都收不到就是死了。
             while True:
                 try:
-                    msg = await asyncio.wait_for(ws.recv(), timeout=40)
+                    msg = await asyncio.wait_for(ws.recv(), timeout=10)
+                    last_msg_t = time.time()
                 except asyncio.TimeoutError:
-                    print("[conn] 40 秒没有任何消息（含心跳），判为僵尸连接，主动关闭")
-                    break
+                    # 设备每 8 秒发一次心跳，10 秒没动静说明有点不对劲。
+                    #
+                    # 这里**不能直接断**：网关被强杀重启后，设备那边的 TCP
+                    # 毫无察觉，仍会往缓冲里写数据，一等就是 socket timeout。
+                    # 所以先发一个 {"type":"ping"} —— 设备收到会刷新自己的
+                    # last_rx，30 秒收不到任何东西它就主动断开重连。
+                    if time.time() - last_msg_t > 40:
+                        print("[conn] 40 秒没有任何消息（含心跳），判为僵尸连接，主动关闭")
+                        break
+                    try:
+                        await ws.send('{"type":"ping"}')
+                    except Exception:
+                        break
+                    continue
 
                 if isinstance(msg, bytes):
+                    sess.rx_msgs += 1
+                    sess.rx_bytes += len(msg)
+                    # 每秒（约 31 条）打一次，确认上行链路真的在动
+                    if sess.rx_msgs % 31 == 0:
+                        print(f"  [rx] {sess.rx_msgs} 条 / {sess.rx_bytes/2/SAMPLE_RATE:.1f}s 音频 "
+                              f"（最近一条 {len(msg)}B）")
                     sess.buf.extend(msg)
+                    # 设备会把多帧合并成一个 WS 消息发（见 main.rs 的上行批处理），
+                    # 所以时长必须按实际字节数折算。原来硬编码 `+= FRAME_MS`
+                    # 假设「一个消息 = 一帧」，批量之后就会把时长算少一半，
+                    # VAD 的静音判定跟着失准。
+                    n_frames = max(1, len(msg) // FRAME_BYTES)
+                    ms = n_frames * FRAME_MS
                     e = rms(msg)
                     if e > VAD_RMS_THRESHOLD:
-                        sess.speech_ms += FRAME_MS
+                        sess.hot_ms += ms
                         sess.silence_ms = 0
-                        sess.in_speech = True
-                    elif sess.in_speech:
-                        sess.silence_ms += FRAME_MS
+                        # 要连续 96ms（3 帧）够响才算「开始说话」。
+                        # 碰桌子、敲键盘、纸张声都只有一两帧，靠这个滤掉，
+                        # 否则静音计时会被它们永远清零。
+                        if sess.hot_ms >= VAD_ONSET_MS:
+                            sess.in_speech = True
+                        if sess.in_speech:
+                            sess.speech_ms += ms
+                    else:
+                        sess.hot_ms = 0
+                        if sess.in_speech:
+                            sess.silence_ms += ms
 
                     done = (sess.in_speech and sess.silence_ms >= VAD_SILENCE_MS) \
                         or sess.speech_ms >= VAD_MAX_UTTERANCE_MS
