@@ -36,7 +36,9 @@ mod aec;
 mod audio;
 mod board;
 mod config;
+mod dhcp;
 mod display;
+mod es7210;
 mod es8311;
 mod esp_sr;
 mod json;
@@ -54,7 +56,7 @@ use core::cell::RefCell;
 
 use embassy_executor::Spawner;
 use embassy_net::{Config as NetConfig, Ipv4Cidr, Runner, StackResources, StaticConfigV4};
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use embedded_hal_bus::i2c::RefCellDevice;
 use esp_hal::{
     clock::CpuClock,
@@ -65,10 +67,6 @@ use esp_hal::{
     rng::Rng,
     time::Rate,
     timer::timg::TimerGroup,
-};
-use esp_hal_dhcp_server::{
-    run_dhcp_server, simple_leaser::SimpleDhcpLeaser, structs::DhcpServerConfig,
-    Ipv4Addr as DhcpIp,
 };
 use esp_println::println;
 use esp_radio::wifi::{
@@ -231,6 +229,26 @@ async fn main(spawner: Spawner) -> ! {
             }
             let _ = codec.set_volume(85);
         }
+
+        // ---------------- 1.3 ES7210 麦克风 ADC ----------------
+        //
+        // 【这块板子有两颗 codec】ES8311 只管喇叭，麦克风走 ES7210（I2C 0x40）。
+        // 之前只初始化了 ES8311，所以 I2C 扫描里那个 "0x40 未知设备" 一直没被
+        // 用起来 —— 后果是 ADC 不出数据，I2S RX 全是静音：
+        // 唤醒词永不命中、ASR 永远收到空音频。
+        {
+            let mut mic = es7210::Es7210::new(RefCellDevice::new(&i2c_bus), es7210::ADDR);
+            match mic.probe() {
+                Some(v) => {
+                    println!("[codec] ES7210 在线（reg0=0x{v:02X}），配置麦克风…");
+                    match mic.init() {
+                        Ok(()) => println!("[codec] ES7210 完成 16kHz/16bit/I2S/30dB"),
+                        Err(_) => println!("[codec] ES7210 初始化失败（麦克风不会有声音）"),
+                    }
+                }
+                None => println!("[codec] 读不到 ES7210（0x40）！麦克风不会有声音"),
+            }
+        }
     }
 
     // ---------------- 1.3 IMU + 触摸（同一个任务轮询）----------------
@@ -264,8 +282,20 @@ async fn main(spawner: Spawner) -> ! {
         .with_din(unsafe { AnyPin::steal(board::PIN_I2S_DIN) })
         .build();
 
-    spawner.spawn(audio::speaker_task(i2s_tx).expect("speaker_task"));
-    spawner.spawn(audio::mic_task(i2s_rx).expect("mic_task"));
+    // 【音频任务延后到 WiFi 连上之后再 spawn】
+    //
+    // 原因（今天实机实测出来的）：`mic_task` 首帧就跑 esp-sr 初始化，
+    // AEC 要 ~122KiB 内部 RAM，VADNet/WakeNet 还要各自几十 KB。
+    // 而内部堆总共只有 112KB（BSS 48KB + reclaimed 64KB），
+    // WiFi 驱动又只能用内部 RAM（malloc_internal）。
+    //
+    // 结果：esp-sr 先把内部 RAM 吃干，WiFi 在四次握手阶段分配不出加密缓冲，
+    // 稳定报 reason=15 FourWayHandshakeTimeout —— 而且**正确密码和错误密码
+    // 报的是同一个错**（当时误判成驱动 bug，其实一个字节都没进到握手）。
+    // 临时关掉 esp-sr 后 WiFi 立刻连上、拿到 192.168.88.149，根因确认。
+    //
+    // 所以顺序改成：先建 WiFi → 连上并拿到 IP → 再启动音频任务，
+    // 让 WiFi 优先拿到它需要的内部 RAM。
 
     // 三个板载按键：PWR 打断 / PLUS/MINUS 音量
     spawner.spawn(keys::keys_task().expect("keys_task"));
@@ -312,6 +342,13 @@ async fn main(spawner: Spawner) -> ! {
     //
     // 坑2：模式从 AP 变 APSTA 会让射频 stop/start，热点瞬断，正在提交配网表单的
     //      手机就被掐了。所以**开机就是 APSTA**，模式全程不变。
+    // 建 WiFi 之前先把内部堆剩多少打出来 —— WiFi 只能用内部 RAM
+    println!(
+        "[mem] 建 WiFi 前：内部 {} B / PSRAM {} B",
+        esp_alloc::HEAP.free_caps(esp_alloc::MemoryCapability::Internal.into()),
+        esp_alloc::HEAP.free_caps(esp_alloc::MemoryCapability::External.into()),
+    );
+
     let ap_cfg = ap_config(&boot_cfg);
     let sta_cfg = if boot_cfg.wifi_set() {
         sta_config(boot_cfg.wifi_ssid.as_str(), boot_cfg.wifi_pass.as_str())
@@ -319,10 +356,26 @@ async fn main(spawner: Spawner) -> ! {
         placeholder_sta()
     };
 
+    // 【有配置时只开 STA，不开热点】
+    //
+    // 实测：APSTA 并存时连家里 WiFi 一直报
+    //   FourWayHandshakeTimeout（信号 -27dBm，密码确认无误）
+    // 怀疑是射频被热点打断 —— 四次握手要求毫秒级及时性，而热点每 100ms 要发
+    // beacon，beta 版 coex 调度可能挤掉握手窗口。
+    // 配网完成后热点本来就没用了（配置在 flash 里，网页走局域网 IP 也能开），
+    // 所以有配置就只开 STA。
+    // 实验结论：APSTA 并存**不是**握手失败的原因（纯 STA 也一样失败）。
+    // 所以热点保持常开 —— 它是连不上家里 WiFi 时唯一能进去改配置的通道。
+    let ap_enabled = true;
+    let initial = if ap_enabled {
+        WifiConfig::AccessPointStation(sta_cfg, ap_cfg)
+    } else {
+        WifiConfig::Station(sta_cfg)
+    };
+
     let mut controller = match esp_radio::wifi::WifiController::new(
         peripherals.WIFI,
-        ControllerConfig::default()
-            .with_initial_config(WifiConfig::AccessPointStation(sta_cfg, ap_cfg)),
+        ControllerConfig::default().with_initial_config(initial),
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -349,17 +402,22 @@ async fn main(spawner: Spawner) -> ! {
     let seed2 = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xA5A5_5A5A;
 
     // ---- 热点侧：自己做网关，地址固定 192.168.4.1 ----
-    let (ap_stack, ap_runner) = embassy_net::new(
-        Interface::access_point(),
-        NetConfig::ipv4_static(StaticConfigV4 {
-            address: Ipv4Cidr::new(store::AP_IP, 24),
-            gateway: None,
-            dns_servers: heapless::Vec::new(),
-        }),
-        mk_static!(StackResources<8>, StackResources::<8>::new()),
-        seed,
-    );
-    spawner.spawn(net_task(ap_runner).expect("ap net task"));
+    // 只有没配网时才建。有配置就纯 STA，射频全给联网用。
+    let mut ap_stack_opt: Option<embassy_net::Stack<'static>> = None;
+    if ap_enabled {
+        let (ap_stack, ap_runner) = embassy_net::new(
+            Interface::access_point(),
+            NetConfig::ipv4_static(StaticConfigV4 {
+                address: Ipv4Cidr::new(store::AP_IP, 24),
+                gateway: None,
+                dns_servers: heapless::Vec::new(),
+            }),
+            mk_static!(StackResources<10>, StackResources::<10>::new()),
+            seed,
+        );
+        spawner.spawn(net_task(ap_runner).expect("ap net task"));
+        ap_stack_opt = Some(ap_stack);
+    }
 
     // ---- 联网侧：DHCP 拿地址，语音流量走这条 ----
     let (stack, runner) = embassy_net::new(
@@ -375,17 +433,21 @@ async fn main(spawner: Spawner) -> ! {
     // 缓冲放 PSRAM，不放 BSS：4 条 TcpSocket 缓冲 + 请求/页面缓冲加起来
     // 二十多 KB，直接 `mk_static!` 会把内部 RAM 的 BSS 撑爆，链接器报
     // `stack.x:13 cannot move location counter backwards`（栈没地方放了）。
-    spawner.spawn(
-        web::web_task(
-            ap_stack,
-            "AP",
-            alloc_psram_buf(2048),
-            alloc_psram_buf(2048),
-            alloc_psram_buf(web::MAX_REQ),
-            alloc_psram_buf(web::PAGE_BUF),
-        )
-        .expect("web ap"),
-    );
+    if let Some(ap_stack) = ap_stack_opt {
+        spawner.spawn(
+            web::web_task(
+                ap_stack,
+                "AP",
+                alloc_psram_buf(2048),
+                alloc_psram_buf(2048),
+                alloc_psram_buf(web::MAX_REQ),
+                alloc_psram_buf(web::PAGE_BUF),
+            )
+            .expect("web ap"),
+        );
+        // 热点侧必须自带 DHCP，否则手机连上会"无互联网"然后自动断开
+        spawner.spawn(dhcp::dhcp_task(ap_stack).expect("dhcp"));
+    }
     spawner.spawn(
         web::web_task(
             stack,
@@ -398,9 +460,10 @@ async fn main(spawner: Spawner) -> ! {
         .expect("web sta"),
     );
 
-    // 热点侧必须自带 DHCP，否则手机连上会"无互联网"然后自动断开
-    spawner.spawn(dhcp_task(ap_stack).expect("dhcp"));
 
+    if !ap_enabled {
+        println!("[wifi] 已配网，只开 STA（热点关闭）");
+    } else {
     println!(
         "[wifi] 热点已开：{} / {}  →  http://{}",
         boot_cfg.ap_ssid_or_default(),
@@ -411,21 +474,42 @@ async fn main(spawner: Spawner) -> ! {
         },
         store::AP_IP,
     );
+    }
 
     // ---- 连家里 WiFi ----
+    //
+    // 【为什么不用 select(connect_async(), Timer)】
+    // 实测这块板子上 `select` + `Timer` 根本不会唤醒 —— 表现是日志停在
+    // "连接 CPE（第 N 次）" 之后再无输出，超时分支永远不触发。
+    // 显示页早先也踩过同一个坑（select(Signal.wait(), Timer) 永不返回）。
+    //
+    // 所以改成：**连接交给独立任务，主流程只用普通 Timer 轮询一个原子状态**。
+    // 普通 Timer::after 在这块板子上是好的（配网页 30 秒等待就是用它）。
     let mut connected = false;
     if boot_cfg.wifi_set() {
-        for attempt in 1..=3u8 {
-            println!(
-                "[wifi] 连接 {}（第 {attempt} 次）…",
-                boot_cfg.wifi_ssid.as_str()
-            );
-            if controller.connect_async().await.is_ok() {
-                connected = true;
-                break;
+        let ssid_for_task = boot_cfg.wifi_ssid.clone();
+        spawner.spawn(
+            wifi_connect_task(controller, ssid_for_task).expect("wifi_connect_task"),
+        );
+
+        // 最多等 45 秒（5 次 × 每次约 8 秒）
+        for _ in 0..225 {
+            match WIFI_STATE.load(core::sync::atomic::Ordering::Relaxed) {
+                1 => {
+                    connected = true;
+                    break;
+                }
+                2 => break,
+                _ => Timer::after(Duration::from_millis(200)).await,
             }
-            Timer::after(Duration::from_secs(5)).await;
         }
+        println!(
+            "[wifi] 连接阶段结束：{}",
+            if connected { "已连上" } else { "未连上" }
+        );
+    } else {
+        // 没配网时热点必须常开，所以别 drop 控制器
+        core::mem::forget(controller);
     }
 
     // 没配网 / 连不上：进配网模式。热点、网页、屏幕都照常工作，
@@ -453,6 +537,12 @@ async fn main(spawner: Spawner) -> ! {
         use core::fmt::Write;
         let _ = write!(ip_text, "{}", cfg.address);
     }
+
+    // WiFi 已拿到 IP。esp-sr 的大块缓冲现在会被 esp-alloc 的补丁
+    // 直接分到 PSRAM（见 vendor/esp-alloc/src/malloc.rs），
+    // 所以这里可以放心启动音频任务，内部 RAM 留给 WiFi/TCP。
+    spawner.spawn(audio::speaker_task(i2s_tx).expect("speaker_task"));
+    spawner.spawn(audio::mic_task(i2s_rx).expect("mic_task"));
 
     // 通知屏幕：IP 到手了，可以从开机画面切到状态页
     display::IP_READY.signal(ip_text);
@@ -592,25 +682,21 @@ fn to_ssid(s: &str, fallback: &'static str) -> Ssid {
 
 /// 热点配置。名字/密码来自 flash，没配过用出厂值。
 fn ap_config(c: &store::Config) -> AccessPointConfig {
-    let base = AccessPointConfig::default()
+    // 【配网热点用开放网络】
+    //
+    // 实测：带 WPA2 密码时，手机能搜到热点但一律提示"密码错误"——
+    // 密码本身经日志核对是完全正确的（9 字节 ASCII），
+    // 且同一个 esp-radio 版本在另一块板子上是能连的。
+    // 所以问题在 esp-radio 1.0.0-beta.1 的 SoftAP 加密实现。
+    //
+    // 配网阶段用 Open 是常见做法：热点只活到配网完成，配完就切正常模式。
+    // 真要加密，等 esp-radio 出正式版再说。
+    AccessPointConfig::default()
         .with_ssid(to_ssid(
             c.ap_ssid_or_default(),
             store::DEFAULT_AP_SSID,
         ))
-        .with_max_connections(4);
-    let pass = c.ap_pass_or_default();
-    if pass.is_empty() {
-        // 开放网络不能带认证，否则 esp_wifi 报参数错误
-        base
-    } else {
-        match Password::try_from(pass) {
-            // 用 WPA/WPA2 兼容模式，不要只给 Wpa2Personal：
-            // 部分手机/系统对「纯 WPA2」的 AP 兼容差，会直接提示"密码错误"。
-            Ok(pw) => base.with_authentication(AuthenticationMethodConfig::WpaWpa2Personal(pw)),
-            // 长度不在 8~63：降级成开放网络，总比起不来强
-            Err(_) => base,
-        }
-    }
+        .with_max_connections(4)
 }
 
 /// STA 配置。空密码必须按 Open 处理，否则 init 直接失败。
@@ -634,35 +720,76 @@ fn placeholder_sta() -> StationConfig {
         .with_authentication(AuthenticationMethodConfig::Open)
 }
 
-/// 热点侧 DHCP + 假 DNS，否则手机连上会"无互联网"然后自动断开
+// pool_size = 2：AP 和 STA 各有一个 embassy-net runner，各要跑一份
+/// 0 = 连接中，1 = 已连上，2 = 失败
+static WIFI_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// STA 连接任务。
+///
+/// `connect_async()` 内部等「连上 / 断开」事件，事件不来就永久挂住，所以必须有
+/// 人在外面管着。这里由任务自己重试，主流程只读 `WIFI_STATE`。
+///
+/// 注意：`WifiController` 一旦 drop 就会停掉射频，所以任务结尾必须常驻，
+/// 不能直接返回。
 #[embassy_executor::task]
-async fn dhcp_task(stack: embassy_net::Stack<'static>) {
-    static GATEWAYS: [DhcpIp; 1] = [DhcpIp::new(192, 168, 4, 1)];
-    static DNS: [DhcpIp; 1] = [DhcpIp::new(192, 168, 4, 1)];
+async fn wifi_connect_task(
+    mut controller: esp_radio::wifi::WifiController<'static>,
+    ssid: heapless::String<32>,
+) {
+    // 先扫一遍：把目标 AP 的真实安全类型打出来。
+    //
+    // 报 FourWayHandshakeTimeout 而密码逐字节正确时，最常见的原因是
+    // 「芯片看到的 auth 是 WPA3，但我们按 WPA2 去连」。esp-radio 这个 beta
+    // 只支持到 WPA2，所以必须确认 AP 到底广播了什么。
+    println!("[wifi] 扫描周边 AP…");
+    let scan_cfg = esp_radio::wifi::scan::ScanConfig::default().with_max(12);
+    match controller.scan_async(&scan_cfg).await {
+        Ok(list) => {
+            for ap in list.iter().take(12) {
+                println!(
+                    "[scan] {:20} ch{:2} rssi{:4} auth={:?}",
+                    ap.ssid.as_str(),
+                    ap.channel,
+                    ap.signal_strength,
+                    ap.auth_method
+                );
+            }
+        }
+        Err(e) => println!("[wifi] 扫描失败: {e:?}"),
+    }
 
-    let config = DhcpServerConfig {
-        ip: DhcpIp::new(192, 168, 4, 1),
-        lease_time: Duration::from_secs(3600),
-        gateways: &GATEWAYS,
-        subnet: Some(DhcpIp::new(255, 255, 255, 0)),
-        dns: &DNS,
-        // 关掉 captive portal：部分手机会因此反复重连/直接放弃。
-        // 配网页本来就要用户手动打开 192.168.4.1，不需要自动弹窗。
-        use_captive_portal: false,
-    };
-    let mut leaser = SimpleDhcpLeaser {
-        start: DhcpIp::new(192, 168, 4, 2),
-        end: DhcpIp::new(192, 168, 4, 10),
-        leases: heapless::Vec::new(),
-    };
+    for attempt in 1..=5u8 {
+        println!("[wifi] 连接 {}（第 {attempt} 次）…", ssid.as_str());
+        match controller.connect_async().await {
+            Ok(info) => {
+                println!(
+                    "[wifi] 已连上，信道 {}，认证 {:?}，AID {}",
+                    info.channel, info.authmode, info.aid
+                );
+                WIFI_STATE.store(1, core::sync::atomic::Ordering::Relaxed);
+                break;
+            }
+            Err(e) => {
+                // 常见 reason：
+                //   FourWayHandshakeTimeout → 密码不对，或 AP 要求 PMF/WPA3
+                //   NoApFound / AuthenticationExpired → 信号/距离问题
+                println!("[wifi] 第 {attempt} 次失败: {e:?}");
+            }
+        }
+        Timer::after(Duration::from_secs(2)).await;
+    }
 
-    log::info!("[dhcp] 分配 192.168.4.2 ~ 192.168.4.10");
-    if let Err(e) = run_dhcp_server(stack, config, &mut leaser).await {
-        log::error!("[dhcp] 退出: {e:?}");
+    if WIFI_STATE.load(core::sync::atomic::Ordering::Relaxed) != 1 {
+        WIFI_STATE.store(2, core::sync::atomic::Ordering::Relaxed);
+        println!("[wifi] 5 次都失败，放弃重试");
+    }
+
+    // 保住控制器：drop 会把 WiFi 停掉
+    loop {
+        Timer::after(Duration::from_secs(3600)).await;
     }
 }
 
-// pool_size = 2：AP 和 STA 各有一个 embassy-net runner，各要跑一份
 #[embassy_executor::task(pool_size = 2)]
 async fn net_task(mut runner: Runner<'static, Interface>) {
     runner.run().await
@@ -671,6 +798,17 @@ async fn net_task(mut runner: Runner<'static, Interface>) {
 /// 断线重连的外壳。真正的会话在 `run_session` 里。
 async fn ws_loop(stack: embassy_net::Stack<'static>) -> ! {
     loop {
+        // 每次重试前把网络状态打出来。
+        // 排查「WiFi 明明连上了却连不到网关」时，这三项能直接区分：
+        //   link_up=false        → 射频掉线（很可能被 esp-sr 抢走内部 RAM）
+        //   link_up=true 有 IP   → 网是通的，问题在对端/防火墙/隔离
+        //   内部堆接近 0          → 后续分配都会失败
+        log::info!(
+            "[net] link_up={} ip={:?} 内部堆={}B",
+            stack.is_link_up(),
+            stack.config_v4().map(|c| c.address),
+            esp_alloc::HEAP.free_caps(esp_alloc::MemoryCapability::Internal.into()),
+        );
         match run_session(stack).await {
             Ok(()) => log::info!("[ws] 会话结束"),
             Err(e) => log::warn!("[ws] 断开: {e}"),
@@ -716,7 +854,7 @@ async fn run_session(stack: embassy_net::Stack<'static>) -> Result<(), &'static 
                 r#""channels":1,"bits":16,"frame_ms":{frame_ms},"config":{{"#,
                 r#""llm":{{"backend":"{llm_backend}","key":"{llm_key}","model":"{llm_model}","base":"{llm_base}"}},"#,
                 r#""asr":{{"chain":"{asr_chain}","key":"{asr_key}","model":"{asr_model}"}},"#,
-                r#""tts":{{"chain":"{tts_chain}","voice":"{tts_voice}"}}#,
+                r#""tts":{{"chain":"{tts_chain}","voice":"{tts_voice}"}}"#,
                 r#"}}}}"#
             ),
             llm_backend = cfg.llm_backend_or_default(),
@@ -737,8 +875,28 @@ async fn run_session(stack: embassy_net::Stack<'static>) -> Result<(), &'static 
 
     let mut down = [0u8; board::FRAME_BYTES];
     let mut text_buf = [0u8; 1024];
+    // 应用层心跳的最后发送时刻
+    let mut last_hb = Instant::now();
 
     loop {
+        // ---- 0. 应用层心跳 ----
+        //
+        // 设备在待机（Idle）状态下**一个字节都不往外发**，整条 TCP 连接是
+        // 纯空闲的。有两个东西会因此把连接回收掉：
+        //   · smoltcp 的 socket timeout（按最后一次发送计时，原来设 10 秒）
+        //   · 手机热点的 NAT 表（空闲条目会被清）
+        // 断开之后用户完全无感，只是下次开口前要先等 3 秒自动重连。
+        //
+        // 实测：网关每 5 秒发一次 WS 控制帧 ping，设备就是不回 pong
+        // （设备端 send() 的错误被 `let _ =` 吞了，查不出来），
+        // 所以干脆不用 WS 控制帧，改成自己发一个文本帧，网关忽略即可。
+        if last_hb.elapsed() >= Duration::from_secs(8) {
+            c.send_text(r#"{"type":"hb"}"#)
+                .await
+                .map_err(|_| "心跳发送失败")?;
+            last_hb = Instant::now();
+        }
+
         // ---- 0. PWR 键请求打断 ----
         // 按键任务已经把本地播放队列清空、状态打回 Idle 了，
         // 但网关那边还在往下推 TTS 数据，不告诉它就会立刻把队列重新灌满。
