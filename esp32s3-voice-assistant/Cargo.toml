@@ -99,3 +99,11 @@ codegen-units = 1
 # 改名后代码和 literal 落在同一输出段，距离由段内偏移决定，与固件大小无关。
 [patch.crates-io]
 esp_sr_sys = { path = "vendor/esp_sr_sys" }
+
+# esp-radio 的 STA 配置把 pmf_cfg.capable 写死成 true，
+# 导致连部分 WPA2 路由器 4-way 握手超时（reason=15）。改成 false，
+# 见 vendor/esp-radio/src/wifi/mod.rs 里的注释。
+esp-radio = { path = "vendor/esp-radio" }
+# esp-alloc：让 C 侧大于 8KB 的 malloc 优先走 PSRAM，
+# 否则 esp-sr 会把内部 RAM 吃光，WiFi 的 TCP 分配不出来。
+esp-alloc = { path = "vendor/esp-alloc" }

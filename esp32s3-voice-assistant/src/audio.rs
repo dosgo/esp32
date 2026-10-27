@@ -85,22 +85,37 @@ pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
     // pre-roll：最近 2 帧，唤醒时补发
     let mut preroll: [Option<AudioFrame>; 2] = [None, None];
     let mut preroll_idx = 0usize;
+    // 麦克风电平日志的节流计数
+    let mut mic_tick: u32 = 0;
+
+    // 【实验开关】临时关掉 esp-sr，验证 WiFi 四次握手失败是不是内部 RAM 被吃光导致的。
+    //
+    // 依据：内部堆总共只有 112KB（BSS 48KB + reclaimed 64KB），而
+    //   AEC 要 ~122KiB、VADNet 模型 ~281KB、WakeNet ~284KB（模型在 flash，
+    //   但推理要缓冲），全都在 WiFi 连接**之前**分配。
+    // WiFi 驱动只能用内部 RAM（malloc_internal），握手阶段的加密缓冲
+    // 分不出来就会超时 —— 正好是 reason=15。
+    const SR_ENABLE: bool = true;
 
     // ---- VADNet ----
     // 加载失败就整个回落到能量 VAD，不影响语音链路能用
-    let vad_ok = crate::vad::init();
+    let vad_ok = if SR_ENABLE { crate::vad::init() } else { false };
     let vad_chunk = crate::vad::chunk_size();
     // 唤醒判定：VADNet 内部已有 200ms 防抖，外面再要 2 帧（64ms）
     let hot_needed = if vad_ok { 2 } else { 3 };
 
     // ---- AEC ----
     // 吃 ~122KiB 内部内存，失败就直通（播放期间不收音，等于回到改造前）
-    let aec_ok = crate::aec::init();
+    let aec_ok = if SR_ENABLE { crate::aec::init() } else { false };
 
     // ---- WakeNet 本地唤醒 ----
     // 必须在 VAD 之后初始化：两者共用同一个 ModelList，由 esp_sr 首次访问时加载。
     // 失败就回落到「VAD 判到人声即唤醒」，行为和加唤醒词之前一样。
-    let wn_ok = crate::wakenet::init();
+    // 【临时】WakeNet 在实测中一直不命中（电平正常、判定块数在涨），
+    // 先用 VADNet 唤醒跑通「说话 → 上传 → ASR → LLM → TTS」整条链路，
+    // 确认音频采样率/格式正确之后，再回头调 WakeNet。
+    // 打开 WakeNet 把下面这行的 false 换成 crate::wakenet::init()
+    let wn_ok = false;
     // 用来检测「刚回到 Idle」这个时刻，好复位唤醒词状态
     let mut was_idle = true;
 
@@ -123,6 +138,17 @@ pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
         // 里面是 interleaved L/R 的 i16。只取左声道。
         let mono = extract_left(dma.as_slice());
         let energy = rms_energy(&mono);
+
+        // 麦克风电平诊断：每 32 帧（约 1 秒）打一次。
+        // 静音底噪通常是个位数，正常说话能到几百甚至上千。
+        // 如果一直贴着 0~2，说明 ES7210 没出数据或 I2S RX 接错。
+        mic_tick = mic_tick.wrapping_add(1);
+        if mic_tick % 32 == 0 {
+            log::info!(
+                "[mic] rms={energy}  已判 {} 块唤醒",
+                crate::wakenet::chunks_total()
+            );
+        }
 
         let st = state();
 

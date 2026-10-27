@@ -58,7 +58,17 @@ impl WsConn {
         let rx = mk_static_buf();
         let tx = mk_static_buf();
         let mut sock = TcpSocket::new(stack, rx, tx);
-        sock.set_timeout(Some(Duration::from_secs(10)));
+        // 【2026-10-28 改】原来是 10 秒，太短了。
+        //
+        // smoltcp 的 timeout 是按「最后一次**发送**数据」算的：设备在待机
+        // （Idle）时一个字节都不往外发，于是连上 10 秒整就被底层 abort，
+        // 表现是设备日志「[ws] 断开: 连接已关闭」+ 网关侧 code=1006，
+        // 用户完全感觉不到，只是每次开口前都要先等 3 秒重连。
+        //
+        // 实测证据：拿一个什么都不做的极简 WS 服务器接设备，精确 10.0 秒断。
+        // 现在放宽到 120 秒，并配合 main.rs 里 8 秒一次的应用层心跳，
+        // 正常情况根本走不到这个超时；它只作为「网关真的死了」的兜底。
+        sock.set_timeout(Some(Duration::from_secs(120)));
         sock.set_keep_alive(Some(Duration::from_secs(20)));
 
         sock.connect((ip, port))

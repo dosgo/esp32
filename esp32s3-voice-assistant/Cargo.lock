@@ -801,8 +801,6 @@ checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 [[package]]
 name = "esp-alloc"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f73e8d355019c740f6a5a78429633040617d28a378c271464caadc52c78216e3"
 dependencies = [
  "allocator-api2",
  "document-features",
@@ -989,8 +987,6 @@ dependencies = [
 [[package]]
 name = "esp-radio"
 version = "1.0.0-beta.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50247f4e91000fc87661e77254126c74acc4535f822ee247f7778807202dc938"
 dependencies = [
  "allocator-api2",
  "docsplay",

@@ -144,21 +144,34 @@ pub async fn display_task(
     // 等 Wi-Fi 拿到 IP。
     //
     // 【为什么不用 select(IP_READY.wait(), Timer::after(..))】
-    // 原来用 select 时，屏幕永远停在开机画面不切状态页。改成分两步：
-    // 先非阻塞取（配网模式下 main 早在 spawn 前就 signal 了，这里能直接拿到），
-    // 再退化成定时等待。拆开写既好排查，也不依赖 select 对这两个 future 的唤醒。
+    // 原来用 select 时，屏幕永远停在开机画面不切状态页。改成轮询：
+    // 每 200ms 非阻塞取一次，同时看配网标志。
+    //
+    // 【为什么不能只等 3 秒】
+    // 实测设备连家里 WiFi 要 5~20 秒（APSTA 并存 + 扫信道）。原来只等 3 秒，
+    // 结果 IP 还没到就把状态页画成了 "no wifi"，而后面 IP 到了屏幕又不会更新，
+    // 看上去就像"一直没连上"。现在等 30 秒，而且**进状态页后还会继续接收
+    // 迟到的 IP 并重绘那一行**。
     let mut ip = IP_READY.try_take();
     if ip.is_none() {
-        log::info!("[lcd] 尚未收到 IP，最多等 3 秒");
-        Timer::after(Duration::from_secs(3)).await;
-        ip = IP_READY.try_take();
+        log::info!("[lcd] 尚未收到 IP，最多等 30 秒（连 WiFi 通常要 5~20 秒）");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while ip.is_none()
+            && Instant::now() < deadline
+            && !SETUP_MODE.load(core::sync::atomic::Ordering::Relaxed)
+        {
+            Timer::after(Duration::from_millis(200)).await;
+            ip = IP_READY.try_take();
+        }
     }
     log::info!(
         "[lcd] 结束等待 IP：{}",
         if ip.is_some() {
             "已拿到"
+        } else if SETUP_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+            "进配网模式"
         } else {
-            "超时，显示 no wifi"
+            "30 秒超时，先显示 no wifi（后面拿到会自己更新）"
         }
     );
 
@@ -206,6 +219,24 @@ pub async fn display_task(
     let mut phase = 0u8;
 
     loop {
+        // 迟到的 IP：WiFi 连上后 main 才 signal，这里取到就重绘那一行。
+        // 没有这段的话，开机时没等到 IP 就永久停在 "no wifi"。
+        if let Some(new_ip) = IP_READY.try_take() {
+            Rectangle::new(Point::new(0, 18), Size::new(LCD_WIDTH as u32, 14))
+                .into_styled(PrimitiveStyle::with_fill(BG))
+                .draw(&mut display)
+                .ok();
+            Text::with_baseline(
+                new_ip.as_str(),
+                Point::new(8, 20),
+                addr_style,
+                Baseline::Top,
+            )
+            .draw(&mut display)
+            .ok();
+            log::info!("[lcd] IP 更新为 {}", new_ip.as_str());
+        }
+
         // 温度变了单独重绘右上角那一小块，不动整屏（避免闪）
         let t = crate::soc_temp::last();
         if t != last_temp {
@@ -457,7 +488,7 @@ where
     };
 
     row("SSID", "ESP32-VOICE", 104, FG);
-    row("Pass", "voice1234", 144, FG);
+    row("Pass", "none (open)", 144, FG);
     row("Web", "192.168.4.1", 184, ACCENT);
 }
 
