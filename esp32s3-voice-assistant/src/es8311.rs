@@ -15,7 +15,7 @@
 // mute_dac / set_mic_gain_db 是预留的调参接口（实测麦克风电平不合适时用）
 #![allow(dead_code)]
 
-use esp_hal::i2c::master::I2c;
+use embedded_hal::i2c::I2c;
 
 // ============ 寄存器地址 ============
 const REG_RESET: u8 = 0x00;
@@ -80,13 +80,18 @@ const SYS10_LINESEL_SHIFT: u8 = 4;
 /// 0dB 对应 0xBF（-95.5dB + 191×0.5dB = 0dB，见 TLV 表）
 const VOL_0DB: u8 = 0xBF;
 
-pub struct Es8311<'d> {
-    i2c: I2c<'d, esp_hal::Blocking>,
+/// ES8311 驱动。
+///
+/// `I2C` 是**泛型**而不是写死 `esp_hal::i2c::master::I2c`，因为这块板上
+/// codec / IMU / 触摸芯片共用同一条 I2C 总线，需要塞进
+/// `embedded_hal_bus::i2c::RefCellDevice` 里共享。
+pub struct Es8311<I2C> {
+    i2c: I2C,
     addr: u8,
 }
 
-impl<'d> Es8311<'d> {
-    pub fn new(i2c: I2c<'d, esp_hal::Blocking>, addr: u8) -> Self {
+impl<I2C: I2c> Es8311<I2C> {
+    pub fn new(i2c: I2C, addr: u8) -> Self {
         Self { i2c, addr }
     }
 
