@@ -114,6 +114,125 @@ KOKORO_SPEED = float(os.environ.get("KOKORO_SPEED", "1.0"))
 EDGE_VOICE = os.environ.get("EDGE_VOICE", "zh-CN-XiaoxiaoNeural")
 EDGE_PROXY = os.environ.get("EDGE_PROXY", "")
 
+# ============================================================================
+# 运行时可改配置 —— 设备网页下发的优先，.env 只是兜底
+# ============================================================================
+#
+# 为什么要这一层：设备端现在有网页配置界面，用户在手机上填完 WiFi、
+# DeepSeek key、语音 key 就存进 flash 并随 WS hello 一起下发。
+# 如果网关还用启动时读的 .env，那就变成"改一次 key 要重启两边"，
+# 网页配置的意义就没了。
+#
+# 规则：
+#   - 设备下发的字段为空 → 用 .env 的值（用户没填就沿用旧配置）
+#   - 设备下发的字段非空 → 覆盖
+#   - 只有 ASR/TTS 的**调用链**变了才重建后端实例（重建 = 重新加载模型，很慢）
+RUNTIME = {
+    "llm_backend": "",
+    "llm_key": "",
+    "llm_model": "",
+    "llm_base": "",
+    "asr_chain": "",
+    "asr_key": "",
+    "asr_model": "",
+    "tts_chain": "",
+    "tts_voice": "",
+}
+
+
+def llm_backend() -> str:
+    return RUNTIME["llm_backend"] or LLM_BACKEND
+
+
+def llm_key() -> str:
+    if RUNTIME["llm_key"]:
+        return RUNTIME["llm_key"]
+    return SF_KEY if llm_backend() == "siliconflow" else DS_KEY
+
+
+def llm_model() -> str:
+    if RUNTIME["llm_model"]:
+        return RUNTIME["llm_model"]
+    return SF_LLM_MODEL if llm_backend() == "siliconflow" else DS_MODEL
+
+
+def llm_base() -> str:
+    if RUNTIME["llm_base"]:
+        return RUNTIME["llm_base"]
+    return SF_BASE if llm_backend() == "siliconflow" else DS_BASE
+
+
+def voice_key() -> str:
+    """ASR 和 TTS 共用一把硅基流动 key"""
+    return RUNTIME["asr_key"] or SF_KEY
+
+
+def voice_model() -> str:
+    return RUNTIME["asr_model"] or SF_ASR_MODEL
+
+
+def voice_tts() -> str:
+    return RUNTIME["tts_voice"] or SF_TTS_VOICE
+
+
+def asr_chain_list() -> list:
+    s = RUNTIME["asr_chain"]
+    return [x.strip() for x in s.split(",") if x.strip()] if s else ASR_CHAIN
+
+
+def tts_chain_list() -> list:
+    s = RUNTIME["tts_chain"]
+    return [x.strip() for x in s.split(",") if x.strip()] if s else TTS_CHAIN
+
+
+def apply_device_config(cfg) -> bool:
+    """合入设备下发的配置，返回是否需要重建 ASR/TTS 后端链。"""
+    if not isinstance(cfg, dict):
+        return False
+    changed_chain = False
+
+    llm = cfg.get("llm")
+    if isinstance(llm, dict):
+        for src, dst in (("backend", "llm_backend"), ("key", "llm_key"),
+                         ("model", "llm_model"), ("base", "llm_base")):
+            v = str(llm.get(src) or "").strip()
+            if v:
+                RUNTIME[dst] = v
+
+    asr = cfg.get("asr")
+    if isinstance(asr, dict):
+        v = str(asr.get("chain") or "").strip()
+        if v:
+            if v != (RUNTIME["asr_chain"] or ",".join(ASR_CHAIN)):
+                changed_chain = True
+            RUNTIME["asr_chain"] = v
+        for src, dst in (("key", "asr_key"), ("model", "asr_model")):
+            v2 = str(asr.get(src) or "").strip()
+            if v2:
+                RUNTIME[dst] = v2
+
+    tts = cfg.get("tts")
+    if isinstance(tts, dict):
+        v = str(tts.get("chain") or "").strip()
+        if v:
+            if v != (RUNTIME["tts_chain"] or ",".join(TTS_CHAIN)):
+                changed_chain = True
+            RUNTIME["tts_chain"] = v
+        v2 = str(tts.get("voice") or "").strip()
+        if v2:
+            RUNTIME["tts_voice"] = v2
+
+    return changed_chain
+
+
+def print_runtime_config(prefix="[cfg]"):
+    def mask(k):
+        return (k[:8] + "…") if k else "未设置"
+    print(f"{prefix} LLM  = {llm_backend()} / {llm_model()}  key={mask(llm_key())}")
+    print(f"{prefix} ASR  = {' → '.join(asr_chain_list())}  key={mask(voice_key())}")
+    print(f"{prefix} TTS  = {' → '.join(tts_chain_list())}  voice={voice_tts()}")
+
+
 # ---- 唤醒词 ----
 WAKE_WORDS = ["你好小智", "小智小智", "嗨小智", "嘿小智", "小智"]
 # 同音兜底：ASR 很容易把「小智」听成「小芝 / 小志 / 晓智」，
@@ -235,18 +354,20 @@ class SiliconFlowAsr(AsrBackend):
     name = "siliconflow/SenseVoiceSmall"
 
     def __init__(self):
-        self.available = bool(SF_KEY)
+        # available 在每次调用时实时判断，这样网页改了 key 立刻生效
+        self.available = True
 
     async def transcribe(self, http, pcm):
-        if not SF_KEY:
+        key = voice_key()
+        if not key:
             return ""
         form = aiohttp.FormData()
         form.add_field("file", pcm_to_wav(pcm), filename="a.wav", content_type="audio/wav")
-        form.add_field("model", SF_ASR_MODEL)
+        form.add_field("model", voice_model())
         try:
             async with http.post(
                 f"{SF_BASE}/audio/transcriptions", data=form,
-                headers={"Authorization": f"Bearer {SF_KEY}"},
+                headers={"Authorization": f"Bearer {key}"},
                 timeout=aiohttp.ClientTimeout(total=20),
             ) as r:
                 if r.status != 200:
@@ -402,22 +523,23 @@ class SiliconFlowTts(TtsBackend):
     name = "siliconflow/CosyVoice2"
 
     def __init__(self):
-        self.available = bool(SF_KEY)
+        self.available = True
 
     async def synth(self, http, text):
-        if not SF_KEY:
-            raise RuntimeError("没配 SILICONFLOW_API_KEY")
+        key = voice_key()
+        if not key:
+            raise RuntimeError("还没配语音 key（网页配置里填，或 .env 里的 SILICONFLOW_API_KEY）")
         async with http.post(
             f"{SF_BASE}/audio/speech",
             json={
                 "model": SF_TTS_MODEL,
-                "voice": SF_TTS_VOICE,
+                "voice": voice_tts(),
                 "input": text,
                 "response_format": "pcm",
                 "sample_rate": SAMPLE_RATE,
                 "speed": 1.0,
             },
-            headers={"Authorization": f"Bearer {SF_KEY}", "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             timeout=aiohttp.ClientTimeout(total=40),
         ) as r:
             if r.status != 200:
@@ -558,14 +680,19 @@ class TtsChain:
 # ============================================================================
 
 async def chat(http: aiohttp.ClientSession, messages: list) -> str:
-    if LLM_BACKEND == "deepseek":
-        if not DS_KEY:
-            return "还没配置 DEEPSEEK_API_KEY。"
-        url, key, model = f"{DS_BASE}/chat/completions", DS_KEY, DS_MODEL
+    backend = llm_backend()
+    key = llm_key()
+    model = llm_model()
+    base = llm_base()
+
+    if backend == "deepseek":
+        if not key:
+            return "还没配置 DeepSeek 的 API Key。"
     else:
-        if not SF_KEY:
-            return "还没配置 SILICONFLOW_API_KEY。"
-        url, key, model = f"{SF_BASE}/chat/completions", SF_KEY, SF_LLM_MODEL
+        if not key:
+            return "还没配置硅基流动的 API Key。"
+
+    url = f"{base}/chat/completions"
 
     try:
         async with http.post(
@@ -705,8 +832,8 @@ def build_backends():
         "kokoro": KokoroTts,
         "edge": EdgeTts,
     }
-    asr = AsrChain([asr_map[n]() for n in ASR_CHAIN if n in asr_map])
-    chain = TtsChain([tts_map[n]() for n in TTS_CHAIN if n in tts_map])
+    asr = AsrChain([asr_map[n]() for n in asr_chain_list() if n in asr_map])
+    chain = TtsChain([tts_map[n]() for n in tts_chain_list() if n in tts_map])
     return asr, chain
 
 
@@ -717,11 +844,24 @@ async def device_handler(ws, asr, tts):
 
     async with aiohttp.ClientSession() as http:
         async def handle_json(raw: str):
+            nonlocal asr, tts
             try:
                 j = json.loads(raw)
             except Exception:
                 return
             if j.get("type") == "hello":
+                # 设备网页里配的东西随 hello 一起下发。这是让"改完 key 立刻能用"
+                # 成立的关键：否则用户得去改这台机器的 .env 再重启网关。
+                cfg = j.get("config")
+                if isinstance(cfg, dict):
+                    need_rebuild = apply_device_config(cfg)
+                    print_runtime_config("[cfg] 设备下发")
+                    if need_rebuild:
+                        print("[cfg] 调用链有变化，重建 ASR/TTS 后端")
+                        try:
+                            asr, tts = build_backends()
+                        except Exception as e:
+                            print(f"[cfg] 重建失败，沿用旧后端: {e}")
                 print(f"[hello] {j.get('format')} {j.get('sample_rate')}Hz "
                       f"{j.get('channels')}ch {j.get('frame_ms')}ms")
                 await send_json(ws, {

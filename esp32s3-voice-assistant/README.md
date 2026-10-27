@@ -26,9 +26,11 @@ esp32s3-voice-assistant/
 │   ├── audio.rs      I2S 全双工 + 能量 VAD + 播放队列
 │   ├── ws.rs         手写 WebSocket 客户端（握手 + 帧编解码）
 │   ├── json.rs       极简 JSON 取值器（替代 serde，省几十 KB）
+│   ├── store.rs      配置持久化（flash 0x9000，TLV 格式）
+│   ├── web.rs        网页配置界面（AP 192.168.4.1 + 局域网 IP）
 │   ├── sensors.rs    I2C 扫描 + QMI8658 IMU + 电容触摸
 │   ├── sdcard.rs     TF 卡（SD 卡的 SPI 兼容模式）
-│   └── display.rs    ST7789 240x240 状态表情
+│   └── display.rs    ST7789 240x240 状态表情 + 兔子开机画面
 └── server/
     ├── gateway.py         网关主程序（ASR/TTS 都是可插拔 + 自动降级）
     ├── .env.example       配置模板
@@ -41,15 +43,45 @@ esp32s3-voice-assistant/
 
 ---
 
-## 一、设备端配置
+## 一、设备端配置（网页配网，不用改代码）
 
-**`src/config.rs`** — 必须改，否则连不上：
+固件烧进去之后，**所有配置都在网页里填**，不用再改代码重烧。
 
-```rust
-pub const WIFI_SSID: &str = "你家的WiFi名";        // 必须 2.4GHz
-pub const WIFI_PASSWORD: &str = "WiFi密码";
-pub const GATEWAY_HOST: &str = "192.168.88.160";   // 上位机的局域网 IP
-```
+### 1. 连设备热点
+
+上电后设备同时开热点和连家里 WiFi（APSTA 并存）：
+
+| 项 | 值 |
+|---|---|
+| 热点名 | `ESP32-VOICE` |
+| 密码 | `voice1234` |
+| 配置页 | <http://192.168.4.1> |
+
+手机连上热点，浏览器打开 `192.168.4.1`，安卓会自动弹「登录到此网络」，点一下就能进。
+
+连上家里 WiFi 之后，**在同一个局域网的电脑/手机上也能打开配置页**（地址是屏幕第二行显示的 IP）。
+
+### 2. 页面里填这些
+
+| 分组 | 字段 | 说明 |
+|---|---|---|
+| 家庭网络 | WiFi 名称 / 密码 | 必须是 **2.4GHz**，5G 连不上 |
+| 语音网关 | 地址 / 端口 | 跑 `gateway.py` 那台机器的局域网 IP，`ipconfig` 看 |
+| 大模型 | 服务商 / Key / 模型 / 接口地址 | 默认 DeepSeek；换硅基流动把这个下拉框换掉即可 |
+| 语音识别 | 优先级 / Key / 模型 | 「自动」= 先本地 sherpa-onnx，失败转云端 |
+| 语音合成 | 优先级 / 音色 | 云端音质好但要 key；Piper 本地免费 |
+| 设备热点 | 名称 / 密码 | 改完要重连新热点 |
+
+**API Key 不回显**：填过的 key 页面里看不到（只显示「已设置」），留空表示不修改。想清空就点页面底部的「恢复出厂设置」。
+
+保存后设备自动重启，约 10 秒生效。
+
+### 3. 配置存在哪
+
+flash 的 `0x9000`（默认分区表里的 nvs 区，裸机固件不用 NVS），带 MAGIC + 校验和。
+**`cargo run` 重烧固件不会丢配置** —— espflash 只擦 app 分区和 otadata。只有 `espflash erase-flash` 或网页「恢复出厂」才会清掉。
+
+### 4. 引脚
 
 **`src/board.rs`** — 引脚。**已按卖家提供的 GPIO 表逐项落定**（2026-10-27），
 不再是早期那套猜测值。完整引脚表、和旧版的差异、strapping 脚注意事项

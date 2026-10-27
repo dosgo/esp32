@@ -1,17 +1,14 @@
-//! 运行配置 —— 烧固件前先改这里
+//! 编译期常量 —— 只有设备名还留在这里
+//!
+//! **WiFi 账号密码、网关地址、AI/语音的 key 已经全部移到 flash 里了**
+//! （见 `store.rs`），通过网页配置，不用再改代码重烧。
+//!
+//! 配网步骤：
+//!   1. 手机连热点 `ESP32-VOICE`（密码 `voice1234`）
+//!   2. 浏览器打开 http://192.168.4.1
+//!   3. 填 WiFi、网关 IP、API key，保存
+//!
+//! 想知道网关 IP：在跑 `gateway.py` 的电脑上 `ipconfig` 看 IPv4 地址。
 
-/// 家里的 Wi-Fi 名称（2.4GHz，ESP32-S3 不支持 5GHz）
-pub const WIFI_SSID: &str = "YOUR_WIFI_SSID";
-/// Wi-Fi 密码
-pub const WIFI_PASSWORD: &str = "YOUR_WIFI_PASSWORD";
-
-/// 语音网关的地址。
-///
-/// 网关跑在你的电脑上（`server/gateway.py`），所以要填电脑的局域网 IP。
-/// 电脑上 `ipconfig` 看 IPv4 地址，比如 192.168.88.160。
-/// ESP32 和电脑必须在同一个网段，否则连不上。
-pub const GATEWAY_HOST: &str = "192.168.88.160";
-pub const GATEWAY_PORT: u16 = 8765;
-
-/// 设备名，会在网关日志里显示
+/// 设备名，会在网关日志和 WebSocket 握手里出现
 pub const DEVICE_NAME: &str = "esp32s3-voice";
