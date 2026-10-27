@@ -40,12 +40,15 @@ mod es8311;
 mod json;
 mod sdcard;
 mod sensors;
+mod soc_temp;
+mod store;
+mod web;
 mod ws;
 
 use core::cell::RefCell;
 
 use embassy_executor::Spawner;
-use embassy_net::{Config as NetConfig, Runner, StackResources};
+use embassy_net::{Config as NetConfig, Ipv4Cidr, Runner, StackResources, StaticConfigV4};
 use embassy_time::{Duration, Timer};
 use embedded_hal_bus::i2c::RefCellDevice;
 use esp_hal::{
@@ -57,14 +60,19 @@ use esp_hal::{
     time::Rate,
     timer::timg::TimerGroup,
 };
+use esp_hal_dhcp_server::{
+    run_dhcp_server, simple_leaser::SimpleDhcpLeaser, structs::DhcpServerConfig,
+    Ipv4Addr as DhcpIp,
+};
 use esp_println::println;
 use esp_radio::wifi::{
-    sta::StationConfig, AuthenticationMethodConfig, Config as WifiConfig, ControllerConfig,
-    Interface, Password, Ssid,
+    ap::AccessPointConfig, sta::StationConfig, AuthenticationMethodConfig, Config as WifiConfig,
+    ControllerConfig, Interface, Password, Ssid,
 };
+use esp_storage::FlashStorage;
 
 use crate::audio::{State, MIC_CH, SPK_CH};
-use crate::config::{DEVICE_NAME, GATEWAY_HOST, GATEWAY_PORT, WIFI_PASSWORD, WIFI_SSID};
+use crate::config::DEVICE_NAME;
 use crate::es8311::Es8311;
 use crate::ws::WsConn;
 
@@ -95,6 +103,24 @@ async fn main(spawner: Spawner) -> ! {
 
     // PSRAM 挂进全局堆（esp-radio 内部走 malloc_internal，拿不到 PSRAM）
     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
+
+    // ---------------- 0. 从 flash 读配置 ----------------
+    // WiFi 账号、网关地址、各家 API key 全在这里。没配过就是空的，
+    // 下面会进配网模式，只开热点等手机来填。
+    web::load_into_memory(FlashStorage::new(peripherals.FLASH).multicore_auto_park()).await;
+    let boot_cfg = web::snapshot().await;
+    println!(
+        "[cfg] 网关={}:{}  LLM={}/{}  WiFi={}",
+        boot_cfg.gw_host_or_default(),
+        boot_cfg.gw_port,
+        boot_cfg.llm_backend_or_default(),
+        boot_cfg.llm_model_or_default(),
+        if boot_cfg.wifi_set() {
+            boot_cfg.wifi_ssid.as_str()
+        } else {
+            "<未配置，进配网模式>"
+        },
+    );
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
@@ -202,18 +228,44 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(audio::speaker_task(i2s_tx).expect("speaker_task"));
     spawner.spawn(audio::mic_task(i2s_rx).expect("mic_task"));
 
-    // ---------------- 3. Wi-Fi ----------------
-    let ssid = Ssid::try_from(WIFI_SSID).unwrap_or_else(|_| Ssid::try_from("fallback").unwrap());
-    let sta = StationConfig::default()
-        .with_ssid(ssid)
-        .with_authentication(match Password::try_from(WIFI_PASSWORD) {
-            Ok(pw) => AuthenticationMethodConfig::Wpa2Personal(pw),
-            Err(_) => AuthenticationMethodConfig::Open,
-        });
+    // ---------------- 3. 屏幕（Wi-Fi 之前就点上）----------------
+    // 放在这里而不是 Wi-Fi 之后，是为了开机画面能尽早出现：
+    // 连 Wi-Fi 通常要 2~5 秒，屏幕要是等连上再初始化，这段时间就是黑屏。
+    spawner.spawn(
+        display::display_task(
+            peripherals.SPI2,
+            unsafe { AnyPin::steal(board::PIN_LCD_SCLK) },
+            unsafe { AnyPin::steal(board::PIN_LCD_MOSI) },
+            unsafe { AnyPin::steal(board::PIN_LCD_CS) },
+            unsafe { AnyPin::steal(board::PIN_LCD_DC) },
+            unsafe { AnyPin::steal(board::PIN_LCD_RST) },
+            unsafe { AnyPin::steal(board::PIN_LCD_BL) },
+        )
+        .expect("display_task"),
+    );
+
+    // ---------------- 4. Wi-Fi：AP + STA 并存 ----------------
+    //
+    // 两个坑，都是实测撞出来的（见 power-key-next 的注释）：
+    //
+    // 坑1：`StationConfig::default()` 的认证方式是 Wpa2Personal。没配过网时
+    //      SSID 和密码都是空，`esp_wifi_set_config(WIFI_IF_STA)` 会返回
+    //      ESP_ERR_WIFI_PASSWORD，init 直接失败。所以没配网时要用**占位 STA**
+    //      （假 SSID + Open），而不是留空。
+    //
+    // 坑2：模式从 AP 变 APSTA 会让射频 stop/start，热点瞬断，正在提交配网表单的
+    //      手机就被掐了。所以**开机就是 APSTA**，模式全程不变。
+    let ap_cfg = ap_config(&boot_cfg);
+    let sta_cfg = if boot_cfg.wifi_set() {
+        sta_config(boot_cfg.wifi_ssid.as_str(), boot_cfg.wifi_pass.as_str())
+    } else {
+        placeholder_sta()
+    };
 
     let mut controller = match esp_radio::wifi::WifiController::new(
         peripherals.WIFI,
-        ControllerConfig::default().with_initial_config(WifiConfig::Station(sta)),
+        ControllerConfig::default()
+            .with_initial_config(WifiConfig::AccessPointStation(sta_cfg, ap_cfg)),
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -224,22 +276,103 @@ async fn main(spawner: Spawner) -> ! {
         }
     };
 
-    let sta_iface = Interface::station();
     let rng = Rng::new();
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
+    let seed2 = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xA5A5_5A5A;
 
-    let (stack, runner) = embassy_net::new(
-        sta_iface,
-        NetConfig::dhcpv4(Default::default()),
-        mk_static!(StackResources<6>, StackResources::<6>::new()),
+    // ---- 热点侧：自己做网关，地址固定 192.168.4.1 ----
+    let (ap_stack, ap_runner) = embassy_net::new(
+        Interface::access_point(),
+        NetConfig::ipv4_static(StaticConfigV4 {
+            address: Ipv4Cidr::new(store::AP_IP, 24),
+            gateway: None,
+            dns_servers: heapless::Vec::new(),
+        }),
+        mk_static!(StackResources<8>, StackResources::<8>::new()),
         seed,
     );
-    spawner.spawn(net_task(runner).expect("net_task"));
+    spawner.spawn(net_task(ap_runner).expect("ap net task"));
 
-    println!("[wifi] 连接 {WIFI_SSID} …");
-    match controller.connect_async().await {
-        Ok(_) => println!("[wifi] 已连上"),
-        Err(e) => println!("[wifi] 连接失败: {e:?}"),
+    // ---- 联网侧：DHCP 拿地址，语音流量走这条 ----
+    let (stack, runner) = embassy_net::new(
+        Interface::station(),
+        NetConfig::dhcpv4(Default::default()),
+        mk_static!(StackResources<8>, StackResources::<8>::new()),
+        seed2,
+    );
+    spawner.spawn(net_task(runner).expect("sta net task"));
+
+    // ---- 配网服务：两个网各起一份，热点侧和局域网侧都能打开配置页 ----
+    //
+    // 缓冲放 PSRAM，不放 BSS：4 条 TcpSocket 缓冲 + 请求/页面缓冲加起来
+    // 二十多 KB，直接 `mk_static!` 会把内部 RAM 的 BSS 撑爆，链接器报
+    // `stack.x:13 cannot move location counter backwards`（栈没地方放了）。
+    spawner.spawn(
+        web::web_task(
+            ap_stack,
+            "AP",
+            alloc_psram_buf(2048),
+            alloc_psram_buf(2048),
+            alloc_psram_buf(web::MAX_REQ),
+            alloc_psram_buf(web::PAGE_BUF),
+        )
+        .expect("web ap"),
+    );
+    spawner.spawn(
+        web::web_task(
+            stack,
+            "STA",
+            alloc_psram_buf(2048),
+            alloc_psram_buf(2048),
+            alloc_psram_buf(web::MAX_REQ),
+            alloc_psram_buf(web::PAGE_BUF),
+        )
+        .expect("web sta"),
+    );
+
+    // 热点侧必须自带 DHCP，否则手机连上会"无互联网"然后自动断开
+    spawner.spawn(dhcp_task(ap_stack).expect("dhcp"));
+
+    println!(
+        "[wifi] 热点已开：{} / {}  →  http://{}",
+        boot_cfg.ap_ssid_or_default(),
+        if boot_cfg.ap_pass_or_default().is_empty() {
+            "开放"
+        } else {
+            boot_cfg.ap_pass_or_default()
+        },
+        store::AP_IP,
+    );
+
+    // ---- 连家里 WiFi ----
+    let mut connected = false;
+    if boot_cfg.wifi_set() {
+        for attempt in 1..=3u8 {
+            println!(
+                "[wifi] 连接 {}（第 {attempt} 次）…",
+                boot_cfg.wifi_ssid.as_str()
+            );
+            if controller.connect_async().await.is_ok() {
+                connected = true;
+                break;
+            }
+            Timer::after(Duration::from_secs(5)).await;
+        }
+    }
+
+    // 没配网 / 连不上：进配网模式。热点、网页、屏幕都照常工作，
+    // 只是不去连网关 —— 用户改完配置保存后设备会自己重启。
+    if !connected {
+        println!("[wifi] 进入配网模式，屏幕显示热点地址");
+        let mut ap_ip_text: heapless::String<16> = heapless::String::new();
+        {
+            use core::fmt::Write;
+            let _ = write!(ap_ip_text, "{}", store::AP_IP);
+        }
+        display::IP_READY.signal(ap_ip_text);
+        loop {
+            Timer::after(Duration::from_secs(3600)).await;
+        }
     }
 
     stack.wait_config_up().await;
@@ -250,20 +383,8 @@ async fn main(spawner: Spawner) -> ! {
         let _ = write!(ip_text, "{}", cfg.address);
     }
 
-    // ---------------- 4. 屏幕 ----------------
-    spawner.spawn(
-        display::display_task(
-            peripherals.SPI2,
-            unsafe { AnyPin::steal(board::PIN_LCD_SCLK) },
-            unsafe { AnyPin::steal(board::PIN_LCD_MOSI) },
-            unsafe { AnyPin::steal(board::PIN_LCD_CS) },
-            unsafe { AnyPin::steal(board::PIN_LCD_DC) },
-            unsafe { AnyPin::steal(board::PIN_LCD_RST) },
-            unsafe { AnyPin::steal(board::PIN_LCD_BL) },
-            ip_text,
-        )
-        .expect("display_task"),
-    );
+    // 通知屏幕：IP 到手了，可以从开机画面切到状态页
+    display::IP_READY.signal(ip_text);
 
     // ---------------- 4.5 TF 卡 ----------------
     // SD 卡用 SPI 兼容模式（CLK16/CMD15/D0_17/D3_14），原因见 sdcard.rs 顶部。
@@ -328,9 +449,19 @@ async fn sensors_task(bus: RefCell<I2c<'static, esp_hal::Blocking>>) {
     }
 
     // ---- 轮询 ----
-    // IMU 每 8 拍（2 秒）打一行，避免刷屏；触摸有按下就报。
+    // IMU 每 8 拍（2 秒）打一行，避免刷屏；触摸有按下就报；温度每 8 拍读一次。
     let mut tick: u32 = 0;
     loop {
+        if tick % 8 == 0 {
+            // 片上温度。读一次要等 ADC 转换完成，放在这里而不是屏幕任务里，
+            // 是因为屏幕任务的重绘节奏不该被传感器时序绑住。
+            if let Some(t) = soc_temp::refresh() {
+                if tick % 16 == 0 {
+                    println!("[temp] 芯片 {}°C", t);
+                }
+            }
+        }
+
         if imu_ok {
             if let Ok(m) = imu.read() {
                 if tick % 8 == 0 {
@@ -347,6 +478,100 @@ async fn sensors_task(bus: RefCell<I2c<'static, esp_hal::Blocking>>) {
         }
         tick = tick.wrapping_add(1);
         Timer::after(Duration::from_millis(250)).await;
+    }
+}
+
+/// 从 PSRAM 分配一块缓冲，失败退回内部堆。
+///
+/// 网页任务的 socket 缓冲和页面缓冲都走这里。直接放 BSS 的话，
+/// 内部 RAM 会被撑爆 —— 链接器报 `cannot move location counter backwards`，
+/// 意思是栈的位置被 BSS 顶穿了。S3R8 有 8MB PSRAM，不用白不用。
+fn alloc_psram_buf(len: usize) -> &'static mut [u8] {
+    unsafe {
+        let layout = core::alloc::Layout::from_size_align_unchecked(len, 4);
+        let mut p = esp_alloc::HEAP.alloc_caps(esp_alloc::MemoryCapability::External.into(), layout);
+        if p.is_null() {
+            p = esp_alloc::HEAP.alloc_caps(esp_alloc::MemoryCapability::Internal.into(), layout);
+        }
+        assert!(!p.is_null(), "网页缓冲分配失败");
+        let s = core::slice::from_raw_parts_mut(p, len);
+        s.fill(0);
+        s
+    }
+}
+
+/// 转 SSID。esp-radio 1.0 把 SSID 换成了强类型，只能 TryFrom；/// 超 32 字节会失败。这里绝不 unwrap —— no_std 里 panic 就是整机死机，
+/// 而输入来自网页表单。
+fn to_ssid(s: &str, fallback: &'static str) -> Ssid {
+    Ssid::try_from(s).unwrap_or_else(|_| Ssid::try_from(fallback).unwrap())
+}
+
+/// 热点配置。名字/密码来自 flash，没配过用出厂值。
+fn ap_config(c: &store::Config) -> AccessPointConfig {
+    let base = AccessPointConfig::default()
+        .with_ssid(to_ssid(
+            c.ap_ssid_or_default(),
+            store::DEFAULT_AP_SSID,
+        ))
+        .with_max_connections(4);
+    let pass = c.ap_pass_or_default();
+    if pass.is_empty() {
+        // 开放网络不能带认证，否则 esp_wifi 报参数错误
+        base
+    } else {
+        match Password::try_from(pass) {
+            Ok(pw) => base.with_authentication(AuthenticationMethodConfig::Wpa2Personal(pw)),
+            // 长度不在 8~63：降级成开放网络，总比起不来强
+            Err(_) => base,
+        }
+    }
+}
+
+/// STA 配置。空密码必须按 Open 处理，否则 init 直接失败。
+fn sta_config(ssid: &str, pass: &str) -> StationConfig {
+    let sta = StationConfig::default().with_ssid(to_ssid(ssid, "esp32-idle"));
+    if pass.is_empty() {
+        sta.with_authentication(AuthenticationMethodConfig::Open)
+    } else {
+        match Password::try_from(pass) {
+            Ok(pw) => sta.with_authentication(AuthenticationMethodConfig::Wpa2Personal(pw)),
+            Err(_) => sta.with_authentication(AuthenticationMethodConfig::Open),
+        }
+    }
+}
+
+/// 没配网时用的假 STA：APSTA 模式下 STA 必须有个合法配置，否则 init 失败。
+/// 别改成留空，也别指望它会连上。
+fn placeholder_sta() -> StationConfig {
+    StationConfig::default()
+        .with_ssid(to_ssid("esp32-idle", "esp32-idle"))
+        .with_authentication(AuthenticationMethodConfig::Open)
+}
+
+/// 热点侧 DHCP + 假 DNS，否则手机连上会"无互联网"然后自动断开
+#[embassy_executor::task]
+async fn dhcp_task(stack: embassy_net::Stack<'static>) {
+    static GATEWAYS: [DhcpIp; 1] = [DhcpIp::new(192, 168, 4, 1)];
+    static DNS: [DhcpIp; 1] = [DhcpIp::new(192, 168, 4, 1)];
+
+    let config = DhcpServerConfig {
+        ip: DhcpIp::new(192, 168, 4, 1),
+        lease_time: Duration::from_secs(3600),
+        gateways: &GATEWAYS,
+        subnet: Some(DhcpIp::new(255, 255, 255, 0)),
+        dns: &DNS,
+        // 让安卓弹"登录到此网络"，点一下就能打开配置页
+        use_captive_portal: true,
+    };
+    let mut leaser = SimpleDhcpLeaser {
+        start: DhcpIp::new(192, 168, 4, 2),
+        end: DhcpIp::new(192, 168, 4, 10),
+        leases: heapless::Vec::new(),
+    };
+
+    log::info!("[dhcp] 分配 192.168.4.2 ~ 192.168.4.10");
+    if let Err(e) = run_dhcp_server(stack, config, &mut leaser).await {
+        log::error!("[dhcp] 退出: {e:?}");
     }
 }
 
@@ -371,20 +596,53 @@ async fn ws_loop(stack: embassy_net::Stack<'static>) -> ! {
 }
 
 async fn run_session(stack: embassy_net::Stack<'static>) -> Result<(), &'static str> {
-    let ip = ws::parse_ipv4(GATEWAY_HOST).ok_or("GATEWAY_HOST 不是合法的 IPv4（见 config.rs）")?;
+    // 网关地址和 AI 配置都是运行时从 flash 读的，改配置不用重烧固件
+    let cfg = web::snapshot().await;
+    let gw_host = cfg.gw_host_or_default();
+    let gw_port = cfg.gw_port;
+
+    let ip = ws::parse_ipv4(gw_host).ok_or("网关地址不是合法 IPv4（去网页配置里填）")?;
 
     let mut host = heapless::String::<32>::new();
     {
         use core::fmt::Write;
-        let _ = write!(host, "{GATEWAY_HOST}:{GATEWAY_PORT}");
+        let _ = write!(host, "{gw_host}:{gw_port}");
     }
 
-    log::info!("[ws] 连接 {}:{} …", GATEWAY_HOST, GATEWAY_PORT);
-    let mut c = WsConn::connect(stack, ip, GATEWAY_PORT, "/", DEVICE_NAME, host.as_str()).await?;
+    log::info!("[ws] 连接 {gw_host}:{gw_port} …");
+    let mut c = WsConn::connect(stack, ip, gw_port, "/", DEVICE_NAME, host.as_str()).await?;
     log::info!("[ws] 握手完成");
 
-    // hello：告诉网关我们的音频格式
-    c.send_text(r#"{"type":"hello","version":1,"format":"pcm","sample_rate":16000,"channels":1,"bits":16,"frame_ms":60}"#)
+    // hello：音频格式 + 全部 AI / 语音配置。
+    //
+    // 把 key 也下发给网关，是为了让「网页改完 key 就能用」——
+    // 否则还得去改网关的 .env 再重启。网关那边以这条消息为准，
+    // .env 只作兜底（老固件不带 config 字段时用）。
+    let mut hello = heapless::String::<1024>::new();
+    {
+        use core::fmt::Write;
+        let _ = write!(
+            hello,
+            concat!(
+                r#"{{"type":"hello","version":2,"format":"pcm","sample_rate":16000,"#,
+                r#""channels":1,"bits":16,"frame_ms":60,"config":{{"#,
+                r#""llm":{{"backend":"{llm_backend}","key":"{llm_key}","model":"{llm_model}","base":"{llm_base}"}},"#,
+                r#""asr":{{"chain":"{asr_chain}","key":"{asr_key}","model":"{asr_model}"}},"#,
+                r#""tts":{{"chain":"{tts_chain}","voice":"{tts_voice}"}}#,
+                r#"}}}}"#
+            ),
+            llm_backend = cfg.llm_backend_or_default(),
+            llm_key = cfg.llm_key.as_str(),
+            llm_model = cfg.llm_model_or_default(),
+            llm_base = cfg.llm_base_or_default(),
+            asr_chain = cfg.asr_chain_or_default(),
+            asr_key = cfg.asr_key.as_str(),
+            asr_model = cfg.asr_model_or_default(),
+            tts_chain = cfg.tts_chain_or_default(),
+            tts_voice = cfg.tts_voice_or_default(),
+        );
+    }
+    c.send_text(hello.as_str())
         .await
         .map_err(|_| "hello 发送失败")?;
 

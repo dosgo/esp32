@@ -49,6 +49,11 @@ esp-backtrace = { version = "0.20.0", features = [
 ] }
 esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32s3"] }
 esp-hal = { version = "1.2.2", features = ["esp32s3", "unstable"] }
+# 网页配置存 flash（0x9000 nvs 区），掉电不丢、重烧不丢
+esp-storage = { version = "0.10.0", features = ["esp32s3", "embedded-storage"] }
+embedded-storage = "0.3.1"
+# 热点侧要自己跑 DHCP，否则手机连上会显示"无互联网"然后自动断开
+esp-hal-dhcp-server = "0.4.3"
 esp-println = { version = "0.18.0", features = ["esp32s3", "log-04"] }
 esp-radio = { version = "1.0.0-beta.1", features = [
     "esp32s3",
@@ -61,6 +66,9 @@ static_cell = "2.1.1"
 log = "0.4.34"
 # WebSocket 握手要 SHA1(Sec-WebSocket-Key + GUID)，纯 no_std
 sha1 = { version = "0.11", default-features = false }
+# 直接点 SENS 寄存器读片上温度：esp-hal 1.2.2 的 tsens 模块不带 S3。
+# 版本必须跟 esp-radio 1.0-beta.1 内部用的一致（0.37），否则寄存器类型对不上。
+esp32s3 = "0.37"
 
 # ---- 1.54" ST7789 240x240 屏 ----
 mipidsi = { version = "0.10", default-features = false }

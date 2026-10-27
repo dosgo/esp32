@@ -396,6 +396,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "edge-dhcp"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7a6f957c944e22c2c1904618863702e8af302953454ac738e6df0c7038c4d88"
+dependencies = [
+ "edge-raw",
+ "heapless 0.9.3",
+ "num_enum",
+ "rand_core 0.10.1",
+]
+
+[[package]]
+name = "edge-raw"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c87c23c2a56d22076013bbf039425369d05bdb9ac833e3249c48008a46e1f95c"
+
+[[package]]
 name = "embassy-embedded-hal"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -895,6 +913,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "esp-hal-dhcp-server"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7979ddfe1c71713329eecb9c6317d52a85152bbf6325fb1e3baacc6ea6af6084"
+dependencies = [
+ "edge-dhcp",
+ "embassy-futures",
+ "embassy-net",
+ "embassy-sync 0.8.0",
+ "embassy-time",
+ "heapless 0.9.3",
+ "log",
+]
+
+[[package]]
 name = "esp-hal-procmacros"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1046,6 +1079,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ef0e785f54e316f64a1e14a7a2f061a2ea0b038b284902ca71e1e1f5574cf47"
 dependencies = [
  "document-features",
+ "embedded-storage",
  "esp-hal",
  "esp-hal-procmacros",
  "esp-metadata-generated",
@@ -1190,13 +1224,17 @@ dependencies = [
  "embedded-hal-bus",
  "embedded-io-async 0.7.0",
  "embedded-sdmmc",
+ "embedded-storage",
  "esp-alloc",
  "esp-backtrace",
  "esp-bootloader-esp-idf",
  "esp-hal",
+ "esp-hal-dhcp-server",
  "esp-println",
  "esp-radio",
  "esp-rtos",
+ "esp-storage",
+ "esp32s3 0.37.0",
  "heapless 0.9.3",
  "log",
  "mipidsi",
@@ -1563,6 +1601,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "num_enum"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d0bca838442ec211fa11de3a8b0e0e8f3a4522575b5c4c06ed722e005036f26"
+dependencies = [
+ "num_enum_derive",
+ "rustversion",
+]
+
+[[package]]
+name = "num_enum_derive"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
