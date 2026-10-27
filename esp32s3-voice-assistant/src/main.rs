@@ -397,6 +397,16 @@ async fn main(spawner: Spawner) -> ! {
         println!("[wifi] 发射功率已提到 19.5dBm");
     }
 
+    // 【2026-10-28 回退】之前在这里关掉了 modem sleep（PowerSaveMode::None），
+    // 理由是它会让 DHCP/ARP 偶发超时。但实测关掉之后反而更糟：ARP 能通、
+    // ICMP 和 TCP 的 SYN-ACK 却完全不被处理（网关停在 SynReceived），
+    // 也就是「射频能收广播帧，但上层收不到定向帧」。
+    //
+    // 说明在 esp-radio 1.0-beta 里改这个省电模式会让射频状态不一致。
+    // 先恢复默认，稳定性优先。
+    //
+    // if let Err(e) = controller.set_power_saving(esp_radio::wifi::PowerSaveMode::None) { ... }
+
     let rng = Rng::new();
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
     let seed2 = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xA5A5_5A5A;
@@ -892,15 +902,16 @@ async fn run_session(stack: embassy_net::Stack<'static>) -> Result<(), &'static 
         // ---- 0. 应用层心跳 ----
         //
         // 设备在待机（Idle）状态下**一个字节都不往外发**，整条 TCP 连接是
-        // 纯空闲的。有两个东西会因此把连接回收掉：
-        //   · smoltcp 的 socket timeout（按最后一次发送计时，原来设 10 秒）
-        //   · 手机热点的 NAT 表（空闲条目会被清）
-        // 断开之后用户完全无感，只是下次开口前要先等 3 秒自动重连。
+        // 纯空闲的，很容易被 NAT / socket timeout 回收，所以要有心跳。
         //
-        // 实测：网关每 5 秒发一次 WS 控制帧 ping，设备就是不回 pong
-        // （设备端 send() 的错误被 `let _ =` 吞了，查不出来），
-        // 所以干脆不用 WS 控制帧，改成自己发一个文本帧，网关忽略即可。
-        if last_hb.elapsed() >= Duration::from_secs(8) {
+        // 【关键】只在**不上传音频**的时候发。正在 Listening 上传时本来就
+        // 有持续流量，不需要心跳；这时候插一条心跳进去反而有害 ——
+        // TCP 发送缓冲只有几 KB，音频一挤就满，心跳的 write_all 就会阻塞，
+        // 把整个发送任务卡死。实测现象：设备传了整整 8 秒（一个心跳周期）
+        // 之后突然一条数据都不再发，也不报错。
+        if audio::state() != audio::State::Listening
+            && last_hb.elapsed() >= Duration::from_secs(8)
+        {
             c.send_text(r#"{"type":"hb"}"#)
                 .await
                 .map_err(|_| "心跳发送失败")?;
@@ -921,32 +932,18 @@ async fn run_session(stack: embassy_net::Stack<'static>) -> Result<(), &'static 
 
         // ---- 1. 把录音队列发出去 ----
         //
-        // 合并成一批再发。每帧单独 send 一次的话，一次 `await` 就要等一轮
-        // TCP 写完成，WiFi 稍慢就积压；队列一满，mic_task 立刻开始丢最旧帧，
-        // 上行音频就被切成「一帧有声、两三帧静音」的碎片（实测 ASR 只认得出
-        // 一个字）。两帧合一个 WS 消息，写入次数和协议开销都砍一半。
+        // 【不要再做「多帧合并成一批」的优化】
+        //
+        // 试过在栈上开 `[0u8; FRAME_BYTES * 2]` 把两帧合成一个 WS 消息发，
+        // 结果设备启动跑一阵就彻底卡死、串口零输出 —— ws_task 的栈装不下
+        // 这 2KB 的数组，直接栈溢出。embassy 任务的栈是静态分配的，
+        // 想加大得改 task 宏的 pool_size，不值得为一个发送次数的小优化去冒这个险。
         //
         // 只有 Listening 状态才上传；其它状态把队列清空，免得重连后发旧声音。
-        if audio::state() == State::Listening {
-            let mut batch = [0u8; board::FRAME_BYTES * 2];
-            let mut blen = 0usize;
-            while let Ok(f) = MIC_CH.try_receive() {
-                if blen + f.len() > batch.len() {
-                    c.send_binary(&batch[..blen])
-                        .await
-                        .map_err(|_| "上行发送失败")?;
-                    blen = 0;
-                }
-                batch[blen..blen + f.len()].copy_from_slice(&f);
-                blen += f.len();
+        while let Ok(f) = MIC_CH.try_receive() {
+            if audio::state() == State::Listening {
+                c.send_binary(&f).await.map_err(|_| "上行发送失败")?;
             }
-            if blen > 0 {
-                c.send_binary(&batch[..blen])
-                    .await
-                    .map_err(|_| "上行发送失败")?;
-            }
-        } else {
-            while MIC_CH.try_receive().is_ok() {}
         }
 
         // ---- 2. 读 20ms ----

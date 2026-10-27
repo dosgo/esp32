@@ -324,14 +324,23 @@ AWAKE_TIMEOUT_S = 90
 # ============================================================================
 
 def rms(pcm: bytes) -> int:
-    n = len(pcm) // 2
-    if n == 0:
+    """一帧 PCM 的 RMS。
+
+    # 为什么用 numpy 而不是 for 循环
+
+    纯 Python 逐样本 `struct.unpack_from` 处理 2048 字节要 1000+ 次函数调用，
+    约 1ms。设备每秒发 31~43 条，看着只占 3%，但这是**在事件循环里同步执行**的：
+    一旦某几帧挤在一起，接收就跟不上，TCP 窗口打满，设备那边的 `write_all`
+    直接阻塞 —— 实测现象就是「设备传了 8 秒音频之后突然不动了」。
+    numpy 版本快两个数量级，这条路径彻底不再是瓶颈。
+    """
+    import numpy as np
+    if len(pcm) < 2:
         return 0
-    total = 0
-    for i in range(0, n * 2, 2):
-        s = struct.unpack_from("<h", pcm, i)[0]
-        total += s * s
-    return int((total / n) ** 0.5)
+    a = np.frombuffer(pcm[: len(pcm) // 2 * 2], dtype="<i2").astype(np.float32)
+    if a.size == 0:
+        return 0
+    return int(np.sqrt((a * a).mean()))
 
 
 def pcm_to_wav(pcm: bytes, rate: int = SAMPLE_RATE) -> bytes:
@@ -358,16 +367,34 @@ def strip_wav_header(data: bytes) -> bytes:
 
 
 def resample(pcm: bytes, src: int, dst: int) -> bytes:
-    """线性插值重采样。语音够用，且不依赖 audioop（3.13 里已被移除）。"""
+    """重采样，用**频域截断**而不是线性插值。
+
+    # 为什么不能用 np.interp
+
+    线性插值只做「按位置取加权平均」，**完全没有抗混叠滤波**。
+    Piper 输出 22.05kHz，降到 16kHz 时 8kHz 以上的能量不会被滤掉，
+    而是折叠回可听频段变成一片沙沙声 —— 听感就是「破音 / 发毛」。
+
+    频域做法直接 rfft 之后把超出新奈奎斯特频率的 bin 丢掉，天然就是
+    砖墙低通，干净得多。TTS 每段只有几秒，一次 rfft 的开销可以忽略。
+    """
     if src == dst or not pcm:
         return pcm
     import numpy as np
-    x = np.frombuffer(pcm, dtype="<i2")
+    x = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
     if x.size == 0:
         return b""
-    n = int(x.size * dst / src)
-    idx = np.linspace(0, x.size - 1, n)
-    y = np.interp(idx, np.arange(x.size), x.astype(np.float32))
+    n_out = int(x.size * dst / src)
+    if n_out < 2:
+        return b""
+
+    spec = np.fft.rfft(x)
+    n_bins = n_out // 2 + 1
+    if n_bins <= spec.size:
+        spec = spec[:n_bins]          # 降采样：砍掉高频，这就是抗混叠
+    else:
+        spec = np.pad(spec, (0, n_bins - spec.size))
+    y = np.fft.irfft(spec, n_out) * (n_out / x.size)
     return y.clip(-32768, 32767).astype("<i2").tobytes()
 
 
@@ -614,7 +641,18 @@ class PiperTts(TtsBackend):
         chunks = list(voice.synthesize(text, syn_config=SynthesisConfig(length_scale=PIPER_LENGTH_SCALE)))
         if not chunks:
             return b""
-        arr = np.concatenate([c.audio_float_array for c in chunks])
+        arr = np.concatenate([c.audio_float_array for c in chunks]).astype(np.float32)
+        # 归一化到 -9dBFS，而不是让它贴着 0dBFS 出去。
+        #
+        # 实测 Piper 输出的峰值是 -0.1dBFS，几乎打满。经 ES8311 的 DAC 再叠
+        # NS4150B 约 24dB 的固定增益，输出必然撞到电源轨 —— 这就是那个
+        # 「一直在破音」的根源，光调 DAC 音量压不住，必须在源头留余量。
+        #
+        # 用「按峰值归一化」而不是固定乘系数：这样每句话的响度是稳定的，
+        # 不会出现长句变小声、短句特别炸的情况。
+        peak = float(np.abs(arr).max())
+        if peak > 1e-6:
+            arr = arr / peak * 0.35
         pcm = (arr * 32767).clip(-32768, 32767).astype("<i2").tobytes()
         # Piper 的 huayan 模型是 22.05kHz，要降到设备端的 16kHz
         return resample(pcm, chunks[0].sample_rate, SAMPLE_RATE)
@@ -1165,6 +1203,10 @@ async def device_handler(ws, asr, tts):
                 return
             # 设备每 8 秒发一次保活心跳，量很大，别让它把日志刷掉
             if j.get("type") == "hb":
+                # 必须**回一个**。设备端有个 30 秒「收不到任何下行数据就判断线」
+                # 的保护（用于网关被强杀后快速恢复），如果这边一声不吭，
+                # 设备会每 30 秒自己断开重连一次 —— 表现为「用着用着突然不吭声」。
+                await send_json(ws, {"type": "pong"})
                 return
             # 排查用：确认文本帧真的到达网关（打印前 40 字符即可）
             print(f"[json] {len(raw)}B 头={raw[:30]!r} 尾={raw[-60:]!r}")
@@ -1256,6 +1298,15 @@ async def device_handler(ws, asr, tts):
 
                     done = (sess.in_speech and sess.silence_ms >= VAD_SILENCE_MS) \
                         or sess.speech_ms >= VAD_MAX_UTTERANCE_MS
+                    # 兜底：buf 超过 6 秒还没触发 done（环境吵、VAD 一直判在说话），
+                    # 直接处理这一段。不设上限的话 buf 会无限增长，ASR 也越来越慢。
+                    #
+                    # 从 10 秒压到 6 秒：原来环境里一点风扇声就能让静音计时永远
+                    # 清零，每句话都要硬等 10 秒才开始识别 —— 用户原话「好慢好慢」。
+                    # 正常情况走不到这条路径（说完 450ms 就该触发），它只是兜底。
+                    if not done and len(sess.buf) > SAMPLE_RATE * 2 * 6:
+                        print("  [vad] 缓冲区超过 6 秒，强制切分")
+                        done = True
                     if done:
                         if not sess.busy:
                             await handle_utterance(ws, sess, http, asr, tts)
