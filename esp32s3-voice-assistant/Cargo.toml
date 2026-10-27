@@ -36,6 +36,11 @@ embassy-net = { version = "0.9.1", features = [
 embassy-sync = "0.8.0"
 embassy-time = { version = "0.5.1", features = ["generic-queue-8"] }
 embedded-io-async = "0.7"
+# 驱动层统一用 embedded-hal 1.0 的 trait，好处是 codec/IMU/触摸能塞进
+# embedded-hal-bus 的共享设备里共用同一条 I2C
+embedded-hal = "1.0"
+# TF 卡：块设备层 + FAT 无关的卡初始化（SPI 模式）
+embedded-sdmmc = "0.10"
 esp-alloc = "0.11.0"
 esp-backtrace = { version = "0.20.0", features = [
     "esp32s3",

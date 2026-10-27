@@ -26,6 +26,8 @@ esp32s3-voice-assistant/
 │   ├── audio.rs      I2S 全双工 + 能量 VAD + 播放队列
 │   ├── ws.rs         手写 WebSocket 客户端（握手 + 帧编解码）
 │   ├── json.rs       极简 JSON 取值器（替代 serde，省几十 KB）
+│   ├── sensors.rs    I2C 扫描 + QMI8658 IMU + 电容触摸
+│   ├── sdcard.rs     TF 卡（SD 卡的 SPI 兼容模式）
 │   └── display.rs    ST7789 240x240 状态表情
 └── server/
     ├── gateway.py         网关主程序（ASR/TTS 都是可插拔 + 自动降级）
@@ -49,9 +51,10 @@ pub const WIFI_PASSWORD: &str = "WiFi密码";
 pub const GATEWAY_HOST: &str = "192.168.88.160";   // 上位机的局域网 IP
 ```
 
-**`src/board.rs`** — 引脚。这块板子不是乐鑫官方板，`board.rs` 里那套是
-「这一类通用 AI 语音板最常见的接法」，**不保证和你手上的一致**。
-核对方法写在文件开头，核心是烧进去看串口 `[i2c] 扫描` 有没有 `0x18`。
+**`src/board.rs`** — 引脚。**已按卖家提供的 GPIO 表逐项落定**（2026-10-27），
+不再是早期那套猜测值。完整引脚表、和旧版的差异、strapping 脚注意事项
+都写在文件开头。烧进去先看串口 `[i2c] 扫描` 那几行：能扫到 `0x18`(ES8311)
+就说明 I2C 对了，扫到的其余地址就是 IMU 和触摸芯片。
 
 ## 二、编译烧录
 

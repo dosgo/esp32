@@ -38,11 +38,16 @@ mod config;
 mod display;
 mod es8311;
 mod json;
+mod sdcard;
+mod sensors;
 mod ws;
+
+use core::cell::RefCell;
 
 use embassy_executor::Spawner;
 use embassy_net::{Config as NetConfig, Runner, StackResources};
 use embassy_time::{Duration, Timer};
+use embedded_hal_bus::i2c::RefCellDevice;
 use esp_hal::{
     clock::CpuClock,
     gpio::AnyPin,
@@ -110,19 +115,41 @@ async fn main(spawner: Spawner) -> ! {
         esp_hal::gpio::OutputConfig::default(),
     );
 
-    // ---------------- 1. ES8311 codec ----------------
+    // ---------------- 1. I2C 总线：codec / IMU / 触摸 三家共用 ----------------
+    // 这块板子的 ES8311、QMI8658、触摸芯片的 SDA/SCL 全是 GPIO42/GPIO41，
+    // 物理上就是同一条总线。所以这里**只建一个 I2c 实例**，
+    // 后面用 RefCellDevice 派生出多个设备句柄。
+    let i2c = I2c::new(
+        peripherals.I2C0,
+        I2cConfig::default().with_frequency(Rate::from_khz(100)),
+    )
+    .expect("I2C 初始化失败")
+    .with_sda(unsafe { AnyPin::steal(board::PIN_I2C_SDA) })
+    .with_scl(unsafe { AnyPin::steal(board::PIN_I2C_SCL) });
+
+    let i2c_bus = RefCell::new(i2c);
+
+    // ---------------- 1.1 扫描总线 ----------------
+    // 这行日志是换板子后**最有价值的一条**：0x18 出现说明 codec 线对了，
+    // 0x6B/0x6A 出现说明 IMU 在，剩下的一个地址就是触摸芯片的型号。
+    {
+        let mut dev = RefCellDevice::new(&i2c_bus);
+        let found = sensors::scan(&mut dev);
+        println!("[i2c] 扫描到 {} 个设备 @ SDA={} SCL={}",
+            found.len(), board::PIN_I2C_SDA, board::PIN_I2C_SCL);
+        if found.is_empty() {
+            println!("[i2c] 一个都没有！SDA/SCL 接反或没有上拉（board.rs 第 6 节）");
+        }
+        for &addr in found.iter() {
+            println!("  [i2c] 0x{addr:02X}  {}", sensors::addr_name(addr));
+        }
+    }
+
+    // ---------------- 1.2 ES8311 codec ----------------
     // 先配 codec 再启 I2S：寄存器写入走 I2C，和 MCLK 无关，
     // 反过来（先启 I2S 再配 codec）容易出现首帧丢字。
     {
-        let i2c = I2c::new(
-            peripherals.I2C0,
-            I2cConfig::default().with_frequency(Rate::from_khz(100)),
-        )
-        .expect("I2C 初始化失败")
-        .with_sda(unsafe { AnyPin::steal(board::PIN_I2C_SDA) })
-        .with_scl(unsafe { AnyPin::steal(board::PIN_I2C_SCL) });
-
-        let mut codec = Es8311::new(i2c, board::ES8311_ADDR);
+        let mut codec = Es8311::new(RefCellDevice::new(&i2c_bus), board::ES8311_ADDR);
 
         match codec.probe() {
             Some(id) => println!("[codec] ES8311 在线，CHIPID=0x{id:02X}"),
@@ -140,6 +167,9 @@ async fn main(spawner: Spawner) -> ! {
             let _ = codec.set_volume(85);
         }
     }
+
+    // ---------------- 1.3 IMU + 触摸（同一个任务轮询）----------------
+    spawner.spawn(sensors_task(i2c_bus).expect("sensors_task"));
 
     // ---------------- 2. I2S 全双工 ----------------
     let i2s = I2s::new(
@@ -235,8 +265,89 @@ async fn main(spawner: Spawner) -> ! {
         .expect("display_task"),
     );
 
+    // ---------------- 4.5 TF 卡 ----------------
+    // SD 卡用 SPI 兼容模式（CLK16/CMD15/D0_17/D3_14），原因见 sdcard.rs 顶部。
+    // 挂卡是阻塞的，没插卡时约 500ms 后放弃 —— 属于可选外设，失败不影响语音链路。
+    match sdcard::SdStorage::mount(
+        peripherals.SPI3,
+        peripherals.GPIO16,
+        peripherals.GPIO15,
+        peripherals.GPIO17,
+        peripherals.GPIO14,
+    ) {
+        Ok(card) if card.blocks() > 0 => {
+            println!("[sd] 就绪 {} MB（{} 块）", card.bytes() / 1024 / 1024, card.blocks())
+        }
+        Ok(_) => println!("[sd] 没插卡，或卡不认（格式化成 FAT32 再试）"),
+        Err(e) => println!("[sd] 挂载失败: {e}"),
+    }
+
     // ---------------- 5. WebSocket 主循环 ----------------
     ws_loop(stack).await
+}
+
+/// IMU + 触摸轮询。
+///
+/// 两者和 codec 共用 GPIO42/41 这条 I2C，所以必须**顺序访问**。
+/// 放在同一个任务里是最省事的做法，也天然避免了总线竞争。
+/// 任一设备探测失败都不影响另一台 —— 都失败就空转。
+#[embassy_executor::task]
+async fn sensors_task(bus: RefCell<I2c<'static, esp_hal::Blocking>>) {
+    use crate::sensors::{Qmi8658, Touch};
+
+    let mut imu = Qmi8658::new(RefCellDevice::new(&bus), board::QMI8658_ADDR);
+    let mut touch = Touch::probe(RefCellDevice::new(&bus));
+
+    // ---- IMU ----
+    let mut imu_ok = false;
+    match imu.probe() {
+        Some(id) => {
+            println!("[imu] @0x{:02X} WHO_AM_I=0x{id:02X}", board::QMI8658_ADDR);
+            if imu.whoami_ok() {
+                // 初始化前先把寄存器打出来，万一配置没生效能对照着看
+                imu.dump_regs();
+                match imu.init() {
+                    Ok(()) => {
+                        println!("[imu] 初始化完成 250Hz ±4g / ±1024dps");
+                        imu_ok = true;
+                    }
+                    Err(_) => println!("[imu] 初始化失败（寄存器写不进去）"),
+                }
+            } else {
+                println!("[imu] WHO_AM_I 不是 0x05，可能不是 QMI8658（跳过）");
+            }
+        }
+        None => println!("[imu] 0x{:02X} 无应答", board::QMI8658_ADDR),
+    }
+
+    // ---- 触摸 ----
+    if touch.is_present() {
+        println!("[touch] {:?} @0x{:02X}", touch.kind(), touch.addr());
+    } else {
+        println!("[touch] 没探测到触摸芯片（RST=47 可能需要先拉低复位，见 touch.rs）");
+    }
+
+    // ---- 轮询 ----
+    // IMU 每 8 拍（2 秒）打一行，避免刷屏；触摸有按下就报。
+    let mut tick: u32 = 0;
+    loop {
+        if imu_ok {
+            if let Ok(m) = imu.read() {
+                if tick % 8 == 0 {
+                    println!(
+                        "[imu] a=({:+.2},{:+.2},{:+.2})g  g=({:+.0},{:+.0},{:+.0})°/s",
+                        m.accel_g[0], m.accel_g[1], m.accel_g[2],
+                        m.gyro_dps[0], m.gyro_dps[1], m.gyro_dps[2],
+                    );
+                }
+            }
+        }
+        if let Some((x, y)) = touch.read_point() {
+            println!("[touch] 按下 ({x}, {y})");
+        }
+        tick = tick.wrapping_add(1);
+        Timer::after(Duration::from_millis(250)).await;
+    }
 }
 
 #[embassy_executor::task]
