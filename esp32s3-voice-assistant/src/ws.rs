@@ -21,7 +21,7 @@
 use embedded_io_async::Write as _;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{IpAddress, Ipv4Address, Stack};
-use embassy_time::{Duration, WithTimeout};
+use embassy_time::{with_timeout, Duration, WithTimeout};
 
 /// `fill` 的两种"失败"：超时是正常节拍，断开要重连
 #[derive(Debug, PartialEq, Eq)]
@@ -58,22 +58,27 @@ impl WsConn {
         let rx = mk_static_buf();
         let tx = mk_static_buf();
         let mut sock = TcpSocket::new(stack, rx, tx);
-        // 【2026-10-28 改】原来是 10 秒，太短了。
-        //
-        // smoltcp 的 timeout 是按「最后一次**发送**数据」算的：设备在待机
-        // （Idle）时一个字节都不往外发，于是连上 10 秒整就被底层 abort，
-        // 表现是设备日志「[ws] 断开: 连接已关闭」+ 网关侧 code=1006，
-        // 用户完全感觉不到，只是每次开口前都要先等 3 秒重连。
-        //
-        // 实测证据：拿一个什么都不做的极简 WS 服务器接设备，精确 10.0 秒断。
-        // 现在放宽到 120 秒，并配合 main.rs 里 8 秒一次的应用层心跳，
-        // 正常情况根本走不到这个超时；它只作为「网关真的死了」的兜底。
+        // socket 自身的超时保持 120 秒（只作为「连上之后对端突然消失」的兜底）。
+        // 注意不要在 connect 成功之后再改这个字段 —— 实测会打乱 smoltcp 的
+        // 状态，导致 SYN-ACK 回来也不回 ACK，连接永远建不起来。
         sock.set_timeout(Some(Duration::from_secs(120)));
         sock.set_keep_alive(Some(Duration::from_secs(20)));
 
-        sock.connect((ip, port))
-            .await
-            .map_err(|_| "TCP 连接失败")?;
+        // 【建连必须加外层超时，这是本次卡死的根因】
+        //
+        // 网络不通时，smoltcp 会对着一个连不上的对端重传 SYN，而它自己的
+        // timeout 是 120 秒。这漫长的两分钟里 WiFi 驱动会一直重传，
+        // 最终把底层射频卡死 —— 而它跑在下面，一死就整机静默：
+        // 串口零输出、不重启、ping 也不通，看起来完全像硬件坏了。
+        //
+        // 用 with_timeout 在外面套 8 秒：超时就放弃这次 socket（它会被 drop
+        // 并释放资源），3 秒后 ws_loop 会重新建立一条干净的连接。
+        // 绝不改 socket 内部的 timeout 字段。
+        match with_timeout(Duration::from_secs(8), sock.connect((ip, port))).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err("TCP 连接失败"),
+            Err(_) => return Err("TCP 连接超时"),
+        }
 
         // ---- 握手 ----
         let key_bytes = rand_key();
@@ -307,6 +312,9 @@ impl WsConn {
 fn mk_static_buf() -> &'static mut [u8] {
     use core::sync::atomic::{AtomicUsize, Ordering};
     const POOL: usize = 4;
+    // 【保持 4096】曾经试过 8192（缓冲池变 32KB），结果静态内存冲到 188KB，
+    // 内部 RAM 被吃穿、设备直接卡死（串口零输出）。实际上行卡顿的真因是
+    // I2S 时钟停振（见 speaker_task），跟这个缓冲大小无关，4KB 足够。
     const SZ: usize = 4096;
 
     static mut POOL_BUF: [[u8; SZ]; POOL] = [[0u8; SZ]; POOL];

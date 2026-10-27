@@ -80,6 +80,17 @@ const SYS10_LINESEL_SHIFT: u8 = 4;
 /// 0dB 对应 0xBF（-95.5dB + 191×0.5dB = 0dB，见 TLV 表）
 const VOL_0DB: u8 = 0xBF;
 
+/// 播放音量取 -9dB = 0xAD（0xBF 往下 18 档 × 0.5dB）。
+///
+/// 【为什么不用 0dB】实测录音里有大量满幅样本（峰值打到 32767/-32768），
+/// 说明信号链已经削顶。0dB 的 DAC 再叠 NS4150B 功放（约 24dB 增益），
+/// 喇叭出来必然是破音 —— 用户的原话是「播放还是波音（破音）」。
+/// 降 9dB 留出约 3 倍余量，主观响度只掉一点点，但削波会彻底消失。
+///
+/// 注意别用 `set_volume(75)`：那个函数是线性映射到 0x00~0xBF，
+/// 75 算出来是 0x8F，相当于 -24dB，声音会小到听不见。
+const DAC_VOL_MINUS_9DB: u8 = 0xAD;
+
 /// ES8311 驱动。
 ///
 /// `I2C` 是**泛型**而不是写死 `esp_hal::i2c::master::I2c`，因为这块板上
@@ -182,7 +193,7 @@ impl<I2C: I2c> Es8311<I2C> {
         // ---- 6. 播放通路 ----
         self.update(REG_SYS8, SYS8_PDN_DAC, 0)?;
         self.update(REG_DAC1, SDP_MUTE, 0)?;
-        self.write_reg(REG_DAC2, VOL_0DB)?;
+        self.write_reg(REG_DAC2, DAC_VOL_MINUS_9DB)?;
         self.update(REG_DAC6, 0, 0x08)?; // EQ bypass
 
         Ok(())

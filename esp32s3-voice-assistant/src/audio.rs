@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
-use embassy_time::{with_timeout, Duration};
+use embassy_time::{with_timeout, Duration, Timer};
 use esp_hal::dma::aligned::DmaAlignedMut;
 use esp_hal::dma::{DmaRxBuf, DmaTxBuf};
 use esp_hal::i2s::master::{I2sRx, I2sTx};
@@ -26,17 +26,17 @@ pub type AudioFrame = heapless::Vec<u8, FRAME_BYTES>;
 
 /// 录音帧：audio_task → ws_task
 ///
-/// 【深度 4 → 16】原来 4 帧（128ms）太浅，ws_task 只要有一帧 `await` 卡在
-/// TCP 写上，队列立刻满，mic_task 就开始「丢最旧帧」—— 实测上行音频变成
-/// 「一帧有声、两三帧静音」的碎块，ASR 只能识别出一个字。
-/// 16 帧（512ms）给网络抖动留足缓冲。固件裁掉 VADNet 后省出约 670KB，
-/// 这 16KB 静态内存完全负担得起。
-pub static MIC_CH: Channel<CriticalSectionRawMutex, AudioFrame, 16> = Channel::new();
-/// 播放帧：ws_task → audio_task
+/// 【深度 4 —— 回退到原始值，别再加】
 ///
-/// 【深度 8 → 12】配合网关侧的水位控制（目标 4 帧），留出更多余量，
-/// 避免 WiFi 抖动时丢帧。
-pub static SPK_CH: Channel<CriticalSectionRawMutex, AudioFrame, 12> = Channel::new();
+/// 这台板子的内部 RAM 非常紧（WiFi + 两个堆 + 网络缓冲已经占掉大半）。
+/// 实测把这里加到 16 帧（16.5KB）、TCP 缓冲加到 8KB×4，BSS 冲到 188KB，
+/// 设备就会出现「启动 → 跑一阵 → 突然卡死，串口一个字都不吐」。
+///
+/// 上行音频断断续续的真因是 I2S 时钟停振（见 speaker_task 的注释），
+/// 不是这个队列太浅。时钟修好之后 4 帧（128ms）完全够用。
+pub static MIC_CH: Channel<CriticalSectionRawMutex, AudioFrame, 4> = Channel::new();
+/// 播放帧：ws_task → audio_task
+pub static SPK_CH: Channel<CriticalSectionRawMutex, AudioFrame, 8> = Channel::new();
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -75,7 +75,12 @@ pub fn set_state(s: State) {
 /// - 其它状态：只读不传（但 DMA 必须一直跑，否则 I2S RX FIFO 溢出会卡死）。
 #[embassy_executor::task]
 pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
-    // DMA 缓冲必须内存对齐，交给 dma_buffers! 宏分配（内部是 static）
+    // DMA 缓冲必须内存对齐，交给 dma_buffers! 宏分配（内部是 static）。
+    //
+    // 【保持单帧 2048B】曾经试过 `I2S_FRAME_BYTES * 2`（一次收 2 帧），
+    // 结果设备连 TCP 握手都完不成（网关侧停在 SynReceived）、mic_task 也
+    // 一条日志都不打 —— 这个改法会破坏 I2S RX/TX 的时钟配合，别再碰。
+    // 音频断续的真正原因在 speaker_task（见那里的注释）。
     let (rx_buf, rx_desc, _, _) = esp_hal::dma_buffers!(I2S_FRAME_BYTES);
     let mut dma = match (DmaAlignedMut::new(rx_desc), DmaAlignedMut::new(rx_buf)) {
         (Ok(d), Ok(b)) => match DmaRxBuf::new(d, b) {
@@ -104,7 +109,19 @@ pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
     //   但推理要缓冲），全都在 WiFi 连接**之前**分配。
     // WiFi 驱动只能用内部 RAM（malloc_internal），握手阶段的加密缓冲
     // 分不出来就会超时 —— 正好是 reason=15。
-    const SR_ENABLE: bool = true;
+    // 【2026-10-28 全部关闭 esp-sr】
+    //
+    // 这台板子的内部 RAM 已经被 BSS（~152KB）+ 网络栈 + 两个堆占满，
+    // 而 AEC 一初始化就要吃掉约 **122KB**。两者一叠加，设备会在启动
+    // 十几秒后彻底卡死：串口一个字都不吐、也不重启、monitor 也读不到，
+    // 看起来像硬件坏了 —— 实际是内存被榨干。
+    //
+    // 现在 VADNet 和 AEC 都用不上：
+    //   · VADNet 会卡在「一直判有人声」，已经把设备永久锁死在 Listening
+    //   · AEC 只用来打印 ERLE，压根没参与链路
+    // 所以整块关掉。真要用语音唤醒/AEC 时，得先想办法把 BSS 降下来
+    // （比如砍网络缓冲、关 web 配置页），再一个一个开回来。
+    const SR_ENABLE: bool = false;
 
     // ---- VADNet ----
     // 加载失败就整个回落到能量 VAD，不影响语音链路能用
@@ -378,15 +395,19 @@ pub async fn speaker_task(mut tx: I2sTx<'static, Async>) {
     let mut buf = [0u8; I2S_FRAME_BYTES];
 
     loop {
-        // 【关键】没有音频时必须补静音帧，不能让 TX 停下来。
+        // 【2026-10-28 回退】这里试过改成 `try_receive()` + 1ms 超时，
+        // 想消除「队列空时白等 32ms、导致 I2S 时钟半停」的问题。
+        // 结果设备在启动 5~16 秒后必定静默卡死（串口零输出、不重启、
+        // monitor 也读不到），说明这个改法在本机上引入了别的问题。
         //
-        // ESP32-S3 的 I2S 是「有 DMA 传输才输出 BCLK/WS」的。一旦 TX 空闲，
-        // BCLK 停振，而 RX 靠 signal_loopback 复用 TX 的时钟 —— 于是麦克风
-        // 也就静默了，现象是"不说话的时候按唤醒没反应"。
-        // 这里用 60ms 超时兜底：有音频就播，没有就送一帧静音维持时钟。
-        let frame = with_timeout(Duration::from_millis(crate::board::FRAME_MS as u64), SPK_CH.receive())
-            .await
-            .ok();
+        // 先退回原样保证可用。下一步要治「时钟半停」得换更稳的思路
+        // （例如给 TX 做双缓冲连续喂数），不能在任务循环里硬改节拍。
+        let frame = with_timeout(
+            Duration::from_millis(crate::board::FRAME_MS as u64),
+            SPK_CH.receive(),
+        )
+        .await
+        .ok();
 
         let samples = match &frame {
             Some(f) => {
@@ -430,6 +451,16 @@ pub async fn speaker_task(mut tx: I2sTx<'static, Async>) {
             Err((_, t, b)) => {
                 tx = t;
                 dma = b;
+                // 【必须 await，不能直接 continue】
+                //
+                // 去掉 32ms 的 with_timeout 之后，这个分支变成「提交失败 →
+                // 立刻重试」的裸循环。`tx.write()` 出错时不会让出 CPU，于是
+                // speaker_task 独占执行器，所有其他任务（包括串口打印、
+                // 网络轮询）全被饿死 —— 现象是设备彻底卡死、串口一个字都不吐，
+                // 看起来像死机，其实是一个不 await 的忙等循环。
+                //
+                // 让出 1ms 既能让 DMA 有机会完成上一次传输，也保证别的任务能跑。
+                Timer::after(Duration::from_millis(1)).await;
                 continue;
             }
         };
