@@ -1301,6 +1301,7 @@ async fn handle_text(c: &mut WsConn, s: &str) -> Result<(), &'static str> {
                     audio::SPK_DROP.store(0, core::sync::atomic::Ordering::Relaxed);
                     audio::SPK_USED_MS.store(0, core::sync::atomic::Ordering::Relaxed);
                     audio::SPK_PEAK.store(0, core::sync::atomic::Ordering::Relaxed);
+                    audio::SPK_WAIT_MS.store(0, core::sync::atomic::Ordering::Relaxed);
                     audio::set_state(State::Speaking);
                 }
                 Some("stop") => {
@@ -1315,10 +1316,13 @@ async fn handle_text(c: &mut WsConn, s: &str) -> Result<(), &'static str> {
                     let played = audio::SPK_PLAYED.load(core::sync::atomic::Ordering::Relaxed);
                     let used = audio::SPK_USED_MS.load(core::sync::atomic::Ordering::Relaxed);
                     log::error!(
-                        "[spk] 帧={played} 丢帧={} 空帧={} 平均周期={}ms 峰值={}",
+                        "[spk] 帧={played} 丢帧={} 空帧={} 平均周期={}ms 其中等DMA={}ms 峰值={}",
                         audio::SPK_DROP.load(core::sync::atomic::Ordering::Relaxed),
                         audio::SPK_EMPTY.load(core::sync::atomic::Ordering::Relaxed),
                         if played > 0 { used / played } else { 0 },
+                        if played > 0 {
+                            audio::SPK_WAIT_MS.load(core::sync::atomic::Ordering::Relaxed) / played
+                        } else { 0 },
                         audio::SPK_PEAK.load(core::sync::atomic::Ordering::Relaxed),
                     );
                     Timer::after(Duration::from_millis(200)).await;

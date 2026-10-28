@@ -68,6 +68,14 @@ pub static SPK_USED_MS: AtomicU32 = AtomicU32::new(0);
 ///   ≈32767 → 数字信号本身已经削顶（网关侧电平给太高 / DAC 音量太大）
 ///   7000~12000 → 数字侧有 >10dB 余量，破音只可能来自丢帧或模拟侧
 pub static SPK_PEAK: AtomicU32 = AtomicU32::new(0);
+/// 单独累计「等 DMA 传输完成」的耗时。
+///
+/// 一圈总共 38ms，而一帧音频只有 32ms。多出来的 6ms 到底花在哪，直接决定
+/// 下一步该改什么：
+///   wait ≈ 32ms  → DMA 正常，那 6ms 是 copy/提交/调度开销（改代码）
+///   wait ≈ 38ms  → DMA 本身就在用 38ms 送 32ms 的音频，说明 I2S 的采样时钟
+///                  比 16kHz 慢 19%，也就是**播放速度/音色都不对**（改时钟）
+pub static SPK_WAIT_MS: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -469,10 +477,25 @@ fn pcm_from_bytes(pcm: &[u8], out: &mut [i16]) -> usize {
     n
 }
 
+/// 【一次 DMA 传输送几帧】
+///
+/// 决定「停顿频率」。实测一次传输固定要花 32ms 音频时间 + 约 6ms 的额外停顿
+/// （`[spk] 平均周期=38ms，其中等DMA=38ms`，而 copy/提交的开销≈0），
+/// 也就是每个传输边界都会空转 6ms —— 这正是「啵啵」和整体拖慢 19% 的来源。
+///
+/// 根因在 esp-hal：`I2sTx::write()` 每次都先调 `reset_tx()` 复位整个 TX 单元，
+/// 然后才启动传输 —— 所以每提交一次就有一次固定的 6ms 空转。这是它一次性
+/// API 的固有代价，只能靠「少提交几次」摊薄：
+///   1 帧/次 → 损失 16%（实测消费 84% 实时）
+///   4 帧/次 → 损失 5~8%（实测 91.8~95.4%）
+///   8 帧/次 → 损失约 2.3%
+const XFER_FRAMES: usize = 8;
+const XFER_BYTES: usize = I2S_FRAME_BYTES * XFER_FRAMES;
+
 /// 播放任务：从 `SPK_CH` 取单声道 PCM，展开成立体声喂 I2S
 #[embassy_executor::task]
 pub async fn speaker_task(mut tx: I2sTx<'static, Async>) {
-    let (_, _, tx_buf, tx_desc) = esp_hal::dma_buffers!(I2S_FRAME_BYTES);
+    let (_, _, tx_buf, tx_desc) = esp_hal::dma_buffers!(XFER_BYTES);
     let mut dma = match (DmaAlignedMut::new(tx_desc), DmaAlignedMut::new(tx_buf)) {
         (Ok(d), Ok(b)) => match DmaTxBuf::new(d, b) {
             Ok(v) => v,
@@ -480,7 +503,7 @@ pub async fn speaker_task(mut tx: I2sTx<'static, Async>) {
         },
         _ => return,
     };
-    let mut buf = [0u8; I2S_FRAME_BYTES];
+    let mut buf = [0u8; XFER_BYTES];
 
     loop {
         // 【I2S 时钟必须连续 —— 这是「超慢 + 破音」的总根因】
@@ -506,22 +529,24 @@ pub async fn speaker_task(mut tx: I2sTx<'static, Async>) {
         // 立即返回，这个循环会变成没有让出点的忙循环，那会饿死整个执行器。
         // 记录起始时刻，循环再快也至少让出 2ms。
         let t_begin = Instant::now();
-        let frame = SPK_CH.try_receive().ok();
-        let _ = frame.is_none() && {
-            // 正在播放（Speaking）却取不到帧 = 队列被抽干，这一帧只能补静音。
-            // 每一次补静音都是一个「有声→静音→有声」的硬跳变，听起来就是咔。
-            if crate::audio::state() == State::Speaking {
-                SPK_EMPTY.fetch_add(1, Ordering::Relaxed);
-            }
-            true
-        };
 
-        if let Some(f) = &frame {
-            // 峰值统计（每帧扫一遍，512 个样本，开销可忽略）
+        // 一次尽量装满 4 帧；不够的部分补静音（提交长度恒定，DMA 不会在边界停振）
+        let mut filled = 0usize;
+        while filled < XFER_FRAMES {
+            let Ok(f) = SPK_CH.try_receive() else { break };
+            let base = filled * I2S_FRAME_BYTES;
+            let n = f.len().min(FRAME_SAMPLES * 2);
+            let samples = n / 2;
             let mut pk = 0u32;
-            let n = f.len() / 2;
-            for i in 0..n {
-                let v = i16::from_le_bytes([f[i * 2], f[i * 2 + 1]]);
+            for i in 0..samples {
+                let lo = f[i * 2];
+                let hi = f[i * 2 + 1];
+                let o = base + i * 4;
+                buf[o] = lo;
+                buf[o + 1] = hi;
+                buf[o + 2] = lo;
+                buf[o + 3] = hi;
+                let v = i16::from_le_bytes([lo, hi]);
                 let a = (v as i32).unsigned_abs();
                 if a > pk {
                     pk = a;
@@ -530,44 +555,41 @@ pub async fn speaker_task(mut tx: I2sTx<'static, Async>) {
             if pk > SPK_PEAK.load(Ordering::Relaxed) {
                 SPK_PEAK.store(pk, Ordering::Relaxed);
             }
-        }
-
-        let samples = match &frame {
-            Some(f) => {
-                // 单声道 → 立体声（左右复制）
-                let n = f.len().min(FRAME_SAMPLES * 2);
-                let samples = n / 2;
-                for i in 0..samples {
-                    let lo = f[i * 2];
-                    let hi = f[i * 2 + 1];
-                    buf[i * 4] = lo;
-                    buf[i * 4 + 1] = hi;
-                    buf[i * 4 + 2] = lo;
-                    buf[i * 4 + 3] = hi;
-                }
-                samples
+            // AEC 参考：代表「这一刻送进 DMA 的样本」
+            if crate::aec::ready() {
+                let mut mono = [0i16; FRAME_SAMPLES];
+                let _ = pcm_from_bytes(&f, &mut mono);
+                crate::aec::push_reference(&mono);
             }
-            None => 0,
-        };
-        // 剩余部分补静音，避免把上一帧的尾巴播出来
-        for b in &mut buf[samples * 4..] {
+            filled += 1;
+        }
+        if filled == 0 && crate::audio::state() == State::Speaking {
+            // 队列被抽干：这一整段只能播静音。每次都是「有声→静音→有声」的硬跳变。
+            SPK_EMPTY.fetch_add(1, Ordering::Relaxed);
+            if crate::aec::ready() {
+                let mono = [0i16; FRAME_SAMPLES];
+                for _ in 0..XFER_FRAMES {
+                    crate::aec::push_reference(&mono);
+                }
+            }
+        }
+        // 没装满的部分补静音
+        for b in &mut buf[filled * I2S_FRAME_BYTES..] {
             *b = 0;
         }
 
-        // ---- AEC 参考信号 ----
-        // 必须在写进 I2S **之前**：参考要代表「这一刻送进 DMA 的东西」。
-        // 没有音频时也要推满一帧静音 —— 写指针一停，参考和麦克风的时间轴
-        // 就错位了，延迟再也对不上。
-        if crate::aec::ready() {
-            let mut mono = [0i16; FRAME_SAMPLES];
-            if let Some(f) = &frame {
-                let _ = pcm_from_bytes(f, &mut mono);
-            }
-            crate::aec::push_reference(&mono);
-        }
-
         dma.as_mut_slice().copy_from_slice(&buf[..]);
-        dma.set_length(I2S_FRAME_BYTES);
+        // 【长度按实际装到的帧数提交，不要恒定 XFER_BYTES】
+        //
+        // 恒定长度的写法在队列不满时会把后面几帧补成静音一起播出去：
+        // 8 帧缓冲下一次能补进 224ms 空白，句子之间会多出一段死寂。
+        // 只有一帧都没取到时才用满长度（那是为了让 I2S 时钟不停振）。
+        let send_bytes = if filled > 0 {
+            filled * I2S_FRAME_BYTES
+        } else {
+            XFER_BYTES
+        };
+        dma.set_length(send_bytes);
 
         let transfer = match tx.write(dma) {
             Ok(t) => t,
@@ -587,7 +609,9 @@ pub async fn speaker_task(mut tx: I2sTx<'static, Async>) {
                 continue;
             }
         };
+        let t_wait = Instant::now();
         let (res, t, b) = transfer.wait_async().await;
+        SPK_WAIT_MS.fetch_add(t_wait.elapsed().as_millis() as u32, Ordering::Relaxed);
         tx = t;
         dma = b;
 
@@ -607,8 +631,9 @@ pub async fn speaker_task(mut tx: I2sTx<'static, Async>) {
         let frame_ms = crate::board::FRAME_MS as u64;
         let used = t_begin.elapsed().as_millis() as u64;
         // 累计耗时，用来算「设备消费音频的实际速度」（时钟漂移的直接证据）
+        // 一次传输 = XFER_FRAMES 帧音频，统计要按帧计
         SPK_USED_MS.fetch_add(used as u32, Ordering::Relaxed);
-        SPK_PLAYED.fetch_add(1, Ordering::Relaxed);
+        SPK_PLAYED.fetch_add(XFER_FRAMES as u32, Ordering::Relaxed);
         // 【只在「明显异常地快」时才补睡】
         //
         // 原来写的是 `if used < frame_ms { sleep(frame_ms - used) }`。
