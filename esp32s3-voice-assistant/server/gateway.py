@@ -278,9 +278,26 @@ def apply_device_config(cfg) -> bool:
             # 不做归一化就会「每次连接都判定链变了」→ 每次重连都重建
             # SenseVoice + Piper（约 6 秒、几百 MB），既慢又让首个回合卡住。
             norm = ",".join(x.strip() for x in v.split(",") if x.strip())
-            if norm != (RUNTIME["asr_chain"] or ",".join(ASR_CHAIN)):
-                changed_chain = True
+            # 【只看「首选」有没有变，别因为「备用链」不同就重建】
+            #
+            # 设备默认下发 "local,local-lite,siliconflow"，和网关 .env 一致；
+            # 但 TTS 那边设备说的是 "piper,siliconflow" 而 .env 是 "piper"，
+            # 只差一个备用项 —— 原来会把整条链丢掉重建，等于把启动时**已经预热好**
+            # 的 Piper（2.5 秒）扔掉，第一轮对话凭空多等 2.5~3 秒（日志实测
+            # 「piper 加载模型 2565ms / 首段出声 3183ms」）。
+            # 首选相同就没必要重建：备用项只是失败时的兜底，用到时各自懒加载。
+            # 【比较「实际生效的首选」，不是字符串的第一个】
+            #
+            # 设备下发的原始串是 "siliconflow,piper"（云端优先），网关 .env 是
+            # "piper"。按字符串比永远不等 → 每次连上都把预热好的模型扔掉重建，
+            # 第一轮对话凭空多等 2.5~3 秒。
+            # 但 siliconflow 没配 key，实际会被排到后面 —— 真正生效的首选两边
+            # 都是 piper。所以拿 `*_chain_list()`（会按可用性排序）的结果比。
+            before = asr_chain_list()
             RUNTIME["asr_chain"] = norm
+            after = asr_chain_list()
+            if (after[0] if after else "") != (before[0] if before else ""):
+                changed_chain = True
         for src, dst in (("key", "asr_key"), ("model", "asr_model")):
             v2 = str(asr.get(src) or "").strip()
             if v2:
@@ -291,9 +308,11 @@ def apply_device_config(cfg) -> bool:
         v = str(tts.get("chain") or "").strip()
         if v:
             norm = ",".join(x.strip() for x in v.split(",") if x.strip())
-            if norm != (RUNTIME["tts_chain"] or ",".join(TTS_CHAIN)):
-                changed_chain = True
+            before = tts_chain_list()
             RUNTIME["tts_chain"] = norm
+            after = tts_chain_list()
+            if (after[0] if after else "") != (before[0] if before else ""):
+                changed_chain = True
         v2 = str(tts.get("voice") or "").strip()
         if v2:
             RUNTIME["tts_voice"] = v2
@@ -1460,6 +1479,17 @@ async def device_handler(ws, asr, tts):
                         print("[cfg] 调用链有变化，重建 ASR/TTS 后端")
                         try:
                             asr, tts = build_backends()
+                            # 新实例的模型是冷的（Piper 第一次合成要 2.5 秒），
+                            # 丢后台预热，别让用户的下一句话替它买单。
+                            async def _warm(t=tts):
+                                try:
+                                    async with aiohttp.ClientSession() as h:
+                                        for b in t.backends:
+                                            if isinstance(b, (PiperTts, KokoroTts)):
+                                                await b.synth(h, "预热")
+                                except Exception:
+                                    pass
+                            asyncio.create_task(_warm())
                         except Exception as e:
                             print(f"[cfg] 重建失败，沿用旧后端: {e}")
                 print(f"[hello] {j.get('format')} {j.get('sample_rate')}Hz "
