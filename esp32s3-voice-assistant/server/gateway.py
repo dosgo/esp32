@@ -274,9 +274,13 @@ def apply_device_config(cfg) -> bool:
     if isinstance(asr, dict):
         v = str(asr.get("chain") or "").strip()
         if v:
-            if v != (RUNTIME["asr_chain"] or ",".join(ASR_CHAIN)):
+            # 规范化再比：设备那边可能带空格（"local, local-lite"），
+            # 不做归一化就会「每次连接都判定链变了」→ 每次重连都重建
+            # SenseVoice + Piper（约 6 秒、几百 MB），既慢又让首个回合卡住。
+            norm = ",".join(x.strip() for x in v.split(",") if x.strip())
+            if norm != (RUNTIME["asr_chain"] or ",".join(ASR_CHAIN)):
                 changed_chain = True
-            RUNTIME["asr_chain"] = v
+            RUNTIME["asr_chain"] = norm
         for src, dst in (("key", "asr_key"), ("model", "asr_model")):
             v2 = str(asr.get(src) or "").strip()
             if v2:
@@ -286,9 +290,10 @@ def apply_device_config(cfg) -> bool:
     if isinstance(tts, dict):
         v = str(tts.get("chain") or "").strip()
         if v:
-            if v != (RUNTIME["tts_chain"] or ",".join(TTS_CHAIN)):
+            norm = ",".join(x.strip() for x in v.split(",") if x.strip())
+            if norm != (RUNTIME["tts_chain"] or ",".join(TTS_CHAIN)):
                 changed_chain = True
-            RUNTIME["tts_chain"] = v
+            RUNTIME["tts_chain"] = norm
         v2 = str(tts.get("voice") or "").strip()
         if v2:
             RUNTIME["tts_voice"] = v2
@@ -395,6 +400,42 @@ def rms(pcm: bytes) -> int:
     if a.size == 0:
         return 0
     return int(np.sqrt((a * a).mean()))
+
+
+# 设备一次 I2S DMA 传输 = 512 个单声道样本（2048B interleaved / 4B 每帧）
+RX_BLOCK_SAMPLES = 512
+
+
+def strip_frame_impulse(pcm: bytes) -> bytes:
+    """抹掉每 512 个样本里的第 1 个「假样本」。
+
+    # 这是什么
+
+    设备每做一次 I2S DMA 传输，第一个样本都是个随机满幅值
+    （8193 / 16383 / 28672 / 32767…），后 511 个才是真声音。
+    证据：把喇叭静音只录麦克风，每个 512 样本块里只有一个样本是 ±32768、
+    其余全部 < 40，块 RMS 恰好 1448 = sqrt(32768²/512) —— 完全由这一个假样本贡献。
+
+    # 为什么必须在这儿撕掉
+
+    它会被当成「声音」：块 RMS 从 25 被抬到 1448（正常说话才 350~1450），
+    于是**静音时 VAD 也判成有人在说话**，`silence_ms` 永远清零、断句永远等不到，
+    只能每 6 秒强制切一刀 —— 用户听到的就是「我话说完它半天不理我」。
+    它同时混在 ASR 的输入里，每 32ms 一个满幅脉冲，识别率必然掉。
+
+    设备固件（src/audio.rs 的 extract_channel）已经修了，这里再兜一层：
+    老固件、以后换实现都能挡住，也能清掉已经录脏的样本。
+    用「复制下一个样本」而不是置 0：置 0 是人为造一个阶跃，同样是咔哒声。
+    """
+    import numpy as np
+    if len(pcm) < 8:
+        return pcm
+    a = np.frombuffer(pcm[: len(pcm) // 2 * 2], dtype="<i2").copy()
+    if a.size > RX_BLOCK_SAMPLES:
+        idx = np.arange(0, a.size, RX_BLOCK_SAMPLES)
+        idx = idx[idx + 1 < a.size]
+        a[idx] = a[idx + 1]
+    return a.astype("<i2").tobytes()
 
 
 def pcm_to_wav(pcm: bytes, rate: int = SAMPLE_RATE) -> bytes:
@@ -1146,8 +1187,16 @@ class PcmSender:
     偏出小半秒。绝对时间轴每帧往后推固定 32ms，抖动不累积。
     """
 
-    TARGET = 4      # 目标水位（帧）= 128ms，足够吸收 WiFi 抖动
-    SAFE_MAX = 7    # 绝不超过队列深度 8，留 1 帧余量
+    # 【4 → 8，2026-10-28】
+    #
+    # 128ms 的水位在这台机器上根本吸不住抖动：Windows 的 asyncio 定时器颗粒度
+    # 是 15.6ms，`sleep(32ms)` 实际落在 31~47ms，再加上 GIL/调度偶发停顿，
+    # 一两百毫秒的空窗很常见。水位只有 4 帧时，一次空窗就把设备队列抽干，
+    # 设备只能补静音 —— 每个接缝一声「啵」。实测一轮 218 帧里空帧 106。
+    #
+    # 抬到 8 帧（256ms）后抖动能被吃掉，代价是首句多等 128ms。
+    TARGET = 8      # 目标水位（帧）= 256ms
+    SAFE_MAX = 22   # 设备那边队列已加深到 24 帧，这里只是水位告警阈值
 
     def __init__(self):
         self.level = 0.0
@@ -1373,7 +1422,8 @@ def build_backends():
 
 async def device_handler(ws, asr, tts):
     peer = ws.remote_address
-    print(f"\n[conn] 设备接入 {peer}")
+    print(f"\n[conn] {time.strftime('%H:%M:%S')} 设备接入 {peer}")
+    t_conn = time.time()
     sess = Session()
 
     async with aiohttp.ClientSession() as http:
@@ -1429,7 +1479,23 @@ async def device_handler(ws, asr, tts):
             # 但 TCP 没发 FIN」的半开连接 —— 现象是 netstat 里挂着一条永远
             # Established 的僵尸连接，设备每次重连都多一条，越积越多。
             # 设备每 8 秒发一次心跳，所以 40 秒什么都收不到就是死了。
+            last_ping_t = 0.0
             while True:
+                # 【下行保活：不管有没有在收音频，每 8 秒都要发一个 ping】
+                #
+                # 设备端有「30 秒收不到任何下行数据就判连接死了、主动断开重连」
+                # 的保护（main.rs 的 last_rx）。而设备在 Listening 状态是**只发不收**
+                # 的：它一直在传麦克风音频，`ws.recv()` 永远不超时，于是下面的
+                # 「超时分支里发 ping」根本轮不到执行 —— last_rx 一直不刷新，
+                # **每 30 秒准时断一次**（会话时长日志正好是 30.1s）。
+                #
+                # 所以 ping 必须独立于「有没有收到东西」来发。
+                if time.time() - last_ping_t >= 8:
+                    try:
+                        await ws.send('{"type":"ping"}')
+                        last_ping_t = time.time()
+                    except Exception:
+                        break
                 try:
                     msg = await asyncio.wait_for(ws.recv(), timeout=10)
                     last_msg_t = time.time()
@@ -1452,6 +1518,10 @@ async def device_handler(ws, asr, tts):
                 if isinstance(msg, bytes):
                     sess.rx_msgs += 1
                     sess.rx_bytes += len(msg)
+                    # 先撕掉 I2S 每帧首样本的假脉冲，再交给 VAD / ASR / 存盘。
+                    # 不撕的话静音帧的 RMS 会被抬到 1448，VAD 永远判「在说话」，
+                    # 断句只能靠 6 秒兜底 —— 这就是「说完半天不理人」的根因。
+                    msg = strip_frame_impulse(msg)
                     # 每秒（约 31 条）打一次，确认上行链路真的在动
                     if sess.rx_msgs % 31 == 0:
                         print(f"  [rx] {sess.rx_msgs} 条 / {sess.rx_bytes/2/SAMPLE_RATE:.1f}s 音频 "
@@ -1488,6 +1558,17 @@ async def device_handler(ws, asr, tts):
                         sess.hot_ms = 0
                         if sess.in_speech:
                             sess.silence_ms += ms
+                        else:
+                            # 还没开始说话（纯静音）：只留最近 400ms 当「起音前回滚」，
+                            # 更早的全丢掉。
+                            #
+                            # 不留就会出事：设备一直在传，buf 6 秒就攒满，触发下面的
+                            # 「缓冲区超过 6 秒，强制切分」，白跑一次 ASR（约 1.5 秒 CPU）
+                            # 而且切出来的整段都是静音 —— 日志里刷屏的
+                            # 「[vad] 一段语音 0.00s / [asr] 空结果」就是它。
+                            keep = SAMPLE_RATE * 2 * 4 // 10      # 400ms 字节数
+                            if len(sess.buf) > keep * 3:
+                                del sess.buf[:-keep]
 
                     done = (sess.in_speech and sess.silence_ms >= VAD_SILENCE_MS) \
                         or sess.speech_ms >= VAD_MAX_UTTERANCE_MS
@@ -1526,7 +1607,8 @@ async def device_handler(ws, asr, tts):
             print(f"[conn] 异常断开 code={e.code} reason={e.reason!r}")
         finally:
             code = getattr(ws, "close_code", None)
-            print(f"[conn] 设备断开 {peer} close_code={code}")
+            print(f"[conn] {time.strftime('%H:%M:%S')} 设备断开 {peer} close_code={code}"
+                  f"  会话时长 {time.time()-t_conn:.1f}s")
 
 
 async def main_server(asr, tts):

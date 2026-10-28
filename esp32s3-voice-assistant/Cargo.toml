@@ -34,7 +34,23 @@ embassy-net = { version = "0.9.1", features = [
     "udp",
 ] }
 embassy-sync = "0.8.0"
-embassy-time = { version = "0.5.1", features = ["generic-queue-8"] }
+# 【定时器队列 8 → 64 —— 这是「卡住但没有任何日志」的总病根】
+#
+# `generic-queue-N` 是整个程序**全局**能同时挂起的定时器数量上限。
+# 原来只有 8 个，而这个项目里同时在跑的定时器远超这个数：
+#   speaker_task  每 32ms 一个 Timer::after（I2S 补帧节拍）
+#   sensors_task  每 250ms
+#   ws_loop       每次 fill() 一个 with_timeout(20ms) + 每 8 秒心跳
+#   display / dhcp / web / 各种 with_timeout
+#
+# 槽位一满，新申请的 Timer 就**永远拿不到**，于是 `Timer::after`、
+# `with_timeout`、`dns_query` 这些全都挂在那里不返回 —— 表现就是
+# 「串口停在某一行、再无输出，但设备没重启、ping 也不通」。
+#
+# 对照实验：新建的 esp32s3-wifi-min 只有 2~3 个定时器，8 个槽位够用，
+# 所以它连百度、连网关 8765 全都一次就通；而语音助手必挂。
+# 64 个槽位的代价只有约 2KB 内存，非常值得。
+embassy-time = { version = "0.5.1", features = ["generic-queue-64"] }
 embedded-io-async = "0.7"
 # 驱动层统一用 embedded-hal 1.0 的 trait，好处是 codec/IMU/触摸能塞进
 # embedded-hal-bus 的共享设备里共用同一条 I2C

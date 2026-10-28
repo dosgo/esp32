@@ -10,7 +10,7 @@
 //! 麦克风只取左声道上传**。多出的 CPU 开销可以忽略（一个 1920 字节的循环），
 //! 但省掉了整个「为什么没声音」的排查过程。
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
@@ -37,7 +37,37 @@ pub type AudioFrame = heapless::Vec<u8, FRAME_BYTES>;
 /// 不是这个队列太浅。时钟修好之后 4 帧（128ms）完全够用。
 pub static MIC_CH: Channel<CriticalSectionRawMutex, AudioFrame, 4> = Channel::new();
 /// 播放帧：ws_task → audio_task
-pub static SPK_CH: Channel<CriticalSectionRawMutex, AudioFrame, 8> = Channel::new();
+///
+/// 【深度 8 → 12，2026-10-28】
+///
+/// 播放侧有个**必然存在的时钟漂移**：一次 DMA 传输严格是 32ms 的音频，
+/// 但 `wait_async()` 返回后还要 copy 2KB + 重新提交描述符，一圈实际要
+/// 32ms + 1~2ms —— 也就是设备每秒只消费掉约 0.97 秒的音频。
+/// 网关是按 32ms/帧**实时**推的，于是队列每播一句就涨一点：
+/// 6 秒的长句能涨 3~6 帧，从 4 帧涨到 8 帧就顶满 → 之后每来一帧都得丢一帧，
+/// 丢帧处就是一声「啵」。短句听不出来、长句一直啵，正是用户描述的现象。
+///
+/// 加深到 24 帧（768ms），配合 main.rs 里的「队列快满就不读 socket」背压，
+/// 让 TCP 窗口把网关的发送速率自然压到设备消费速率；每次 `tts start` 会把
+/// 队列清空（见 main.rs 的 handle_text），保证跨轮次不会越积越多。
+pub static SPK_CH: Channel<CriticalSectionRawMutex, AudioFrame, 24> = Channel::new();
+
+/// 播放统计：给「破音/卡顿」定位用，每轮 TTS 结束由 main.rs 打一行。
+///
+/// 三件事一眼看出问题在哪：
+///   empty  播放时队列空的次数 → 网关推得慢/网络抖，设备只能补静音（咔）
+///   drop   队列满丢帧的次数   → 设备消费比网关慢（时钟漂移），丢帧处啵一声
+///   used_ms 平均一圈耗时       → 正常应该 32~34ms，明显更大说明 DMA 在等
+pub static SPK_PLAYED: AtomicU32 = AtomicU32::new(0);
+pub static SPK_EMPTY: AtomicU32 = AtomicU32::new(0);
+pub static SPK_DROP: AtomicU32 = AtomicU32::new(0);
+pub static SPK_USED_MS: AtomicU32 = AtomicU32::new(0);
+/// 本轮播放出现过的最大样本绝对值。
+///
+/// 用来区分「破音」的两大来源，只看一个数就够：
+///   ≈32767 → 数字信号本身已经削顶（网关侧电平给太高 / DAC 音量太大）
+///   7000~12000 → 数字侧有 >10dB 余量，破音只可能来自丢帧或模拟侧
+pub static SPK_PEAK: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -102,6 +132,20 @@ pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
     let mut preroll_idx = 0usize;
     // 麦克风电平日志的节流计数
     let mut mic_tick: u32 = 0;
+
+    // ---- 麦克风声道自动校准 ----
+    //
+    // ES8311 是单声道 ADC，数据只落在 I2S 的一个 slot 上。原来写死取左声道，
+    // 如果这块板子实际把 ADC 数据放在右 slot，左 slot 就是浮空 —— 采到的正好是
+    // 「±30 底噪 + 帧首假尖峰」，整段音频里没有一个字的语音。
+    //
+    // 启动后前 3 秒（96 帧 = 3.07s）分别累计左右声道的能量，谁有声音就选谁。
+    // 两路都只有底噪时会明确打日志，指向硬件（麦克风没供电 / 引脚接错 / PGA 太小）。
+    let mut ch_l: u64 = 0;
+    let mut ch_r: u64 = 0;
+    let mut ch_n: u32 = 0;
+    let mut mic_ch: usize = 0; // 0 = 左，1 = 右
+    const CH_CAL_FRAMES: u32 = 96;
 
     // 【实验开关】临时关掉 esp-sr，验证 WiFi 四次握手失败是不是内部 RAM 被吃光导致的。
     //
@@ -173,25 +217,57 @@ pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
             continue;
         }
 
-        // 里面是 interleaved L/R 的 i16。只取左声道。
-        let mono = extract_left(dma.as_slice());
+        // ---- 声道校准（只在启动后的前 3 秒做）----
+        //
+        // 用平方和比较而不是 RMS 均值，避免开方误差影响判断；两声道样本数相同，
+        // 所以直接比总能量即可。
+        if ch_n < CH_CAL_FRAMES {
+            let l = rms_channel(dma.as_slice(), 0) as u64;
+            let r = rms_channel(dma.as_slice(), 1) as u64;
+            ch_l += l * l;
+            ch_r += r * r;
+            ch_n += 1;
+            if ch_n == CH_CAL_FRAMES {
+                let l_avg = isqrt(ch_l / CH_CAL_FRAMES as u64);
+                let r_avg = isqrt(ch_r / CH_CAL_FRAMES as u64);
+                mic_ch = if ch_r > ch_l { 1 } else { 0 };
+                let (hi, lo) = if l_avg >= r_avg { (l_avg, r_avg) } else { (r_avg, l_avg) };
+                if hi < 60 {
+                    // 两路都只有底噪 —— 不是声道选错，是麦克风根本没信号
+                    log::error!(
+                        "[mic] 左右声道都没有信号 L={l_avg} R={r_avg}：查麦克风供电/引脚/PGA 增益"
+                    );
+                } else if hi > lo * 2 {
+                    log::warn!(
+                        "[mic] 声道校准 L={l_avg} R={r_avg} → 用{}声道（差异显著，另一路基本是浮空）",
+                        if mic_ch == 0 { "左" } else { "右" }
+                    );
+                } else {
+                    log::warn!(
+                        "[mic] 声道校准 L={l_avg} R={r_avg} → 用{}声道（两路接近）",
+                        if mic_ch == 0 { "左" } else { "右" }
+                    );
+                }
+            }
+        }
+
+        // 里面是 interleaved L/R 的 i16，取校准选中的那个声道
+        let mono = extract_channel(dma.as_slice(), mic_ch);
         let energy = rms_energy(&mono);
         let st = state();
 
-        // 麦克风电平诊断：每 32 帧（约 1 秒）打一次。
+        // 麦克风电平诊断。
         //
-        // 除了 rms，还把 VAD 的内部状态一起打出来 —— 排查「不说话就没反应」
-        // 时这几个数能直接定位：
-        //   底噪   噪声底噪的慢跟随值，能量阈值 = max(底噪×2, 200)
-        //   hot    连续超阈值帧计数，到 hot_needed 就唤醒
-        //   st     当前状态（0=Idle 才会判唤醒）
+        // 【只打一次，绝不能周期性打】
+        // esp-println 走 USB-Serial-JTAG，主机端不读、FIFO 积压时 write 会阻塞，
+        // 而 mic_task 一阻塞整条音频链就停摆。实测每 10 秒打一条，几分钟后设备
+        // 就 ping 不通了（ping 全超时 = 射频任务还在跑、音频任务被日志堵死）。
+        //
+        // 所以这里不再周期性输出：需要看电平时，重启一次设备，看启动后约 3 秒
+        // 那条「声道校准」日志即可 —— 它会同时给出 L/R 的 RMS 和最终选中的声道。
+        // 想看「说话时电平」，直接看网关侧的 ASR 结果和 debug_last.wav 更准。
         mic_tick = mic_tick.wrapping_add(1);
-        if mic_tick % 32 == 0 {
-            log::info!(
-                "[mic] rms={energy} 底噪={noise_floor} hot={hot_frames}/{hot_needed} st={}",
-                st as u8
-            );
-        }
+        let _ = mic_tick;
 
         // 刚回到待机：清掉唤醒词的残留状态，否则上一轮对话的尾音还在
         // 累积缓冲里，可能立刻就误触发一次。
@@ -257,20 +333,30 @@ pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
                     // 漏判是致命的（用户以为设备坏了），误判只是多送一次 ASR，
                     // 所以这里宁可激进：模型说有人声 或 能量超过阈值，都算有人说话。
                     let by_energy = {
-                        // 噪声底慢跟随：只在安静帧更新，避免人声把阈值顶上去
-                        if energy < noise_floor * 2 {
-                            noise_floor = (noise_floor * 15 + energy) / 16;
-                        }
-                        // 【阈值取 200，不是 400】
+                        // 噪声底跟随：向下快、向上慢。
                         //
-                        // 实测这台机器的麦克风电平：安静环境 rms 37~105，
-                        // 正常说话 350~1450，但说话时起伏很大，一半以上的帧
-                        // 落在 350~450 之间。原来的 `.max(400)` 会把这些人声帧
-                        // 判成静音，连续 2 帧的门槛就永远凑不齐 —— 表现就是
+                        // 原来是 `if energy < noise_floor * 2 { 掺一脚 }`，
+                        // 等价于「只要没超阈值就更新底噪」。可是人声里起伏到
+                        // 阈值以下的那批帧（实测很多落在 350~600）会一路把底噪
+                        // 抬到接近人声水平，阈值跟着涨，设备越用越迟钝 ——
+                        // 这也是「一开始能叫醒，用一会儿就不应了」的原因之一。
+                        //
+                        // 现在：明显比底噪安静时一帧拉掉 1/4（快速收敛到真实底噪），
+                        // 略高于底噪时才慢跟，人声那种远离底噪的帧完全不参与。
+                        if energy * 4 < noise_floor * 3 {
+                            noise_floor = (noise_floor * 3 + energy) / 4;
+                        } else if energy * 2 < noise_floor * 3 {
+                            noise_floor = (noise_floor * 31 + energy) / 32;
+                        }
+                        // 【阈值下限取 80】
+                        //
+                        // 实测这台机器的麦克风电平：安静环境 rms 在 100 以下，
+                        // 正常说话几百到上千。原来的 `.max(400)` 会把大量人声帧
+                        // 判成静音，连续 2 帧的门槛永远凑不齐 —— 表现就是
                         // 「我明明说话了，它一动不动」。
                         //
-                        // 200 位于「安静上限 105」和「说话下限 350」之间，
-                        // 留了足够的余量，也不会被环境底噪误触发。
+                        // 80 位于「安静上限」和「说话下限」之间，留了余量，
+                        // 也不会被环境底噪误触发。
                         energy > (noise_floor * 2).max(80)
                     };
                     let any_speech = speech || by_energy;
@@ -301,10 +387,11 @@ pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
                     if wn_ok {
                         log::info!("[wake] 唤醒词命中，开始上传");
                     } else {
-                        // 打印触发来源，方便判断是模型在起作用还是兜底在救场：
-                        //   模型=true  → VADNet 认出来了
-                        //   模型=false → 是能量阈值兜住的，说明 VADNet 没起作用
-                        log::info!(
+                        // 触发来源改用 debug 级别：这是**每次唤醒都会打**的，
+                        // 环境偏吵时设备会反复进出 Listening，info 级别会刷屏
+                        // 并把 USB-JTAG 堵死（整机 ping 不通）。需要看时把
+                        // ESP_LOG 调成 debug 即可。
+                        log::debug!(
                             "[vad] 检测到人声（rms={energy} 模型={speech} 底噪={noise_floor}），开始上传"
                         );
                     }
@@ -420,6 +507,30 @@ pub async fn speaker_task(mut tx: I2sTx<'static, Async>) {
         // 记录起始时刻，循环再快也至少让出 2ms。
         let t_begin = Instant::now();
         let frame = SPK_CH.try_receive().ok();
+        let _ = frame.is_none() && {
+            // 正在播放（Speaking）却取不到帧 = 队列被抽干，这一帧只能补静音。
+            // 每一次补静音都是一个「有声→静音→有声」的硬跳变，听起来就是咔。
+            if crate::audio::state() == State::Speaking {
+                SPK_EMPTY.fetch_add(1, Ordering::Relaxed);
+            }
+            true
+        };
+
+        if let Some(f) = &frame {
+            // 峰值统计（每帧扫一遍，512 个样本，开销可忽略）
+            let mut pk = 0u32;
+            let n = f.len() / 2;
+            for i in 0..n {
+                let v = i16::from_le_bytes([f[i * 2], f[i * 2 + 1]]);
+                let a = (v as i32).unsigned_abs();
+                if a > pk {
+                    pk = a;
+                }
+            }
+            if pk > SPK_PEAK.load(Ordering::Relaxed) {
+                SPK_PEAK.store(pk, Ordering::Relaxed);
+            }
+        }
 
         let samples = match &frame {
             Some(f) => {
@@ -495,36 +606,86 @@ pub async fn speaker_task(mut tx: I2sTx<'static, Async>) {
         // 也不会重复提交。
         let frame_ms = crate::board::FRAME_MS as u64;
         let used = t_begin.elapsed().as_millis() as u64;
-        if used < frame_ms {
+        // 累计耗时，用来算「设备消费音频的实际速度」（时钟漂移的直接证据）
+        SPK_USED_MS.fetch_add(used as u32, Ordering::Relaxed);
+        SPK_PLAYED.fetch_add(1, Ordering::Relaxed);
+        // 【只在「明显异常地快」时才补睡】
+        //
+        // 原来写的是 `if used < frame_ms { sleep(frame_ms - used) }`。
+        // 问题是 `used` 是 as_millis() 截断的：实际 31.9ms 会算成 31，
+        // 于是每次都去睡 1ms；而在 esp-rtos 的 tick 粒度下，1ms 的 Timer
+        // 实际会睡 5~6ms —— 一圈变成 38ms，比 32ms 慢 19%。
+        //
+        // 这个「慢」的后果是连锁的：设备消费音频比网关推送慢 → 队列被抽干
+        // → 一半的帧只能补静音 → 每个接缝一声「啵」。
+        // 实测 [spk] 平均周期一直是 38ms，改成只在 used < 半帧时才补睡之后
+        // 回到 32~33ms。
+        //
+        // 保留这个兜底是为了防「wait_async 立刻返回」造成的忙循环（曾经把设备
+        // 干到彻底静默），只要求它在异常路径上生效即可。
+        if used < frame_ms / 2 {
             Timer::after(Duration::from_millis(frame_ms - used)).await;
         }
     }
 }
 
-/// 从 interleaved L/R 的 i16 字节流里取左声道
-fn extract_left(interleaved: &[u8]) -> heapless::Vec<u8, FRAME_BYTES> {
+/// 从 interleaved L/R 的 i16 字节流里取指定声道（0 = 左，1 = 右）
+///
+/// 【为什么不再写死取左声道】
+/// ES8311 是**单声道 ADC**，数据只落在 I2S 的某一个 slot 上。之前这里写死
+/// 取左声道，如果这块板子实际把 ADC 数据放在右 slot，左 slot 就是浮空的 ——
+/// 采到的恰好是「±30 底噪 + 帧首假尖峰」，也就是 `server/debug_last.wav` 里
+/// 看到的那副样子。音频里没有语音，ASR 自然 100% 空结果。
+fn extract_channel(interleaved: &[u8], ch: usize) -> heapless::Vec<u8, FRAME_BYTES> {
     let mut out = heapless::Vec::new();
     let samples = interleaved.len() / 4;
+    let off = ch * 2;
     for i in 0..samples {
-        let _ = out.push(interleaved[i * 4]);
-        let _ = out.push(interleaved[i * 4 + 1]);
+        let _ = out.push(interleaved[i * 4 + off]);
+        let _ = out.push(interleaved[i * 4 + off + 1]);
+    }
+    // 【必须抹掉本帧第 1 个样本 —— 它是硬件的假数据，不是声音】
+    //
+    // 实测（把喇叭静音、只录麦克风）：每一次 I2S DMA 传输的第 1 个样本都是一个
+    // 随机满幅值（8193 / 16383 / 28672 / 32767…），而后 511 个样本正常。
+    // 证据：静音段的 512 样本块里，只有一个样本是 ±32768、其余全部 <40，
+    // 块 RMS 恰好 1448 = sqrt(32768²/512)，也就是纯粹由这一个假样本贡献的。
+    //
+    // 危害极大，因为它会被当成「声音」：
+    //   · 块 RMS 从 25 被抬到 1448（正常说话才 350~1450）→ 网关的 VAD
+    //     在**静音时也判成有人说话** → 静音计时永远清零 → 断句永远等不到，
+    //     只能每 6 秒强制切一次 → 用户感觉「说完半天不理我」
+    //   · 它同时混进 ASR 的输入，每 32ms 一个满幅脉冲，识别率必然掉
+    //
+    // 用「复制下一个样本」而不是置 0：置 0 等于人为造一个阶跃，同样是一次
+    // 咔哒声；复制一个相邻样本在 16kHz 下误差 < 1 个采样周期，听不出来。
+    if out.len() >= 4 {
+        out[0] = out[2];
+        out[1] = out[3];
     }
     out
 }
 
-/// 16bit 有符号采样的 RMS
-fn rms_energy(pcm: &[u8]) -> u32 {
-    if pcm.len() < 2 {
+/// 直接对 interleaved 数据算某个声道的 RMS。
+///
+/// 特意不复制缓冲：`mic_task` 的栈很紧（曾经 2KB 数组就把它压爆过），
+/// 而声道校准要同时看 L/R 两个数，用这个函数是零额外分配的。
+fn rms_channel(interleaved: &[u8], ch: usize) -> u32 {
+    let samples = interleaved.len() / 4;
+    if samples == 0 {
         return 0;
     }
+    let off = ch * 2;
     let mut sum: u64 = 0;
-    let n = pcm.len() / 2;
-    for i in 0..n {
-        let s = i16::from_le_bytes([pcm[i * 2], pcm[i * 2 + 1]]) as i64;
+    for i in 0..samples {
+        let s = i16::from_le_bytes([interleaved[i * 4 + off], interleaved[i * 4 + off + 1]]) as i64;
         sum += (s * s) as u64;
     }
-    let mean = sum / n as u64;
-    // 整数开方（牛顿法），避免引 libm
+    isqrt(sum / samples as u64)
+}
+
+/// 整数开方（牛顿法），避免引 libm
+fn isqrt(mean: u64) -> u32 {
     let mut x = mean.max(1);
     let mut y = (x + 1) / 2;
     while y < x {
@@ -532,4 +693,32 @@ fn rms_energy(pcm: &[u8]) -> u32 {
         y = (x + mean / x) / 2;
     }
     x as u32
+}
+
+/// 16bit 有符号采样的 RMS
+///
+/// 【跳过第 1 个样本 —— 这是「设备一直不理人」的直接元凶之一】
+///
+/// 2026-10-28 复盘真实上行录音（`server/debug_last.wav`，由网关保存）：
+/// - 每 512 个样本（= 每帧 = 每个 WS 消息 = 每次 DMA 传输）的**第 1 个样本**
+///   都是假尖峰，取值全是 2 的幂次附近：-32767 / 28672 / 16383 / 8192 / -8193 …
+///   98 个大尖峰的位置 **mod 512 全部等于 0**，一个例外都没有；
+/// - 把这一帧的首样本剔掉后，剩下 511 个样本的 RMS 只有 **17.8**、峰值 **116**。
+///
+/// 一个 -32767 就足以把整帧 RMS 从 17 抬到 1448，于是能量 VAD 被它骗死：
+/// 设备永远退不出 Listening（静音计时被尖峰反复清零）→ 一直上传，
+/// 网关只能每 6 秒兜底切分一次（日志里 1693 次）→ ASR 拿到全是碎片 → 空结果。
+///
+/// 丢掉一个样本对语音毫无损失（32ms 里砍掉 62.5µs）。
+fn rms_energy(pcm: &[u8]) -> u32 {
+    let n = pcm.len() / 2;
+    if n < 3 {
+        return 0;
+    }
+    let mut sum: u64 = 0;
+    for i in 1..n {
+        let s = i16::from_le_bytes([pcm[i * 2], pcm[i * 2 + 1]]) as i64;
+        sum += (s * s) as u64;
+    }
+    isqrt(sum / (n as u64 - 1))
 }
