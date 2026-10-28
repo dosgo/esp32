@@ -134,14 +134,19 @@ impl<I2C: I2c> Es8311<I2C> {
     }
 
     /// 完整上电 + 配置。调用前必须先让 ESP32 输出 MCLK/BCLK/WS。
-    pub fn init(&mut self) -> Result<(), ()> {
+    ///
+    /// 失败时返回出错的那一步 —— 之前只返回 `()`，实机上只看到一句
+    /// 「初始化失败」，完全不知道该查哪个寄存器。
+    pub fn init(&mut self) -> Result<(), &'static str> {
         // ---- 1. 软复位 ----
-        self.write_reg(REG_RESET, RESET_RST_ALL)?;
+        self.write_reg(REG_RESET, RESET_RST_ALL)
+            .map_err(|_| "软复位: 写 0x00=0x1F")?;
         esp_rom_delay_ms(20);
-        self.write_reg(REG_RESET, 0x00)?;
+        self.write_reg(REG_RESET, 0x00).map_err(|_| "软复位: 清 0x00")?;
         esp_rom_delay_ms(10);
         // CSM 打开，进入工作态
-        self.write_reg(REG_RESET, RESET_CSM_ON)?;
+        self.write_reg(REG_RESET, RESET_CSM_ON)
+            .map_err(|_| "软复位: 开 CSM (0x00=0x80)")?;
         esp_rom_delay_ms(5);
 
         // ---- 2. 时钟 ----
@@ -150,21 +155,28 @@ impl<I2C: I2c> Es8311<I2C> {
             REG_CLKMGR1,
             0,
             CLK_MCLK_ON | CLK_BCLK_ON | CLK_ADC_ON | CLK_DAC_ON | CLK_ANA_ADC_ON | CLK_ANA_DAC_ON,
-        )?;
+        )
+        .map_err(|_| "时钟: 0x01")?;
         // 16k / 4.096MHz 对应系数表里的 (div=1, mult=1, div_adc_dac=1)，
         // 也就是三个字段全 0，不用算分频
-        self.update(REG_CLKMGR2, 0xFF, 0x00)?;
-        self.update(REG_CLKMGR5, 0xFF, 0x00)?;
+        self.update(REG_CLKMGR2, 0xFF, 0x00)
+            .map_err(|_| "时钟: 0x02")?;
+        self.update(REG_CLKMGR5, 0xFF, 0x00)
+            .map_err(|_| "时钟: 0x05")?;
 
         // ---- 3. 数字音频接口格式 ----
         // 录音方向和播放方向都要设：16bit + I2S，先不静音
-        self.update(REG_SDP_IN, 0xFF, SDP_WL_16 | SDP_FMT_I2S)?;
-        self.update(REG_SDP_OUT, 0xFF, SDP_WL_16 | SDP_FMT_I2S)?;
+        self.update(REG_SDP_IN, 0xFF, SDP_WL_16 | SDP_FMT_I2S)
+            .map_err(|_| "接口格式: 0x09 (ADC)")?;
+        self.update(REG_SDP_OUT, 0xFF, SDP_WL_16 | SDP_FMT_I2S)
+            .map_err(|_| "接口格式: 0x0A (DAC)")?;
 
         // ---- 4. 模拟电源 ----
         // 上电等待时间给最小值，然后一次性把 bias / Vref / VMID 全打开
-        self.write_reg(REG_SYS1, 0x00)?;
-        self.write_reg(REG_SYS2, 0x00)?;
+        self.write_reg(REG_SYS1, 0x00)
+            .map_err(|_| "模拟电源: 0x0B")?;
+        self.write_reg(REG_SYS2, 0x00)
+            .map_err(|_| "模拟电源: 0x0C")?;
         self.update(
             REG_SYS3,
             SYS3_PDN_ANA
@@ -175,26 +187,40 @@ impl<I2C: I2c> Es8311<I2C> {
                 | SYS3_PDN_VREF
                 | SYS3_VMIDSEL_MASK,
             SYS3_VMIDSEL_OP,
-        )?;
+        )
+        .map_err(|_| "模拟电源: 0x0D")?;
         esp_rom_delay_ms(10);
 
         // ---- 5. 麦克风通路 ----
         // PGA 和 ADC 调制器上电
-        self.update(REG_SYS4, SYS4_PDN_PGA | SYS4_PDN_MOD, 0)?;
+        self.update(REG_SYS4, SYS4_PDN_PGA | SYS4_PDN_MOD, 0)
+            .map_err(|_| "麦克风: 0x0E (PGA/MOD 上电)")?;
         // 输入选择：0 = MIC1P/MIC1N 差分（板载模拟麦走这条）
         // PGA 增益 12dB（0x04，步进 3dB）。太大会削顶，太小 ASR 识别率掉
-        self.update(REG_SYS10, SYS10_PGA_GAIN_MASK | (0x03 << SYS10_LINESEL_SHIFT), 0x04)?;
+        self.update(
+            REG_SYS10,
+            SYS10_PGA_GAIN_MASK | (0x03 << SYS10_LINESEL_SHIFT),
+            0x04,
+        )
+        .map_err(|_| "麦克风: 0x14 (增益/输入选择)")?;
         // ADC 数字侧 0dB
-        self.update(REG_ADC2, 0x07, 0x00)?;
-        self.write_reg(REG_ADC3, VOL_0DB)?;
+        self.update(REG_ADC2, 0x07, 0x00)
+            .map_err(|_| "麦克风: 0x16")?;
+        self.write_reg(REG_ADC3, VOL_0DB)
+            .map_err(|_| "麦克风: 0x17")?;
         // 关 ALC（自动增益在近场语音上会抽气），开高通滤掉直流
-        self.update(REG_ADC8, 0, 0x60)?;
+        self.update(REG_ADC8, 0, 0x60)
+            .map_err(|_| "麦克风: 0x1C")?;
 
         // ---- 6. 播放通路 ----
-        self.update(REG_SYS8, SYS8_PDN_DAC, 0)?;
-        self.update(REG_DAC1, SDP_MUTE, 0)?;
-        self.write_reg(REG_DAC2, DAC_VOL_MINUS_9DB)?;
-        self.update(REG_DAC6, 0, 0x08)?; // EQ bypass
+        self.update(REG_SYS8, SYS8_PDN_DAC, 0)
+            .map_err(|_| "播放: 0x12 (DAC 上电)")?;
+        self.update(REG_DAC1, SDP_MUTE, 0)
+            .map_err(|_| "播放: 0x31 (解除静音)")?;
+        self.write_reg(REG_DAC2, DAC_VOL_MINUS_9DB)
+            .map_err(|_| "播放: 0x32 (音量)")?;
+        self.update(REG_DAC6, 0, 0x08)
+            .map_err(|_| "播放: 0x37 (EQ bypass)")?; // EQ bypass
 
         Ok(())
     }

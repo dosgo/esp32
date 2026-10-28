@@ -64,21 +64,27 @@ impl WsConn {
         sock.set_timeout(Some(Duration::from_secs(120)));
         sock.set_keep_alive(Some(Duration::from_secs(20)));
 
-        // 【建连必须加外层超时，这是本次卡死的根因】
+        // 【建连不能套 with_timeout —— 这是「一直卡在 ws_loop 里什么都不打」的根因】
         //
-        // 网络不通时，smoltcp 会对着一个连不上的对端重传 SYN，而它自己的
-        // timeout 是 120 秒。这漫长的两分钟里 WiFi 驱动会一直重传，
-        // 最终把底层射频卡死 —— 而它跑在下面，一死就整机静默：
-        // 串口零输出、不重启、ping 也不通，看起来完全像硬件坏了。
+        // `embassy_time::with_timeout` 内部是 `select(future, Timer)`，
+        // 而这块板子上 select + Timer 的唤醒**不可靠**（主流程那段注释、
+        // 显示页的 Signal+Timer 都踩过同一个坑）。
         //
-        // 用 with_timeout 在外面套 8 秒：超时就放弃这次 socket（它会被 drop
-        // 并释放资源），3 秒后 ws_loop 会重新建立一条干净的连接。
-        // 绝不改 socket 内部的 timeout 字段。
-        match with_timeout(Duration::from_secs(8), sock.connect((ip, port))).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => return Err("TCP 连接失败"),
-            Err(_) => return Err("TCP 连接超时"),
+        // 实测现象：设备连上 WiFi、DHCP 拿到 IP、进入 ws_loop，然后**串口再无
+        // 任何输出** —— 连失败日志都没有，因为整个 with_timeout 就没返回过。
+        //
+        // 对照实验坐实了这一点：新建的 `esp32s3-wifi-min` 用
+        // `set_timeout()` + 裸 `connect().await`（不套 with_timeout），
+        // 连 192.168.88.160:8765 一次就通，连百度 80 连续 8 次全通。
+        //
+        // 所以超时改由 smoltcp 自己管：set_timeout 是「多久没有活动就 abort」，
+        // 完全不依赖 embassy 的 Timer。
+        sock.set_timeout(Some(Duration::from_secs(10)));
+        if sock.connect((ip, port)).await.is_err() {
+            return Err("TCP 连接失败/超时");
         }
+        // 建连成功后恢复成大超时，避免正常收发被误判
+        sock.set_timeout(Some(Duration::from_secs(120)));
 
         // ---- 握手 ----
         let key_bytes = rand_key();
@@ -105,6 +111,19 @@ impl WsConn {
             .map_err(|_| "握手请求发送失败")?;
 
         // ---- 读响应头 ----
+        // 同样不用 with_timeout（理由见上面建连那段）；用 socket 层的超时。
+        //
+        // 【临时收紧到 5 秒，但必须在拿到 101 之后立刻放开】
+        //
+        // smoltcp 的 `set_timeout` **不是「单次读超时」，而是「整条连接空闲多久就
+        // abort」**。这里只为了给握手加个上限才调到 5 秒，如果不恢复，
+        // 连接就会变成「5 秒没有任何字节往来就断」——
+        //
+        // 实测症状：设备待机时一个字节都不发，于是**每 5.0 秒被自己踢一次**，
+        // 网关侧看到 code=1006 异常断开，设备侧看到「连接已关闭」，
+        // 然后 3 秒后重连……一整晚所有「忽然不理人 / 时好时坏」都是这一个 bug。
+        // 会话时长日志能直接印证：不说话的会话 5.0s，传着音频的会话 45.2s。
+        sock.set_timeout(Some(Duration::from_secs(5)));
         let mut resp = [0u8; 512];
         let mut rlen = 0usize;
         loop {
@@ -113,9 +132,7 @@ impl WsConn {
             }
             let got = sock
                 .read(&mut resp[rlen..])
-                .with_timeout(Duration::from_secs(5))
                 .await
-                .map_err(|_| "握手超时")?
                 .map_err(|_| "握手读取失败")?;
             if got == 0 {
                 return Err("服务端关闭连接");
@@ -133,6 +150,11 @@ impl WsConn {
                     acc: [0u8; ACC_SIZE],
                     acc_len: 0,
                 };
+                // 【恢复成正常的大超时】——这才是连接期的值。
+                // 忘了这一行，连接就会在空闲 5 秒后被 smoltcp 自己 abort。
+                // 120 秒只是个「对端已经消失」的兜底：真正判断死链靠
+                // main.rs 里 30 秒收不到任何下行数据主动重连。
+                conn.sock.set_timeout(Some(Duration::from_secs(120)));
                 let take = extra.len().min(ACC_SIZE);
                 conn.acc[..take].copy_from_slice(&extra[..take]);
                 conn.acc_len = take;
@@ -201,6 +223,20 @@ impl WsConn {
 
     pub async fn send_binary(&mut self, p: &[u8]) -> Result<(), ()> {
         self.send(OP_BINARY, p).await
+    }
+
+    /// 发送缓冲还塞得下吗？
+    ///
+    /// 【为什么必须查这个再发】
+    /// 网关那侧只要慢一下（比如收到 hello 后重建 ASR/TTS 后端，要加载
+    /// SenseVoice 1.5s + Piper 4.5s 才能继续读 socket），设备的 TCP 发送缓冲
+    /// 几 KB 很快就满，而 `write_all` 会一直等下去 —— 整个会话循环被卡死，
+    /// 既发不了心跳也读不了下行，最后要么被网关判死、要么自己 30 秒超时断开。
+    /// 实测表现就是「设备刚连上 1 秒就掉，然后疯狂重连」。
+    /// 所以每帧发送前先用这个判一下，塞不进去就丢掉这帧（音频丢一帧无所谓，
+    /// 链路活着更重要）。
+    pub fn can_send(&self) -> bool {
+        self.sock.may_send()
     }
 
     /// 从 socket 再读一些数据进累积缓冲。被取消是安全的（见模块注释）。
@@ -306,27 +342,53 @@ impl WsConn {
 
 /// 拿一块 4KB 的 TCP 缓冲。
 ///
-/// 不能用 `StaticCell::init` —— 它只能写一次，第二次（重连时）会 panic。
-/// 这里用 4 块轮转：同一时刻只会有一个活动连接，轮转一圈回来时
-/// 上一轮的 WsConn 早就 drop 了，不会有两个引用指向同一块。
+/// 【放 PSRAM，把内部 RAM 让给必须内部的东西】
+///
+/// 这块板内部 RAM 堆只有 112KB，而 WiFi 驱动的 DMA 缓冲（static_rx/tx，
+/// 射频直接写）**必须**在内部 RAM，搬不走。所以能搬的就该搬走：
+/// smoltcp 的 socket rx/tx 缓冲只是任务上下文里的内存拷贝，不参与 DMA，
+/// 放 8MB 的 PSRAM 完全安全。
+///
+/// 这里一次性从 PSRAM 分配、之后轮转复用（AtomicPtr 缓存），反复重连不会泄漏。
+/// 注意：**不能每帧现分配现释放** —— 那样会很快把 PSRAM 切碎，
+/// 而且连接期间缓冲的生命周期必须长于 socket。
+///
+/// 分配失败（PSRAM 没起来）时回退内部 RAM，保证还能跑。
+///
+/// 另：`std::alloc` 之外的这条路径绕开了 vendor/esp-alloc 的 malloc 补丁，
+/// 所以不受那个 2KB 阈值影响。
 fn mk_static_buf() -> &'static mut [u8] {
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
     const POOL: usize = 4;
-    // 【保持 4096】曾经试过 8192（缓冲池变 32KB），结果静态内存冲到 188KB，
-    // 内部 RAM 被吃穿、设备直接卡死（串口零输出）。实际上行卡顿的真因是
-    // I2S 时钟停振（见 speaker_task），跟这个缓冲大小无关，4KB 足够。
+    // 【保持 4096】曾经试过 8192（缓冲池变 32KB），静态内存冲到 188KB，
+    // 内部 RAM 被吃穿、设备直接卡死。4KB 足够。
     const SZ: usize = 4096;
 
-    static mut POOL_BUF: [[u8; SZ]; POOL] = [[0u8; SZ]; POOL];
+    static PTRS: [AtomicPtr<u8>; POOL] = [const { AtomicPtr::new(core::ptr::null_mut()) }; POOL];
     static IDX: AtomicUsize = AtomicUsize::new(0);
 
     let i = IDX.fetch_add(1, Ordering::Relaxed) % POOL;
-    // SAFETY: 索引轮转保证同一块缓冲在 4 次调用内不会被重复交出；
-    // 而每次重连的间隔是 3 秒，旧连接一定已经释放。
-    unsafe {
-        let base = core::ptr::addr_of_mut!(POOL_BUF) as *mut u8;
-        core::slice::from_raw_parts_mut(base.add(i * SZ), SZ)
+    let mut p = PTRS[i].load(Ordering::Relaxed);
+
+    if p.is_null() {
+        let layout = unsafe { core::alloc::Layout::from_size_align_unchecked(SZ, 4) };
+        // 优先 PSRAM
+        p = unsafe {
+            esp_alloc::HEAP.alloc_caps(esp_alloc::MemoryCapability::External.into(), layout)
+        };
+        if p.is_null() {
+            // 回退：内部 RAM（至少还能跑）
+            p = unsafe {
+                esp_alloc::HEAP.alloc_caps(esp_alloc::MemoryCapability::Internal.into(), layout)
+            };
+        }
+        if p.is_null() {
+            panic!("TCP 缓冲分配失败（PSRAM 和内部堆都不足）");
+        }
+        PTRS[i].store(p, Ordering::Relaxed);
     }
+
+    unsafe { core::slice::from_raw_parts_mut(p, SZ) }
 }
 
 fn put(dst: &mut [u8], src: &[u8]) -> usize {
