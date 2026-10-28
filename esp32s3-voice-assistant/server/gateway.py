@@ -394,6 +394,12 @@ VAD_MIN_SPEECH_MS = 300
 # 最长一段语音。设 8 秒而不是 15：环境吵的时候 VAD 可能一直判「还在说」，
 # 拖到 15 秒才强制截断，那一段音频已经混了几十句噪音，识别必然失败。
 VAD_MAX_UTTERANCE_MS = 8000
+# 「识别成空，但要给用户回话」的门槛（秒）。低于它保持沉默。
+#
+# 取 0.8s：正常一句话至少这么长。喘气、衣物摩擦、敲桌子这些会让 VAD 判成
+# 说话但识别不出字的声音，一般都在 0.5s 以内 —— 给它们回话会变成机器人
+# 不停地插嘴说「没听清」，反而更烦。
+VAD_ASK_RETRY_S = 0.8
 AWAKE_TIMEOUT_S = 90
 
 
@@ -1363,11 +1369,17 @@ async def handle_utterance(ws, sess, http, asr, tts):
     #
     # 流式路径下 `pending_text` 在收音频的过程中就解完了，这里几乎零成本。
     # 只有识别器没启动/中途出错时才回退到「整段送 AsrChain」。
+    # 统一由这里算「这段语音有多长」：两条路径（流式 / 整段）都要用。
+    #
+    # 注意必须看 **speech_ms（判成「在说话」的累计时长）**，不能看 buf 长度：
+    # buf 里混着设备补发的 pre-roll、开口前的环境噪声、句尾那 450ms 静音，
+    # 长度肯定虚高。用 buf 判断最短语音等于不设门槛 —— 一句 100ms 的碎片
+    # 也会被送去识别，识别器只能吐空结果，用户体感就是「它没反应」。
+    dur_s = sess.speech_ms / 1000.0
     if sess.pending_text is not None:
         text = sess.pending_text
         sess.pending_text = None
-        dur = sess.speech_ms / 1000.0
-        print(f"  [vad] 一段语音 {dur:.2f}s（流式，结果已就绪）")
+        print(f"  [vad] 一段语音 {dur_s:.2f}s（流式，结果已就绪）")
         # 仍然留一份音频，排查音质问题时要看
         try:
             save_wav(HERE / "debug_last.wav", bytes(sess.buf))
@@ -1375,12 +1387,13 @@ async def handle_utterance(ws, sess, http, asr, tts):
             pass
         sess.reset_utterance()
     else:
-        if len(sess.buf) < SAMPLE_RATE * 2 * VAD_MIN_SPEECH_MS // 1000:
+        if sess.speech_ms < VAD_MIN_SPEECH_MS:
+            print(f"  [vad] 忽略碎片 {dur_s:.2f}s（不到 {VAD_MIN_SPEECH_MS}ms，多半是碰桌子/喘气）")
             sess.reset_utterance()
             return
 
         pcm = bytes(sess.buf)
-        print(f"  [vad] 一段语音 {len(pcm)/2/SAMPLE_RATE:.2f}s，送去识别")
+        print(f"  [vad] 一段语音 {dur_s:.2f}s / 缓冲 {len(pcm)/2/SAMPLE_RATE:.2f}s，送去识别")
         # 调试留档：ASR 识别得莫名其妙时，直接拿这个文件看上行音频到底长什么样
         try:
             save_wav(HERE / "debug_last.wav", pcm)
@@ -1395,7 +1408,17 @@ async def handle_utterance(ws, sess, http, asr, tts):
             return
 
     if not text:
-        print("  [asr] 空结果（没在说话 / 音频太短 / 噪声）")
+        print(f"  [asr] 空结果（{dur_s:.2f}s 有声音但没解出内容）")
+        # 【必须给个回应 —— 「没反应」有一半是这里】
+        #
+        # 用户明明说了话、设备也确实录到了，但识别器就是吐空。
+        # 以前网关只打一行日志就 return，设备那边从头到尾一言不发 ——
+        # 用户不知道是没听见还是没听清，只能再喊一遍，体验极差。
+        # 足够长（正常一句话的长度）就该明确说一句「没听清」，用户立刻知道
+        # 要不要重说；太短的（喘气、衣物摩擦）保持沉默，否则会一直插话。
+        if dur_s >= VAD_ASK_RETRY_S:
+            await send_json(ws, {"type": "stt", "text": ""})
+            await respond(ws, sess, http, tts, "抱歉，我没听清，能再说一遍吗？")
         return
     print(f"  [asr] {text}")
     await send_json(ws, {"type": "stt", "text": text})
@@ -1548,6 +1571,20 @@ async def device_handler(ws, asr, tts):
                 if isinstance(msg, bytes):
                     sess.rx_msgs += 1
                     sess.rx_bytes += len(msg)
+                    # 【正在回答上一句：这期间的音频一律不收】
+                    #
+                    # 这段是被设备侧的回音/用户插话触发的。以前是照样跑 VAD，
+                    # 跑完再在 `done` 那里 `reset_utterance()` 丢掉。那样有个坏处：
+                    # 用户这句话的**后半截**会被当成一段全新的语音重新累计，
+                    # 长度凑不够就被判成碎片丢掉 —— 一句话被劈成两半、两半都
+                    # 废掉，用户看到的就是「它又不理我」。
+                    # 现在直接不进 VAD，播放一结束，下一句从头干干净净地开始。
+                    if sess.busy:
+                        sess.buf.clear()
+                        sess.asr_stream = None
+                        if sess.rx_msgs % 31 == 0:
+                            print(f"  [rx] 正在回复中，跳过 {sess.rx_msgs} 条上行音频")
+                        continue
                     # 先撕掉 I2S 每帧首样本的假脉冲，再交给 VAD / ASR / 存盘。
                     # 不撕的话静音帧的 RMS 会被抬到 1448，VAD 永远判「在说话」，
                     # 断句只能靠 6 秒兜底 —— 这就是「说完半天不理人」的根因。

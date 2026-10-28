@@ -33,9 +33,34 @@ pub type AudioFrame = heapless::Vec<u8, FRAME_BYTES>;
 /// 实测把这里加到 16 帧（16.5KB）、TCP 缓冲加到 8KB×4，BSS 冲到 188KB，
 /// 设备就会出现「启动 → 跑一阵 → 突然卡死，串口一个字都不吐」。
 ///
+/// 【深度 4 → 8，2026-10-29】
+///
 /// 上行音频断断续续的真因是 I2S 时钟停振（见 speaker_task 的注释），
-/// 不是这个队列太浅。时钟修好之后 4 帧（128ms）完全够用。
-pub static MIC_CH: Channel<CriticalSectionRawMutex, AudioFrame, 4> = Channel::new();
+/// 不是这个队列太浅。时钟修好之后 4 帧（128ms）够**匀速收发**用，
+/// 但不够一次性倒出 pre-roll：见 `PREROLL_FRAMES`。
+/// 唤醒那一刻要往这里塞 6 帧先前记忆 + 当前帧，4 帧的队列会直接丢掉
+/// 最前面那段 —— 而那正是好不容易留住的第一个字。
+/// 只加 4 帧（+4KB BSS），离之前踩到的死线（BSS 188KB 整机卡死）还很远。
+pub static MIC_CH: Channel<CriticalSectionRawMutex, AudioFrame, 8> = Channel::new();
+/// 【起音回滚（pre-roll）：从 2 帧加到 6 帧，2026-10-29】
+///
+/// 这是「有时候识别不了 / 识别成半句」的主因，值得写清楚。
+///
+/// 设备 Idle 时要连续 `hot_needed`(2) 帧能量超阈值才承认「有人在说话」，
+/// 也就是开口之后要等 64ms 才敢上传。原来的 pre-roll 只有 2 帧 = 64ms，
+/// 而它保存的**正好就是触发判定用的那两帧** —— 换句话说，触发点之前的声音
+/// 一帧都没留下，白白满足第 1 帧之前的音频全丢。
+///
+/// 中文一个字大约 200~300ms，而轻声起头的字（"你…""我…"、气息音）前
+/// 100ms 能量还没爬起来。于是用户说的第一句话天生是缺头的：
+///   「你叫什么名字」→ 录进去的是「叫什么名字」开头的 airflow 已经没了 →
+///   日志里识别成「你叫什」，更短的句子直接让 SenseVoice 吐空结果 →
+///   网关不回任何话。**用户体感就是「有时候他不理我」**。
+///
+/// 6 帧 = 192ms：即便第 64ms 才触发，也能把触发点之前 128ms 补回来，
+/// 第一个字完整。再多就要往只有几百 KB 的内部 RAM 里压 10KB+，不划算。
+const PREROLL_FRAMES: usize = 6;
+
 /// 播放帧：ws_task → audio_task
 ///
 /// 【深度 8 → 12，2026-10-28】
@@ -135,9 +160,12 @@ pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
     let mut hot_frames: u8 = 0;
     // Listening 状态下连续静音帧计数
     let mut quiet_frames: u16 = 0;
-    // pre-roll：最近 2 帧，唤醒时补发
-    let mut preroll: [Option<AudioFrame>; 2] = [None, None];
-    let mut preroll_idx = 0usize;
+    // pre-roll 环形缓冲。**放 PSRAM**（这块的 BSS 已经 210KB+，历史上有多次
+    // 「内部 RAM 榨干 → 跑一阵整机卡死」，不能为了录音往前兜 192ms 去冒险）。
+    // mic_task 启动时一次性分配，之后原地轮转复用。
+    let preroll = crate::alloc_psram_buf(PREROLL_FRAMES * FRAME_BYTES);
+    let mut preroll_w = 0usize;   // 下一个写入槽位
+    let mut preroll_n = 0usize;   // 已存帧数（上限 PREROLL_FRAMES）
     // 麦克风电平日志的节流计数
     let mut mic_tick: u32 = 0;
 
@@ -376,31 +404,41 @@ pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
                     hot_frames >= hot_needed
                 };
 
-                // 存 pre-roll：唤醒后要补发，避免用户紧接着说的第一个字被切掉
-                let mut f = AudioFrame::new();
-                let _ = f.extend_from_slice(&mono);
-                preroll[preroll_idx] = Some(f);
-                preroll_idx = (preroll_idx + 1) % 2;
+                // 存进 pre-roll 环形缓冲：唤醒后要按时间顺序补发，
+                // 否则用户在设备「反应过来」之前说的话会被整个切掉。
+                {
+                    let off = preroll_w * FRAME_BYTES;
+                    preroll[off..off + FRAME_BYTES].copy_from_slice(&mono);
+                    preroll_w = (preroll_w + 1) % PREROLL_FRAMES;
+                    preroll_n = preroll_n.saturating_add(1).min(PREROLL_FRAMES);
+                }
 
                 if hit {
                     // 唤醒：把 pre-roll 按时间顺序补发
                     set_state(State::Listening);
                     quiet_frames = 0;
-                    for i in 0..2 {
-                        let idx = (preroll_idx + i) % 2;
-                        if let Some(f) = preroll[idx].take() {
-                            let _ = MIC_CH.try_send(f);
+                    let mut flushed = 0u8;
+                    // 最旧的一帧在 (写指针 - 已存帧数) 处
+                    let start = (preroll_w + PREROLL_FRAMES - preroll_n) % PREROLL_FRAMES;
+                    for i in 0..preroll_n {
+                        let off = ((start + i) % PREROLL_FRAMES) * FRAME_BYTES;
+                        let mut f = AudioFrame::new();
+                        if f.extend_from_slice(&preroll[off..off + FRAME_BYTES]).is_ok() {
+                            if MIC_CH.try_send(f).is_ok() {
+                                flushed += 1;
+                            }
                         }
                     }
+                    preroll_n = 0;
                     if wn_ok {
-                        log::info!("[wake] 唤醒词命中，开始上传");
+                        log::info!("[wake] 唤醒词命中，开始上传（补发 {flushed} 帧 pre-roll）");
                     } else {
                         // 触发来源改用 debug 级别：这是**每次唤醒都会打**的，
                         // 环境偏吵时设备会反复进出 Listening，info 级别会刷屏
                         // 并把 USB-JTAG 堵死（整机 ping 不通）。需要看时把
                         // ESP_LOG 调成 debug 即可。
                         log::debug!(
-                            "[vad] 检测到人声（rms={energy} 模型={speech} 底噪={noise_floor}），开始上传"
+                            "[vad] 检测到人声（rms={energy} 模型={speech} 底噪={noise_floor}），开始上传（补发 {flushed} 帧 pre-roll）"
                         );
                     }
                 }
