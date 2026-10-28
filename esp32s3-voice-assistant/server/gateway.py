@@ -82,10 +82,21 @@ DOWNLINK_BYTES = FRAME_BYTES                        # 1024
 LISTEN_PORT = int(os.environ.get("GATEWAY_PORT", 8765))
 
 # ---- 后端选择 ----
-ASR_BACKEND = os.environ.get("ASR_BACKEND", "siliconflow")
-LLM_BACKEND = os.environ.get("LLM_BACKEND", "siliconflow")
-TTS_CHAIN = [x.strip() for x in os.environ.get("TTS_CHAIN", "siliconflow,piper").split(",") if x.strip()]
-# ASR 降级链。local 走 sherpa-onnx + SenseVoice，和云端是**同一个模型**，
+#
+# 【默认值改成「全本地 + DeepSeek」】
+#
+# 原来 LLM 默认 siliconflow、TTS 默认 "siliconflow,piper"。而 siliconflow
+# 的 key 一直没配，后果是：
+#   · LLM 直接 401（如果设备没连上、hello 里的 config 没到，就会走到这里）
+#   · TTS **每一句都先失败一次**才降级到 Piper —— 白白多等一个网络往返
+#
+# 现在明确：ASR 用本地流式、TTS 用本地 Piper、LLM 用 DeepSeek。
+# 设备 hello 里下发的 config 仍然优先（改网页配置立即生效），这里只是
+# 「没有配置时的兜底」，兜底必须是能用的。
+ASR_BACKEND = os.environ.get("ASR_BACKEND", "local")
+LLM_BACKEND = os.environ.get("LLM_BACKEND", "deepseek")
+TTS_CHAIN = [x.strip() for x in os.environ.get("TTS_CHAIN", "piper").split(",") if x.strip()]
+# ASR 降级链。local 走 sherpa-onnx 流式 zipformer，和云端是**同一个模型族**，
 # 只是跑在你机器上——免费、离线、延迟更低。本地跑不了才走云端。
 # local       = sherpa-onnx（C++ 实现，最快，但 Termux 装不上）
 # local-lite  = 纯 Python 自实现（慢 13ms，但手机也能跑）
@@ -202,6 +213,49 @@ def tts_chain_list() -> list:
     return chain
 
 
+def bootstrap_local_config():
+    """启动时把 config.local.json 合入 RUNTIME，作为设备下发前的兜底。
+
+    # 为什么必须有这一步
+
+    RUNTIME 原来只由设备的 hello 下发填充。于是「网关刚起来、设备还没连上」
+    这段窗口里，所有 LLM/TTS 调用都走空 key —— 表现是莫名其妙的
+    `HTTP 401 Token is invalid`（key 明明是对的，只是没被读到）。
+
+    bench_pipeline.py 这类工具是自己手动读 json 再传 config 才绕过去的，
+    等于掩盖了这个问题。
+
+    优先级仍然是：设备 hello 下发 > 本地 json > 代码里的默认值。
+    """
+    p = HERE.parent / "config.local.json"
+    if not p.exists():
+        print(f"[cfg] 没找到 {p.name}，使用代码默认值")
+        return
+    try:
+        c = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"[cfg] {p.name} 解析失败：{e}")
+        return
+
+    for src, dst in (("llm_backend", "llm_backend"), ("llm_key", "llm_key"),
+                     ("llm_model", "llm_model"), ("llm_base", "llm_base"),
+                     ("tts_chain", "tts_chain"), ("tts_voice", "tts_voice"),
+                     ("asr_chain", "asr_chain"), ("asr_key", "asr_key"),
+                     ("asr_model", "asr_model")):
+        v = str(c.get(src) or "").strip()
+        if v:
+            RUNTIME[dst] = v
+
+    k = RUNTIME["llm_key"]
+    asr_now = RUNTIME["asr_chain"] or ",".join(ASR_CHAIN)
+    asr_list = [x.strip() for x in asr_now.split(",") if x.strip()]
+    print(
+        f"[cfg] 载入本地配置：LLM={llm_backend()}/{llm_model()} "
+        f"key={'已设置' if k else '未设置'}  "
+        f"TTS={' → '.join(tts_chain_list())}  ASR={' → '.join(asr_list)}"
+    )
+
+
 def apply_device_config(cfg) -> bool:
     """合入设备下发的配置，返回是否需要重建 ASR/TTS 后端链。"""
     if not isinstance(cfg, dict):
@@ -303,12 +357,12 @@ SYSTEM_PROMPT = (
 # 音频，静音计时被加速了 1.875 倍 —— 配 700 实际只有 373ms 就切句。
 # FRAME_MS 改成 32 之后累加才是真毫秒，所以这里同步回调：
 # 450ms 是中文自然换气停顿（200~300ms）之上、又不至于让人觉得"说完半天没反应"的值。
-# 能量阈值必须和固件里 audio.rs 的 `(noise_floor * 2).max(200)` **大致对齐**。
+# 能量阈值必须和固件里 audio.rs 的 `(noise_floor * 2).max(80)` 对齐。
 #
-# 曾经这里是 500，而固件那边是 400/200。同一段音频，设备判「这是人声，上传」，
-# 网关却判「这是静音，不理」—— 两边打架，用户看到的就是设备明明在传数据，
-# 却永远得不到回应。现在统一到 250：安静环境实测 rms 37~105，正常说话 350+。
-VAD_RMS_THRESHOLD = 250
+# ⚠️ 固件把 ES7210 的麦克风增益从 30dB 降到了 18dB（幅度约 1/4），
+# 所以这里对应的阈值也要跟着降，否则设备在说话、网关却判「静音」。
+# 原来的 250 是按 30dB 增益调的。
+VAD_RMS_THRESHOLD = 90
 # 连续多响才算「开口」。真实说话是持续的，噪音是断续的 —— 这是两者最可靠的差别。
 VAD_ONSET_MS = 96
 VAD_SILENCE_MS = 450
@@ -572,6 +626,90 @@ class AsrChain:
                 print(f"  [asr] {b.name} 失败（{e}），降级下一个")
                 last_err = e
         raise RuntimeError(f"所有 ASR 后端都失败：{last_err}")
+
+
+# ---- 流式 ASR ------------------------------------------------------------
+#
+# 和上面 AsrChain 的根本区别：AsrChain 需要**一整段**音频才能开始识别，
+# 而流式识别器是「边收边解码」，用户说最后一个字的时候结果基本已经出来了。
+# 省掉的正是整段识别的 100~250ms，而且天然支持把中间结果实时显示出来。
+#
+# 注意 SenseVoice **不能**流式 —— 它是非自回归的整句模型，必须看到完整音频。
+# 所以这里换成了流式 Zipformer（中英双语，chunk 约 320ms）。
+STREAM_ASR_DIR = HERE / "models" / "asr" / "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20"
+
+
+class StreamingAsr:
+    """流式识别器封装：feed() 边收边解，finish() 取最终结果。
+
+    # 为什么不做成 AsrBackend 子类
+
+    接口语义不一样：AsrBackend.transcribe(pcm) 是「一段进、文本出」的无状态调用，
+    而流式是「一个 stream 反复喂、最后取结果」的有状态对象。硬套同一个接口
+    反而会把生命周期搞乱（stream 是跟随一轮对话的）。
+    """
+
+    def __init__(self):
+        self.rec = None
+        self.available = (
+            (STREAM_ASR_DIR / "tokens.txt").exists()
+            and (STREAM_ASR_DIR / "encoder-epoch-99-avg-1.int8.onnx").exists()
+            and (STREAM_ASR_DIR / "decoder-epoch-99-avg-1.int8.onnx").exists()
+            and (STREAM_ASR_DIR / "joiner-epoch-99-avg-1.int8.onnx").exists()
+        )
+
+    def load(self):
+        if self.rec is None:
+            import sherpa_onnx
+            print("[asr] 加载流式 Zipformer（首次约 1-2 秒）…")
+            t0 = time.time()
+            self.rec = sherpa_onnx.OnlineRecognizer.from_transducer(
+                tokens=str(STREAM_ASR_DIR / "tokens.txt"),
+                encoder=str(STREAM_ASR_DIR / "encoder-epoch-99-avg-1.int8.onnx"),
+                decoder=str(STREAM_ASR_DIR / "decoder-epoch-99-avg-1.int8.onnx"),
+                joiner=str(STREAM_ASR_DIR / "joiner-epoch-99-avg-1.int8.onnx"),
+                num_threads=ASR_THREADS,
+                sample_rate=SAMPLE_RATE,
+                feature_dim=80,
+                decoding_method="greedy_search",
+            )
+            print(f"[asr] 流式 Zipformer 就绪 {time.time() - t0:.2f}s")
+        return self.rec
+
+    def new_stream(self):
+        return self.load().create_stream()
+
+    def feed(self, stream, pcm: bytes) -> None:
+        """喂一段 16bit 小端单声道 PCM（可以是从 WS 收到的一帧）。"""
+        import numpy as np
+        if len(pcm) < 2:
+            return
+        samples = np.frombuffer(pcm[: len(pcm) // 2 * 2], dtype="<i2").astype(np.float32) / 32768.0
+        rec = self.load()
+        stream.accept_waveform(SAMPLE_RATE, samples)
+        while rec.is_ready(stream):
+            rec.decode_stream(stream)
+
+    def finish(self, stream) -> str:
+        """告诉识别器「音频到此为止」，解出剩余部分并返回最终文本。"""
+        rec = self.load()
+        try:
+            stream.input_finished()
+        except Exception:
+            pass
+        while rec.is_ready(stream):
+            rec.decode_stream(stream)
+        return rec.get_result(stream)
+
+    def partial(self, stream) -> str:
+        """当前已解出的中间结果（可用于实时显示）。"""
+        try:
+            return self.load().get_result(stream)
+        except Exception:
+            return ""
+
+
+STREAM_ASR = StreamingAsr()
 
 
 # ============================================================================
@@ -870,20 +1008,41 @@ _SENT_SOFT = "，,；;、：:"
 _SENT_TAIL = "”’』」）)】》"
 
 
+# 逗号类标点：累积到这个字数就在此切分，让首包更早出声。
+#
+# 为什么不无条件切：3 字以内（「你好，」）单独合成会被 Piper 读成句末降调，
+# 听感像一句说完了。8 字是「上下文够、语调不塌」和「比等整句早 100~200ms」的平衡点。
+COMMA_CUT_MIN = 4
+# 一直没有句末标点时，攒到这个长度就硬切一刀
+HARD_CUT = 14
+
+
 def cut_sentence(buf: str):
     """从累积文本里切出**第一句**，返回 `(句子, 剩余文本)`。
 
     没切出完整句子时返回 `("", buf)`，调用方继续攒。
 
-    # 阈值为什么是 18 字
+    # 为什么切得这么碎
 
-    首包延迟 = 等 LLM 吐出第一句的时间 + TTS 合成时间。DeepSeek 大约
-    30~50 字/秒，所以「等 28 字」和「等 18 字」差 200~300ms，这部分是用户
-    开口后干等的主要来源之一。
+    实测 Piper 是**纯线性**的，RTF 恒为 0.045：
 
-    18 字大约正好是一个带逗号的中文短句，切出来听着是自然停顿而不是硬截断；
-    一直没有标点才会退到每 16 字硬切一刀 —— 多合成几次的代价远小于让人干等。
+        2字 0.70s音频  39ms      14字 2.46s音频 110ms
+        8字 1.73s音频  77ms      38字 8.07s音频 343ms
+
+    固定开销只有 ~20ms，所以首包延迟**完全由「第一句有多长」决定**，
+    跟模型快慢无关。DeepSeek 约 30~50 字/秒，少等 6 个字就省 120~200ms。
+
+    于是切成「标点即切」：句末标点（。！？）立刻切，逗号类攒够 8 字就切。
+    这样 LLM 吐出第一个逗号时，第一段音频就已经在合成路上了 —— 用户听到的
+    是「边生成边播」，而不是「等整段说完再开口」。
+
+    代价是逗号处会被读成短停顿（略像句末），但语音助手场景下不突兀。
     """
+    # ---- 1. 按出现顺序扫，谁先到就切谁 ----
+    #
+    # 这里必须**一次顺序扫描**，不能先整体找句末标点再找逗号 ——
+    # 否则「你好，我是小特，今天天气不错。」会一路扫到最后的句号，
+    # 切出 15 个字，逗号检测形同虚设（这个坑我踩过）。
     for i, ch in enumerate(buf):
         if ch in _SENT_END:
             j = i + 1
@@ -894,12 +1053,15 @@ def cut_sentence(buf: str):
             # 只有标点没有内容（比如开头的「……」），跳过继续累计
             if sent.strip(_SENT_END + _SENT_TAIL + " "):
                 return sent, rest
+        elif ch in _SENT_SOFT and i + 1 >= COMMA_CUT_MIN:
+            return buf[:i + 1].strip(), buf[i + 1:]
 
-    if len(buf) >= 18:
+    # ---- 2. 一直没标点：够长就硬切，别让用户干等 ----
+    if len(buf) >= HARD_CUT:
         for i in range(len(buf) - 1, -1, -1):
             if buf[i] in _SENT_SOFT:
                 return buf[:i + 1].strip(), buf[i + 1:]
-        return buf[:16].strip(), buf[16:]
+        return buf[:HARD_CUT].strip(), buf[HARD_CUT:]
     return "", buf
 
 
@@ -939,6 +1101,10 @@ class Session:
     # 上行统计：排查「设备明明在传却收不到」时看这两个数
     rx_msgs: int = 0
     rx_bytes: int = 0
+    # 流式识别状态。`asr_stream` 跟随一轮对话：开口时新建，说完时取结果并丢弃。
+    asr_stream: object = None
+    # 流式识别在「说完」那一刻已经解好的文本，交给 handle_utterance 直接用
+    pending_text: object = None
 
     def reset_utterance(self):
         self.buf.clear()
@@ -946,6 +1112,7 @@ class Session:
         self.silence_ms = 0
         self.hot_ms = 0
         self.in_speech = False
+        self.asr_stream = None
 
 
 async def send_json(ws, obj):
@@ -1124,27 +1291,43 @@ async def respond(ws, sess, http, tts, user_text: str):
 
 
 async def handle_utterance(ws, sess, http, asr, tts):
-    if len(sess.buf) < SAMPLE_RATE * 2 * VAD_MIN_SPEECH_MS // 1000:
+    # ---- 取文本：优先用流式已经解好的结果 ----
+    #
+    # 流式路径下 `pending_text` 在收音频的过程中就解完了，这里几乎零成本。
+    # 只有识别器没启动/中途出错时才回退到「整段送 AsrChain」。
+    if sess.pending_text is not None:
+        text = sess.pending_text
+        sess.pending_text = None
+        dur = sess.speech_ms / 1000.0
+        print(f"  [vad] 一段语音 {dur:.2f}s（流式，结果已就绪）")
+        # 仍然留一份音频，排查音质问题时要看
+        try:
+            save_wav(HERE / "debug_last.wav", bytes(sess.buf))
+        except Exception:
+            pass
         sess.reset_utterance()
-        return
+    else:
+        if len(sess.buf) < SAMPLE_RATE * 2 * VAD_MIN_SPEECH_MS // 1000:
+            sess.reset_utterance()
+            return
 
-    pcm = bytes(sess.buf)
-    print(f"  [vad] 一段语音 {len(pcm)/2/SAMPLE_RATE:.2f}s，送去识别")
-    # 调试留档：ASR 识别得莫名其妙时，直接拿这个文件看上行音频到底长什么样
-    # （能量分布、有没有断裂、是不是只有半截）。只留最近一次，不做堆积。
-    try:
-        save_wav(HERE / "debug_last.wav", pcm)
-    except Exception:
-        pass
-    sess.reset_utterance()
+        pcm = bytes(sess.buf)
+        print(f"  [vad] 一段语音 {len(pcm)/2/SAMPLE_RATE:.2f}s，送去识别")
+        # 调试留档：ASR 识别得莫名其妙时，直接拿这个文件看上行音频到底长什么样
+        try:
+            save_wav(HERE / "debug_last.wav", pcm)
+        except Exception:
+            pass
+        sess.reset_utterance()
 
-    try:
-        text = await asr.transcribe(http, pcm)
-    except Exception as e:
-        print(f"  [asr] 全部失败：{e}")
-        return
+        try:
+            text = await asr.transcribe(http, pcm)
+        except Exception as e:
+            print(f"  [asr] 全部失败：{e}")
+            return
+
     if not text:
-        print("  [asr] 空结果（key 没配 / 音频太短 / 噪声）")
+        print("  [asr] 空结果（没在说话 / 音频太短 / 噪声）")
         return
     print(f"  [asr] {text}")
     await send_json(ws, {"type": "stt", "text": text})
@@ -1273,6 +1456,16 @@ async def device_handler(ws, asr, tts):
                     if sess.rx_msgs % 31 == 0:
                         print(f"  [rx] {sess.rx_msgs} 条 / {sess.rx_bytes/2/SAMPLE_RATE:.1f}s 音频 "
                               f"（最近一条 {len(msg)}B）")
+                    # 流式识别：边收边解码，不等整段。
+                    # 用 try 包住 —— 识别器出任何问题都不该影响收音频和兜底路径。
+                    if STREAM_ASR.available:
+                        try:
+                            if sess.asr_stream is None:
+                                sess.asr_stream = STREAM_ASR.new_stream()
+                            STREAM_ASR.feed(sess.asr_stream, msg)
+                        except Exception as e:
+                            print(f"  [asr] 流式喂数据失败（{e}），本轮改用整段识别")
+                            sess.asr_stream = None
                     sess.buf.extend(msg)
                     # 设备会把多帧合并成一个 WS 消息发（见 main.rs 的上行批处理），
                     # 所以时长必须按实际字节数折算。原来硬编码 `+= FRAME_MS`
@@ -1309,6 +1502,14 @@ async def device_handler(ws, asr, tts):
                         done = True
                     if done:
                         if not sess.busy:
+                            # 流式路径：音频是边收边解的，到这一刻结果基本已经好了，
+                            # 只需要 finish() 解掉尾巴。这一步通常只要几毫秒。
+                            if sess.asr_stream is not None:
+                                try:
+                                    sess.pending_text = STREAM_ASR.finish(sess.asr_stream)
+                                except Exception as e:
+                                    print(f"  [asr] 流式收尾失败（{e}），改用整段识别")
+                                    sess.pending_text = None
                             await handle_utterance(ws, sess, http, asr, tts)
                         else:
                             sess.reset_utterance()
@@ -1344,6 +1545,19 @@ async def main_server(asr, tts):
                 print(f"  [warmup] 本地 SenseVoice 预热完成 {(time.time()-t0)*1000:.0f}ms")
             except Exception as e:
                 print(f"  [warmup] 本地 SenseVoice 预热失败：{e}")
+
+    # 流式识别器：预加载 + 空跑一次，把 onnxruntime 的图优化摊掉
+    if STREAM_ASR.available:
+        try:
+            t0 = time.time()
+            st = STREAM_ASR.new_stream()
+            STREAM_ASR.feed(st, b"\x00" * (SAMPLE_RATE * 2))
+            STREAM_ASR.finish(st)
+            print(f"  [warmup] 流式 Zipformer 预热完成 {(time.time()-t0)*1000:.0f}ms")
+        except Exception as e:
+            print(f"  [warmup] 流式 Zipformer 预热失败：{e}（将回退整段识别）")
+    else:
+        print("  [warmup] 没找到流式模型目录，ASR 走整段识别")
 
     for b in tts.backends:
         if isinstance(b, (PiperTts, KokoroTts)):
@@ -1484,6 +1698,8 @@ if __name__ == "__main__":
     args = ap.parse_args()
 
     try:
+        # 设备连上之前也要能正常工作（否则第一轮必然是 401）
+        bootstrap_local_config()
         asr, tts = build_backends()
         if args.check:
             asyncio.run(cmd_check(asr, tts))
