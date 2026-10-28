@@ -14,7 +14,8 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
-use embassy_time::{with_timeout, Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
+use esp_println::println;
 use esp_hal::dma::aligned::DmaAlignedMut;
 use esp_hal::dma::{DmaRxBuf, DmaTxBuf};
 use esp_hal::i2s::master::{I2sRx, I2sTx};
@@ -270,7 +271,7 @@ pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
                         //
                         // 200 位于「安静上限 105」和「说话下限 350」之间，
                         // 留了足够的余量，也不会被环境底噪误触发。
-                        energy > (noise_floor * 2).max(200)
+                        energy > (noise_floor * 2).max(80)
                     };
                     let any_speech = speech || by_energy;
                     if any_speech {
@@ -329,7 +330,7 @@ pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
                 let quiet = if vad_ok {
                     !speech
                 } else {
-                    energy < (noise_floor * 2).max(200)
+                    energy < (noise_floor * 2).max(80)
                 };
                 if quiet {
                     quiet_frames += 1;
@@ -395,19 +396,30 @@ pub async fn speaker_task(mut tx: I2sTx<'static, Async>) {
     let mut buf = [0u8; I2S_FRAME_BYTES];
 
     loop {
-        // 【2026-10-28 回退】这里试过改成 `try_receive()` + 1ms 超时，
-        // 想消除「队列空时白等 32ms、导致 I2S 时钟半停」的问题。
-        // 结果设备在启动 5~16 秒后必定静默卡死（串口零输出、不重启、
-        // monitor 也读不到），说明这个改法在本机上引入了别的问题。
+        // 【I2S 时钟必须连续 —— 这是「超慢 + 破音」的总根因】
         //
-        // 先退回原样保证可用。下一步要治「时钟半停」得换更稳的思路
-        // （例如给 TX 做双缓冲连续喂数），不能在任务循环里硬改节拍。
-        let frame = with_timeout(
-            Duration::from_millis(crate::board::FRAME_MS as u64),
-            SPK_CH.receive(),
-        )
-        .await
-        .ok();
+        // 原来这里用 `with_timeout(FRAME_MS, SPK_CH.receive())`：队列空的时候
+        // 先干等 32ms，再花 32ms 传输静音，一个循环变成 64ms —— I2S 的
+        // BCLK/WS 有一半时间是停振的。而麦克风（RX）靠 signal_loopback
+        // 复用 TX 的时钟采样，于是上行音频精确变成「32ms 有声 / 32ms 静音」：
+        //     块RMS = [25, 37, 1248, 67, 1268, 89, 1184, 92, ...]
+        // 后果是连锁的：
+        //   · 上行被挖掉一半 → VAD 永远判不到「说完」→ 每句话干等 6 秒强制切分
+        //   · 下行同样被拉成一半速率 → 播放像慢放
+        //   · 波形每 32ms 断一次 → 破音
+        //
+        // 改成非阻塞取：没有音频就**立刻**送静音帧，让 DMA 永不停。
+        //
+        // 曾经这么改过一次，设备「卡死」了几十秒，于是被回退了。但后来查明
+        // 那次卡死的真凶是 `[mic] rms=` 每秒的日志把 USB-JTAG 堵死
+        // （见 .cargo/config.toml 里 ESP_LOG 的说明），跟这里无关。
+        // 日志关掉之后重新启用这个写法，是安全的。
+        //
+        // 下面还加了「最小循环时间」保护：万一 tx.write/wait_async 因为异常
+        // 立即返回，这个循环会变成没有让出点的忙循环，那会饿死整个执行器。
+        // 记录起始时刻，循环再快也至少让出 2ms。
+        let t_begin = Instant::now();
+        let frame = SPK_CH.try_receive().ok();
 
         let samples = match &frame {
             Some(f) => {
@@ -467,8 +479,24 @@ pub async fn speaker_task(mut tx: I2sTx<'static, Async>) {
         let (res, t, b) = transfer.wait_async().await;
         tx = t;
         dma = b;
-        if res.is_err() {
-            continue;
+
+        // 【最小循环时间保护 —— 这个值必须是「一帧的时长」，不能更小】
+        //
+        // 上面改成了 `try_receive()`（不等队列），正常情况下 `wait_async()`
+        // 会等满 32ms 的 DMA 传输时间，循环天然被限速。
+        //
+        // 但异常路径下（wait_async 立即返回 / 传输报错）循环会变得飞快。
+        // 这里踩过一个坑：兜底只写了 2ms，结果 I2S 的 DMA 一帧要 32ms 才
+        // 传得完，2ms 就提交一次等于**16 倍过载**，描述符链直接被冲垮，
+        // 表现是设备启动 5~16 秒后彻底静默卡死（串口零输出、不重启）。
+        //
+        // 正确做法是把这一圈补足到整帧时长：无论 DMA 走得多快，循环频率
+        // 恒等于 32ms/次，与 I2S 的采样时钟严格对齐。这样既不会忙等，
+        // 也不会重复提交。
+        let frame_ms = crate::board::FRAME_MS as u64;
+        let used = t_begin.elapsed().as_millis() as u64;
+        if used < frame_ms {
+            Timer::after(Duration::from_millis(frame_ms - used)).await;
         }
     }
 }

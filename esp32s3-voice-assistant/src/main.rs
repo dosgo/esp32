@@ -366,7 +366,21 @@ async fn main(spawner: Spawner) -> ! {
     // 所以有配置就只开 STA。
     // 实验结论：APSTA 并存**不是**握手失败的原因（纯 STA 也一样失败）。
     // 所以热点保持常开 —— 它是连不上家里 WiFi 时唯一能进去改配置的通道。
-    let ap_enabled = true;
+    // 【2026-10-28 从硬编码 true 改为按配置判断】
+    //
+    // 原来这里是 `let ap_enabled = true;`，于是设备**永远**跑在 APSTA 模式：
+    // 一边开热点「ESP32-VOICE」，一边连 CPE。而 ESP32 的 AP 和 STA 共用同一
+    // 套射频前端，只能分时切换信道 —— 结果就是：
+    //
+    //   · 关联能成功（信标/认证帧很小，抢得到时隙）
+    //   · DHCP 能成功（广播帧每个 DTIM 都发）
+    //   · **但 ICMP echo / TCP SYN-ACK 这类单播包大量丢失**
+    //     表现：ping 100% 丢包、网关停在 SynReceived、TCP 建不起来
+    //
+    // 配网只在「还没配过 WiFi」时才需要热点；一旦 WiFi 配置存在，就该
+    // 纯 STA 跑，把整个射频让给联网。这也正是下面那段注释本来写明的意图
+    // （「只有没配网时才建。有配置就纯 STA」），只是判断条件一直没接上。
+    let ap_enabled = !boot_cfg.wifi_set();
     let initial = if ap_enabled {
         WifiConfig::AccessPointStation(sta_cfg, ap_cfg)
     } else {
