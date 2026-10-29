@@ -18,8 +18,10 @@ tmp/
 # 2026-10-26 已经踩过一次：96afd89 误提交 399MB 模型，push 被 GitHub 拒绝，
 # 最后用 filter-branch 剔除。模型文件放本地/网盘，不要进库。
 esp32s3-voice-assistant/server/models/
+esp32s3-voice-assistant/goServer/models/
 *.onnx
 *.onnx.json
+*.far
 
 # 备份 / 过程文件
 *.bak
