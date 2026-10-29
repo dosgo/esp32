@@ -51,6 +51,14 @@ static SPI_BUF: static_cell::StaticCell<[u8; 1024]> = static_cell::StaticCell::n
 /// Wi-Fi 拿到 IP 后由 `main` 发信号，屏幕据此从开机画面切到状态页。
 pub static IP_READY: Signal<CriticalSectionRawMutex, heapless::String<16>> = Signal::new();
 
+/// WebSocket 是否已经连上网关。
+///
+/// 以前屏幕只认 IP：WiFi 一连上就画 READY，但此时 TCP/hello 还没完成，
+/// 用户说话当然没人理。现在 WS 没连上时 Idle 显示 CONNECTING，
+/// 连上后才显示 READY；断线重连时也会自动退回 CONNECTING。
+pub static GW_READY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 // 配色：深底 + 青绿，和大部分 AI 硬件的调性一致
 const BG: Rgb565 = Rgb565::new(2, 5, 6);
 const FG: Rgb565 = Rgb565::WHITE;
@@ -496,8 +504,15 @@ fn draw_face<D>(d: &mut D, st: State, phase: u8)
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    // 只清中间那块，避免整屏闪
-    let area = Rectangle::new(Point::new(0, 40), Size::new(LCD_WIDTH as u32, 160));
+    // 只清中间那块，避免整屏闪。
+    //
+    // 【必须一直清到屏幕底部】状态文字在 y=208、底部进度条在 y=230，
+    // 原来这里只清到 y=200，旧文字/旧进度条没被擦掉，切状态时就会
+    // 出现 LISTENING / THINKING / SPEAKING / CONNECTING 叠在一起。
+    let area = Rectangle::new(
+        Point::new(0, 40),
+        Size::new(LCD_WIDTH as u32, (LCD_HEIGHT as u32).saturating_sub(40)),
+    );
     area.into_styled(PrimitiveStyle::with_fill(BG)).draw(d).ok();
 
     let cx = LCD_WIDTH as i32 / 2;
@@ -505,7 +520,14 @@ where
     let eye_dx = 42;
 
     let (label, col) = match st {
-        State::Idle => ("READY", DIM),
+        State::Idle => {
+            if GW_READY.load(core::sync::atomic::Ordering::Relaxed) {
+                ("READY", DIM)
+            } else {
+                // 有 WiFi 但网关/hello 还没连上：明确告诉用户现在说话没用
+                ("CONNECTING", WARN)
+            }
+        }
         State::Listening => ("LISTENING", ACCENT),
         State::Thinking => ("THINKING", WARN),
         State::Speaking => ("SPEAKING", FG),
