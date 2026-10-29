@@ -196,6 +196,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun startDownload() {
         if (downloading) return
+        if (GatewayService.running) {
+            // 下载完要释放并重载模型；网关正在用同一份 native 实例，
+            // 这时 release 可能把正在推理的对象 free 掉（轻则识别变哑，重则 native crash）。
+            Toast.makeText(this, "请先停止网关再下载/更换模型", Toast.LENGTH_LONG).show()
+            return
+        }
         val missing = ModelDownloader.specs(this).filter { !it.dest.exists() || it.dest.length() == 0L }
         if (missing.isEmpty()) {
             Toast.makeText(this, "模型已经齐了，不用下", Toast.LENGTH_SHORT).show()

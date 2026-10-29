@@ -25,7 +25,7 @@ import websockets
 
 URL = "ws://127.0.0.1:8765"
 RATE = 16000
-FRAME = 1920  # 60ms
+FRAME = 1024  # 32ms，必须和固件 board.rs / gateway.py 的 FRAME_BYTES 一致
 
 
 def tone(ms: int, freq: int = 300, amp: int = 6000) -> bytes:
@@ -59,12 +59,12 @@ async def make_voice(text: str) -> bytes:
 
 
 async def feed(ws, pcm: bytes):
-    """按 60ms 一帧发出去，节奏和真机一致"""
+    """按 32ms 一帧发出去，节奏和真机一致"""
     if len(pcm) % FRAME:
         pcm += b"\x00" * (FRAME - len(pcm) % FRAME)
     for i in range(0, len(pcm), FRAME):
         await ws.send(pcm[i:i + FRAME])
-        await asyncio.sleep(0.06)
+        await asyncio.sleep(0.032)
 
 
 async def main():
@@ -82,8 +82,8 @@ async def main():
 
     async with websockets.connect(URL, max_size=1024 * 1024) as ws:
         await ws.send(json.dumps({
-            "type": "hello", "version": 1, "format": "pcm",
-            "sample_rate": RATE, "channels": 1, "bits": 16, "frame_ms": 60,
+            "type": "hello", "version": 2, "format": "pcm",
+            "sample_rate": RATE, "channels": 1, "bits": 16, "frame_ms": 32,
         }))
 
         async def reader():

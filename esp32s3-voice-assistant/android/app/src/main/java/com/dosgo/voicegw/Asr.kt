@@ -19,6 +19,14 @@ import java.io.File
  */
 class Asr(private val modelDir: File) {
 
+    /**
+     * 网关和测试页共用同一个 Asr 实例（Models 单例），两边可能在不同线程
+     * 同时 transcribe；sherpa-onnx 的 recognizer 不保证并发安全，这里串行化。
+     * release() 也要拿同一把锁，避免把正在推理的 native 对象 free 掉。
+     */
+    private val lock = Any()
+
+    @Volatile
     private var rec: OfflineRecognizer? = null
 
     val isReady: Boolean
@@ -28,7 +36,7 @@ class Asr(private val modelDir: File) {
         File(modelDir, "model.int8.onnx").exists() && File(modelDir, "tokens.txt").exists()
 
     /** 加载模型。耗时 1-3 秒，必须在后台线程调用。 */
-    fun load(): Boolean {
+    fun load(): Boolean = synchronized(lock) {
         if (rec != null) return true
         if (!modelExists()) {
             Log.e(TAG, "模型缺失：$modelDir")
@@ -66,7 +74,7 @@ class Asr(private val modelDir: File) {
      * @param pcm 16kHz / 16bit / 单声道，小端字节序
      * @return 识别出的文字，失败返回空串
      */
-    fun transcribe(pcm: ByteArray): String {
+    fun transcribe(pcm: ByteArray): String = synchronized(lock) {
         val r = rec ?: return ""
         if (pcm.size < 2) return ""
 
@@ -86,7 +94,7 @@ class Asr(private val modelDir: File) {
         }
     }
 
-    fun release() {
+    fun release() = synchronized(lock) {
         rec?.release()
         rec = null
     }
