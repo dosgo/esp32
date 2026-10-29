@@ -36,6 +36,14 @@ class Tts(private val modelDir: File) {
 
     enum class Engine { KOKORO, VITS, NONE }
 
+    /**
+     * 网关和测试页共用同一个 Tts 实例（Models 单例）。
+     * generate/generateWithCallback 不能并发，release() 也不能把正在合成的
+     * native 对象 free 掉，所以两个入口和 release 都拿同一把锁。
+     */
+    private val lock = Any()
+
+    @Volatile
     private var tts: OfflineTts? = null
     private var engine: Engine = Engine.NONE
     private var label = "无"
@@ -84,7 +92,7 @@ class Tts(private val modelDir: File) {
 
     fun modelExists(): Boolean = detectEngine() != Engine.NONE
 
-    fun load(): Boolean {
+    fun load(): Boolean = synchronized(lock) {
         if (tts != null) return true
         val e = detectEngine()
         if (e == Engine.NONE) {
@@ -166,7 +174,7 @@ class Tts(private val modelDir: File) {
      * 合成语音
      * @return 16kHz / 16bit / 单声道 小端 PCM；失败返回空数组
      */
-    fun synth(text: String, speakerId: Int = 0, speed: Float = 1.0f): ByteArray {
+    fun synth(text: String, speakerId: Int = 0, speed: Float = 1.0f): ByteArray = synchronized(lock) {
         val t = tts ?: return ByteArray(0)
         if (text.isBlank()) return ByteArray(0)
         return try {
@@ -197,7 +205,7 @@ class Tts(private val modelDir: File) {
         speakerId: Int = 0,
         speed: Float = 1.0f,
         onChunk: (ByteArray) -> Boolean,
-    ): Boolean {
+    ): Boolean = synchronized(lock) {
         val t = tts ?: return false
         if (text.isBlank()) return false
         return try {
@@ -223,7 +231,7 @@ class Tts(private val modelDir: File) {
         }
     }
 
-    fun release() {
+    fun release() = synchronized(lock) {
         tts?.free()
         tts = null
         engine = Engine.NONE

@@ -3,23 +3,36 @@ package com.dosgo.voicegw
 /**
  * 协议常量 —— 必须和 ESP32 固件、以及 Python 版 gateway.py 完全一致。
  *
- * 客户端（ESP32）上行：16kHz / 16bit / 单声道 PCM，每帧 1920 字节（60ms）
- * 服务端（本 App）下行：同样的 PCM，每帧 ≤1920 字节
+ * 客户端（ESP32）上行：16kHz / 16bit / 单声道 PCM，每帧 1024 字节（32ms）
+ * 服务端（本 App）下行：同样的 PCM，每帧 1024 字节
  * 控制消息走 JSON 文本帧。
+ *
+ * 【2026-10-29 修正】这里原来还是 60ms / 1920 字节，是固件改 32ms 之前的旧值。
+ * 固件 board.rs 现在是 FRAME_MS=32、FRAME_BYTES=1024；如果继续按 1920 下发，
+ * 设备只拷得进前 1024 字节，剩下 896 字节被 consume() 丢掉 —— 每帧丢 47%，
+ * 声音变慢 1.875 倍还带破音。VAD 的毫秒记账同样会快 1.875 倍。
  */
 object Protocol {
     const val SAMPLE_RATE = 16000
-    const val FRAME_MS = 60
-    const val FRAME_BYTES = SAMPLE_RATE * 2 * FRAME_MS / 1000   // 1920
+    const val FRAME_MS = 32
+    const val FRAME_BYTES = SAMPLE_RATE * 2 * FRAME_MS / 1000   // 1024
 
-    // VAD 参数（和 Python 版保持一致）
-    const val VAD_RMS_THRESHOLD = 500
-    const val VAD_SILENCE_MS = 700
-    const val VAD_MIN_SPEECH_MS = 300
-    const val VAD_MAX_UTTERANCE_MS = 15000
+    // VAD 参数（和 Python 版 gateway.py 对齐）
+    const val VAD_RMS_THRESHOLD = 90
+    // 连续超过门限多久才算“真的开口”。碰桌子、敲键盘只有一两帧。
+    const val VAD_ONSET_MS = 96
+    const val VAD_SILENCE_MS = 450
+    const val VAD_MIN_SPEECH_MS = 192
+    const val VAD_MAX_UTTERANCE_MS = 8000
+    // 待机时只留最近 400ms 作为起音前回滚，不能把整段静音都送给 ASR
+    const val PRE_ROLL_MS = 400
     const val AWAKE_TIMEOUT_S = 90
 
-    val WAKE_WORDS = listOf("你好小智", "小智小智", "嗨小智", "嘿小智", "小智")
+    val WAKE_WORDS = listOf(
+        // 设备端 WakeNet 的唤醒词；即使现在 WakeNet 没开，也兼容用户按文档喊这句
+        "小特小特", "小特", "小特小",
+        "你好小智", "小智小智", "嗨小智", "嘿小智", "小智",
+    )
 
     // 同音兜底：ASR 容易把「小智」听成「小芝 / 小志 / 晓智」
     // 手机端不引拼音库（体积/依赖），用一张常见同音字表覆盖

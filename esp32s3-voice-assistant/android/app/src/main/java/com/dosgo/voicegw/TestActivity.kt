@@ -514,6 +514,10 @@ class TestActivity : AppCompatActivity() {
 
     private fun startDownload() {
         if (downloading) return
+        if (GatewayService.running) {
+            Toast.makeText(this, "请先停止网关再下载/更换模型", Toast.LENGTH_LONG).show()
+            return
+        }
         downloading = true
         dlCancelled = false
         btnDownload.isEnabled = false
@@ -727,6 +731,10 @@ class TestActivity : AppCompatActivity() {
     private fun downloadVoiceModel() {
         if (downloading) {
             Toast.makeText(this, "正在下载，稍等", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (GatewayService.running) {
+            Toast.makeText(this, "请先停止网关再更换音色模型", Toast.LENGTH_LONG).show()
             return
         }
         downloading = true

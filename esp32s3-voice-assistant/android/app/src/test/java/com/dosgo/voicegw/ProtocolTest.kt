@@ -17,10 +17,10 @@ class ProtocolTest {
     // ---------------------------------------------------------------- 帧常量
 
     @Test
-    fun `一帧正好 60ms 1920 字节`() {
-        assertEquals(60, Protocol.FRAME_MS)
-        assertEquals(1920, Protocol.FRAME_BYTES)
-        // 和固件 board.rs 的 FRAME_SAMPLES 对齐：960 采样 × 2 字节
+    fun `一帧正好 32ms 1024 字节`() {
+        assertEquals(32, Protocol.FRAME_MS)
+        assertEquals(1024, Protocol.FRAME_BYTES)
+        // 和固件 board.rs 的 FRAME_SAMPLES 对齐：512 采样 × 2 字节
         assertEquals(Protocol.FRAME_BYTES, Protocol.SAMPLE_RATE * 2 * Protocol.FRAME_MS / 1000)
     }
 
@@ -33,6 +33,9 @@ class ProtocolTest {
         assertTrue(Protocol.isWakeWord("小智"))
         // 句子里带唤醒词也应命中（ASR 常带标点）
         assertTrue(Protocol.isWakeWord("你好，小智。"))
+        // 设备端 WakeNet 的唤醒词也要认
+        assertTrue(Protocol.isWakeWord("小特小特"))
+        assertTrue(Protocol.isWakeWord("小特"))
     }
 
     @Test
@@ -77,15 +80,15 @@ class ProtocolTest {
     @Test
     fun `能解析固件发来的 hello`() {
         // 固件 main.rs 里实际发的这一行，注意数字字段不带引号
-        val hello = """{"type":"hello","version":1,"format":"pcm","sample_rate":16000,"channels":1,"bits":16,"frame_ms":60}"""
+        val hello = """{"type":"hello","version":2,"format":"pcm","sample_rate":16000,"channels":1,"bits":16,"frame_ms":32}"""
         assertEquals("hello", jsonStr(hello, "type"))
-        assertEquals("1", jsonStr(hello, "version"))
+        assertEquals("2", jsonStr(hello, "version"))
         assertEquals("pcm", jsonStr(hello, "format"))
         assertEquals("16000", jsonStr(hello, "sample_rate"))
         assertEquals("16", jsonStr(hello, "bits"))
-        assertEquals("60", jsonStr(hello, "frame_ms"))
+        assertEquals("32", jsonStr(hello, "frame_ms"))
         // 末尾的数字字段（后面直接跟 }）也要能读出来
-        assertEquals("60", jsonStr(hello, "frame_ms"))
+        assertEquals("32", jsonStr(hello, "frame_ms"))
     }
 
     @Test
@@ -138,12 +141,12 @@ class ProtocolTest {
 
     @Test
     fun `静音帧 RMS 为 0`() {
-        assertEquals(0, AudioPcm.rms(ByteArray(1920)))
+        assertEquals(0, AudioPcm.rms(ByteArray(1024)))
     }
 
     @Test
     fun `满幅方波 RMS 接近 32767`() {
-        val n = 960
+        val n = 512
         val pcm = ByteArray(n * 2)
         for (i in 0 until n) {
             val v = if (i % 2 == 0) 32767 else -32768
@@ -156,11 +159,11 @@ class ProtocolTest {
 
     @Test
     fun `小音量应该低于 VAD 门限`() {
-        // 振幅 200 的正弦，RMS ≈ 141，低于门限 500 → 判定为没人说话
-        val n = 960
+        // 振幅 80 的正弦，RMS ≈ 57，低于门限 90 → 判定为没人说话
+        val n = 512
         val pcm = ByteArray(n * 2)
         for (i in 0 until n) {
-            val v = (200 * Math.sin(2 * Math.PI * 440 * i / 16000.0)).toInt()
+            val v = (80 * Math.sin(2 * Math.PI * 440 * i / 16000.0)).toInt()
             pcm[i * 2] = (v and 0xFF).toByte()
             pcm[i * 2 + 1] = ((v shr 8) and 0xFF).toByte()
         }
@@ -169,7 +172,7 @@ class ProtocolTest {
 
     @Test
     fun `正常说话音量应该高于 VAD 门限`() {
-        val n = 960
+        val n = 512
         val pcm = ByteArray(n * 2)
         for (i in 0 until n) {
             val v = (6000 * Math.sin(2 * Math.PI * 300 * i / 16000.0)).toInt()
