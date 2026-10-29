@@ -10,16 +10,16 @@
 //! 麦克风只取左声道上传**。多出的 CPU 开销可以忽略（一个 1920 字节的循环），
 //! 但省掉了整个「为什么没声音」的排查过程。
 
-use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Timer};
-use esp_println::println;
 use esp_hal::dma::aligned::DmaAlignedMut;
 use esp_hal::dma::{DmaRxBuf, DmaTxBuf};
 use esp_hal::i2s::master::{I2sRx, I2sTx};
 use esp_hal::Async;
+use esp_println::println;
 
 use crate::board::{FRAME_BYTES, FRAME_SAMPLES, I2S_FRAME_BYTES};
 
@@ -85,6 +85,12 @@ pub static SPK_CH: Channel<CriticalSectionRawMutex, AudioFrame, 24> = Channel::n
 ///   used_ms 平均一圈耗时       → 正常应该 32~34ms，明显更大说明 DMA 在等
 pub static SPK_PLAYED: AtomicU32 = AtomicU32::new(0);
 pub static SPK_EMPTY: AtomicU32 = AtomicU32::new(0);
+/// 取到了音频、但不足一个 8 帧 DMA 批次的次数。这个值大于 0 说明播放
+/// 水位不够稳定：虽然不是完全空队列，仍会频繁重启 DMA 并产生短促咔声。
+pub static SPK_PARTIAL: AtomicU32 = AtomicU32::new(0);
+/// 当前是否还有一批真实语音在 DMA 中。tts stop 要等它结束，不能只看队列；
+/// speaker_task 可能已经把队列取空，但最后 1~8 帧仍在硬件里播放。
+pub static SPK_INFLIGHT: AtomicBool = AtomicBool::new(false);
 pub static SPK_DROP: AtomicU32 = AtomicU32::new(0);
 pub static SPK_USED_MS: AtomicU32 = AtomicU32::new(0);
 /// 本轮播放出现过的最大样本绝对值。
@@ -164,9 +170,9 @@ pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
     // 「内部 RAM 榨干 → 跑一阵整机卡死」，不能为了录音往前兜 192ms 去冒险）。
     // mic_task 启动时一次性分配，之后原地轮转复用。
     let preroll = crate::alloc_psram_buf(PREROLL_FRAMES * FRAME_BYTES);
-    let mut preroll_w = 0usize;   // 下一个写入槽位
-    let mut preroll_n = 0usize;   // 已存帧数（上限 PREROLL_FRAMES）
-    // 麦克风电平日志的节流计数
+    let mut preroll_w = 0usize; // 下一个写入槽位
+    let mut preroll_n = 0usize; // 已存帧数（上限 PREROLL_FRAMES）
+                                // 麦克风电平日志的节流计数
     let mut mic_tick: u32 = 0;
 
     // ---- 麦克风声道自动校准 ----
@@ -267,7 +273,11 @@ pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
                 let l_avg = isqrt(ch_l / CH_CAL_FRAMES as u64);
                 let r_avg = isqrt(ch_r / CH_CAL_FRAMES as u64);
                 mic_ch = if ch_r > ch_l { 1 } else { 0 };
-                let (hi, lo) = if l_avg >= r_avg { (l_avg, r_avg) } else { (r_avg, l_avg) };
+                let (hi, lo) = if l_avg >= r_avg {
+                    (l_avg, r_avg)
+                } else {
+                    (r_avg, l_avg)
+                };
                 if hi < 60 {
                     // 两路都只有底噪 —— 不是声道选错，是麦克风根本没信号
                     log::error!(
@@ -423,7 +433,9 @@ pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
                     for i in 0..preroll_n {
                         let off = ((start + i) % PREROLL_FRAMES) * FRAME_BYTES;
                         let mut f = AudioFrame::new();
-                        if f.extend_from_slice(&preroll[off..off + FRAME_BYTES]).is_ok() {
+                        if f.extend_from_slice(&preroll[off..off + FRAME_BYTES])
+                            .is_ok()
+                        {
                             if MIC_CH.try_send(f).is_ok() {
                                 flushed += 1;
                             }
@@ -610,6 +622,8 @@ pub async fn speaker_task(mut tx: I2sTx<'static, Async>) {
                     crate::aec::push_reference(&mono);
                 }
             }
+        } else if filled > 0 && filled < XFER_FRAMES {
+            SPK_PARTIAL.fetch_add(1, Ordering::Relaxed);
         }
         // 没装满的部分补静音
         for b in &mut buf[filled * I2S_FRAME_BYTES..] {
@@ -629,9 +643,14 @@ pub async fn speaker_task(mut tx: I2sTx<'static, Async>) {
         };
         dma.set_length(send_bytes);
 
+        let has_audio = filled > 0;
+        if has_audio {
+            SPK_INFLIGHT.store(true, Ordering::Release);
+        }
         let transfer = match tx.write(dma) {
             Ok(t) => t,
             Err((_, t, b)) => {
+                SPK_INFLIGHT.store(false, Ordering::Release);
                 tx = t;
                 dma = b;
                 // 【必须 await，不能直接 continue】
@@ -649,6 +668,9 @@ pub async fn speaker_task(mut tx: I2sTx<'static, Async>) {
         };
         let t_wait = Instant::now();
         let (res, t, b) = transfer.wait_async().await;
+        if has_audio {
+            SPK_INFLIGHT.store(false, Ordering::Release);
+        }
         SPK_WAIT_MS.fetch_add(t_wait.elapsed().as_millis() as u32, Ordering::Relaxed);
         tx = t;
         dma = b;
@@ -669,9 +691,11 @@ pub async fn speaker_task(mut tx: I2sTx<'static, Async>) {
         let frame_ms = crate::board::FRAME_MS as u64;
         let used = t_begin.elapsed().as_millis() as u64;
         // 累计耗时，用来算「设备消费音频的实际速度」（时钟漂移的直接证据）
-        // 一次传输 = XFER_FRAMES 帧音频，统计要按帧计
+        // 按实际提交帧数统计；以前无论 filled 是 1 还是 8 都加 8，
+        // 会把短批次造成的周期问题完全掩盖掉。
         SPK_USED_MS.fetch_add(used as u32, Ordering::Relaxed);
-        SPK_PLAYED.fetch_add(XFER_FRAMES as u32, Ordering::Relaxed);
+        let submitted_frames = if filled > 0 { filled } else { XFER_FRAMES };
+        SPK_PLAYED.fetch_add(submitted_frames as u32, Ordering::Relaxed);
         // 【只在「明显异常地快」时才补睡】
         //
         // 原来写的是 `if used < frame_ms { sleep(frame_ms - used) }`。
