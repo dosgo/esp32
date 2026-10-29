@@ -388,9 +388,9 @@ SYSTEM_PROMPT = (
 # 原来的 250 是按 30dB 增益调的。
 VAD_RMS_THRESHOLD = 90
 # 连续多响才算「开口」。真实说话是持续的，噪音是断续的 —— 这是两者最可靠的差别。
-VAD_ONSET_MS = 96
+VAD_ONSET_MS = 64
 VAD_SILENCE_MS = 450
-VAD_MIN_SPEECH_MS = 300
+VAD_MIN_SPEECH_MS = 192
 # 最长一段语音。设 8 秒而不是 15：环境吵的时候 VAD 可能一直判「还在说」，
 # 拖到 15 秒才强制截断，那一段音频已经混了几十句噪音，识别必然失败。
 VAD_MAX_UTTERANCE_MS = 8000
@@ -399,7 +399,7 @@ VAD_MAX_UTTERANCE_MS = 8000
 # 取 0.8s：正常一句话至少这么长。喘气、衣物摩擦、敲桌子这些会让 VAD 判成
 # 说话但识别不出字的声音，一般都在 0.5s 以内 —— 给它们回话会变成机器人
 # 不停地插嘴说「没听清」，反而更烦。
-VAD_ASK_RETRY_S = 0.8
+VAD_ASK_RETRY_S = 0.5
 AWAKE_TIMEOUT_S = 90
 
 
@@ -516,6 +516,21 @@ def resample(pcm: bytes, src: int, dst: int) -> bytes:
         spec = np.pad(spec, (0, n_bins - spec.size))
     y = np.fft.irfft(spec, n_out) * (n_out / x.size)
     return y.clip(-32768, 32767).astype("<i2").tobytes()
+
+
+def fade_pcm_edges(pcm: bytes, fade_ms: int = 8) -> bytes:
+    """给每个 TTS 小句做短淡入淡出，避免尾帧补零产生波形硬跳变。"""
+    if len(pcm) < 4 or fade_ms <= 0:
+        return pcm
+    import numpy as np
+    a = np.frombuffer(pcm[: len(pcm) // 2 * 2], dtype="<i2").astype(np.float32)
+    n = min(a.size // 2, SAMPLE_RATE * fade_ms // 1000)
+    if n < 2:
+        return pcm
+    ramp = np.linspace(0.0, 1.0, n, endpoint=True, dtype=np.float32)
+    a[:n] *= ramp
+    a[-n:] *= ramp[::-1]
+    return a.clip(-32768, 32767).astype("<i2").tobytes()
 
 
 def save_wav(path, pcm: bytes):
@@ -949,6 +964,7 @@ class TtsChain:
                 t0 = time.time()
                 pcm = await b.synth(http, text)
                 if pcm:
+                    pcm = fade_pcm_edges(pcm)
                     dt = (time.time() - t0) * 1000
                     print(f"  [tts] {b.name}：{len(pcm)/2/SAMPLE_RATE:.1f}s 音频，{dt:.0f}ms")
                     return pcm
@@ -1212,15 +1228,17 @@ class PcmSender:
     偏出小半秒。绝对时间轴每帧往后推固定 32ms，抖动不累积。
     """
 
-    # 【4 → 8，2026-10-28】
+    # 【4 → 16】播放侧现在按 8 帧一批提交 DMA，网关至少保留两批水位。
     #
     # 128ms 的水位在这台机器上根本吸不住抖动：Windows 的 asyncio 定时器颗粒度
     # 是 15.6ms，`sleep(32ms)` 实际落在 31~47ms，再加上 GIL/调度偶发停顿，
     # 一两百毫秒的空窗很常见。水位只有 4 帧时，一次空窗就把设备队列抽干，
     # 设备只能补静音 —— 每个接缝一声「啵」。实测一轮 218 帧里空帧 106。
     #
-    # 抬到 8 帧（256ms）后抖动能被吃掉，代价是首句多等 128ms。
-    TARGET = 8      # 目标水位（帧）= 256ms
+    # 只抬到 8 帧仍然会被每次 DMA 一次抽空；16 帧给下一批留下余量。
+    # ESP32 一次 DMA 会取 8 帧。只保留 8 帧等于每次刚好抽空，任何调度抖动
+    # 都会让下一批只拿到 1~7 帧，频繁重启 I2S DMA 并产生咔声。保留两批水位。
+    TARGET = 16     # 目标水位（帧）= 512ms
     SAFE_MAX = 22   # 设备那边队列已加深到 24 帧，这里只是水位告警阈值
 
     def __init__(self):

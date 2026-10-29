@@ -1298,6 +1298,7 @@ async fn handle_text(c: &mut WsConn, s: &str) -> Result<(), &'static str> {
                     while SPK_CH.try_receive().is_ok() {}
                     audio::SPK_PLAYED.store(0, core::sync::atomic::Ordering::Relaxed);
                     audio::SPK_EMPTY.store(0, core::sync::atomic::Ordering::Relaxed);
+                    audio::SPK_PARTIAL.store(0, core::sync::atomic::Ordering::Relaxed);
                     audio::SPK_DROP.store(0, core::sync::atomic::Ordering::Relaxed);
                     audio::SPK_USED_MS.store(0, core::sync::atomic::Ordering::Relaxed);
                     audio::SPK_PEAK.store(0, core::sync::atomic::Ordering::Relaxed);
@@ -1306,7 +1307,9 @@ async fn handle_text(c: &mut WsConn, s: &str) -> Result<(), &'static str> {
                 }
                 Some("stop") => {
                     // 等播放队列放完再回待机，否则最后一句会被截断
-                    while !SPK_CH.is_empty() {
+                    while !SPK_CH.is_empty()
+                        || audio::SPK_INFLIGHT.load(core::sync::atomic::Ordering::Acquire)
+                    {
                         Timer::after(Duration::from_millis(20)).await;
                     }
                     // 一句播完打一行统计。三个数直接区分「破音」的不同来源：
@@ -1316,16 +1319,16 @@ async fn handle_text(c: &mut WsConn, s: &str) -> Result<(), &'static str> {
                     let played = audio::SPK_PLAYED.load(core::sync::atomic::Ordering::Relaxed);
                     let used = audio::SPK_USED_MS.load(core::sync::atomic::Ordering::Relaxed);
                     log::error!(
-                        "[spk] 帧={played} 丢帧={} 空帧={} 平均周期={}ms 其中等DMA={}ms 峰值={}",
+                        "[spk] 帧={played} 丢帧={} 空帧={} 半批={} 平均周期={}ms 其中等DMA={}ms 峰值={}",
                         audio::SPK_DROP.load(core::sync::atomic::Ordering::Relaxed),
                         audio::SPK_EMPTY.load(core::sync::atomic::Ordering::Relaxed),
+                        audio::SPK_PARTIAL.load(core::sync::atomic::Ordering::Relaxed),
                         if played > 0 { used / played } else { 0 },
                         if played > 0 {
                             audio::SPK_WAIT_MS.load(core::sync::atomic::Ordering::Relaxed) / played
                         } else { 0 },
                         audio::SPK_PEAK.load(core::sync::atomic::Ordering::Relaxed),
                     );
-                    Timer::after(Duration::from_millis(200)).await;
                     audio::set_state(State::Idle);
                 }
                 _ => {}
