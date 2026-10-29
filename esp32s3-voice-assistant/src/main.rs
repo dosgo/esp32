@@ -1038,6 +1038,7 @@ async fn ws_loop(stack: embassy_net::Stack<'static>) -> ! {
                 }
             }
         }
+        display::GW_READY.store(false, core::sync::atomic::Ordering::Relaxed);
         audio::set_state(State::Idle);
         // 把队列里残留的音频清掉，避免重连后把旧声音发出去
         while MIC_CH.try_receive().is_ok() {}
@@ -1062,6 +1063,9 @@ async fn run_session(stack: embassy_net::Stack<'static>) -> Result<(), &'static 
 
     log::error!("[ws] 连接 {gw_host}:{gw_port} …");
     let mut c = WsConn::connect(stack, ip, gw_port, "/", DEVICE_NAME, host.as_str()).await?;
+    // TCP 连上就先把屏幕从 CONNECTING 换成 READY；后面 hello 失败会由
+    // ws_loop 统一置回 false。
+    display::GW_READY.store(true, core::sync::atomic::Ordering::Relaxed);
     // 降到 debug：重连时每轮都会打一条，info 级别会在网关没开时刷爆 USB-JTAG
     log::debug!("[ws] 握手完成");
 
