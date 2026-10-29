@@ -80,16 +80,15 @@ const SYS10_LINESEL_SHIFT: u8 = 4;
 /// 0dB 对应 0xBF（-95.5dB + 191×0.5dB = 0dB，见 TLV 表）
 const VOL_0DB: u8 = 0xBF;
 
-/// 播放音量取 -9dB = 0xAD（0xBF 往下 18 档 × 0.5dB）。
+/// 播放音量取 0dB = 0xBF（ES8311 数字音量最大档）。
 ///
-/// 【为什么不用 0dB】实测录音里有大量满幅样本（峰值打到 32767/-32768），
-/// 说明信号链已经削顶。0dB 的 DAC 再叠 NS4150B 功放（约 24dB 增益），
-/// 喇叭出来必然是破音 —— 用户的原话是「播放还是波音（破音）」。
-/// 降 9dB 留出约 3 倍余量，主观响度只掉一点点，但削波会彻底消失。
+/// 2026-10-30：-9dB 太小声，-6dB 用户仍嫌小；而吱吱声在 -6/-3 都存在，
+/// 说明它跟音量削顶不是一一对应。先把音量给满，吱吱声单独按硬件/链路查。
+/// 如果最大音量下出现明显破音，再回调到 -3dB（0xB9）或 -6dB（0xB3）。
 ///
 /// 注意别用 `set_volume(75)`：那个函数是线性映射到 0x00~0xBF，
 /// 75 算出来是 0x8F，相当于 -24dB，声音会小到听不见。
-const DAC_VOL_MINUS_9DB: u8 = 0xAD;
+const DAC_VOL_0DB: u8 = 0xBF;
 
 /// ES8311 驱动。
 ///
@@ -196,11 +195,14 @@ impl<I2C: I2c> Es8311<I2C> {
         self.update(REG_SYS4, SYS4_PDN_PGA | SYS4_PDN_MOD, 0)
             .map_err(|_| "麦克风: 0x0E (PGA/MOD 上电)")?;
         // 输入选择：0 = MIC1P/MIC1N 差分（板载模拟麦走这条）
-        // PGA 增益 12dB（0x04，步进 3dB）。太大会削顶，太小 ASR 识别率掉
+        // PGA 增益 24dB（0x08，步进 3dB）。太大会削顶，太小 ASR 识别率掉。
+        // 2026-10-29：12dB 时安静环境 RMS 40、说话峰值常不到 300，网关
+        // VAD 门限 90 判不到；18dB 好一些，但用户离板子稍远仍然偶尔不唤醒。
+        // 这里用 24dB；如果环境底噪被放大到误唤醒，再退回 18dB。
         self.update(
             REG_SYS10,
             SYS10_PGA_GAIN_MASK | (0x03 << SYS10_LINESEL_SHIFT),
-            0x04,
+            0x08,
         )
         .map_err(|_| "麦克风: 0x14 (增益/输入选择)")?;
         // ADC 数字侧 0dB
@@ -217,7 +219,7 @@ impl<I2C: I2c> Es8311<I2C> {
             .map_err(|_| "播放: 0x12 (DAC 上电)")?;
         self.update(REG_DAC1, SDP_MUTE, 0)
             .map_err(|_| "播放: 0x31 (解除静音)")?;
-        self.write_reg(REG_DAC2, DAC_VOL_MINUS_9DB)
+        self.write_reg(REG_DAC2, DAC_VOL_0DB)
             .map_err(|_| "播放: 0x32 (音量)")?;
         self.update(REG_DAC6, 0, 0x08)
             .map_err(|_| "播放: 0x37 (EQ bypass)")?; // EQ bypass

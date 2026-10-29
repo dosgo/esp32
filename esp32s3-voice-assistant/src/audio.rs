@@ -77,6 +77,15 @@ const PREROLL_FRAMES: usize = 6;
 /// 队列清空（见 main.rs 的 handle_text），保证跨轮次不会越积越多。
 pub static SPK_CH: Channel<CriticalSectionRawMutex, AudioFrame, 24> = Channel::new();
 
+/// `tts start` 后先别切 Speaking：等队列攒够一整批 8 帧再开始播放。
+///
+/// 2026-10-30：用户描述的「啵啵」在 [spk] 里对应 `空帧=1 + 半批=1`。
+/// 如果 tts start 立刻切 Speaking，speaker_task 第一圈队列还是空的，
+/// 会先补 8 帧静音，等音频到了再从静音硬切到语音 —— 就是开头那声「啵」。
+/// 现在 start 只清队列 + 置这个标志，main 循环等 SPK_CH 攒够 8 帧再切 Speaking。
+pub static SPK_PRIMING: AtomicBool = AtomicBool::new(false);
+pub const SPK_PRIME_FRAMES: usize = 8;
+
 /// 播放统计：给「破音/卡顿」定位用，每轮 TTS 结束由 main.rs 打一行。
 ///
 /// 三件事一眼看出问题在哪：
@@ -394,16 +403,16 @@ pub async fn mic_task(mut rx: I2sRx<'static, Async>) {
                         } else if energy * 2 < noise_floor * 3 {
                             noise_floor = (noise_floor * 31 + energy) / 32;
                         }
-                        // 【阈值下限取 80】
+                        // 【阈值下限取 80，倍数从 2 降到 1.5】
                         //
-                        // 实测这台机器的麦克风电平：安静环境 rms 在 100 以下，
-                        // 正常说话几百到上千。原来的 `.max(400)` 会把大量人声帧
-                        // 判成静音，连续 2 帧的门槛永远凑不齐 —— 表现就是
-                        // 「我明明说话了，它一动不动」。
+                        // 实测 18dB 增益下安静环境 rms 约 80~90，正常说话
+                        // 300~1000。原来用 `noise_floor * 2`，安静时阈值就
+                        // 到 170~180，说话小声一点/离麦远一点就凑不齐连续
+                        // 2 帧 —— 表现就是「老不搭理我」。
                         //
-                        // 80 位于「安静上限」和「说话下限」之间，留了余量，
-                        // 也不会被环境底噪误触发。
-                        energy > (noise_floor * 2).max(80)
+                        // 1.5 倍把阈值压到 130 左右，仍然高于环境底噪，
+                        // 但给小声说话留了余量；如果误唤醒变多再回调。
+                        energy > (noise_floor * 3 / 2).max(80)
                     };
                     let any_speech = speech || by_energy;
                     if any_speech {
@@ -583,6 +592,14 @@ pub async fn speaker_task(mut tx: I2sTx<'static, Async>) {
         // 一次尽量装满 4 帧；不够的部分补静音（提交长度恒定，DMA 不会在边界停振）
         let mut filled = 0usize;
         while filled < XFER_FRAMES {
+            // 【关键】非 Speaking 状态不要消费 SPK_CH。
+            //
+            // tts start 后我们故意先停在 Thinking，等队列攒够 8 帧再切
+            // Speaking；如果 speaker_task 在 Thinking 也把帧取走，队列永远
+            // 攒不满，priming 就没意义，而且音频会在 Thinking 阶段被提前播掉。
+            if crate::audio::state() != State::Speaking {
+                break;
+            }
             let Ok(f) = SPK_CH.try_receive() else { break };
             let base = filled * I2S_FRAME_BYTES;
             let n = f.len().min(FRAME_SAMPLES * 2);
@@ -631,17 +648,16 @@ pub async fn speaker_task(mut tx: I2sTx<'static, Async>) {
         }
 
         dma.as_mut_slice().copy_from_slice(&buf[..]);
-        // 【长度按实际装到的帧数提交，不要恒定 XFER_BYTES】
+        // 【2026-10-30 改：不再提交短批次】
         //
-        // 恒定长度的写法在队列不满时会把后面几帧补成静音一起播出去：
-        // 8 帧缓冲下一次能补进 224ms 空白，句子之间会多出一段死寂。
-        // 只有一帧都没取到时才用满长度（那是为了让 I2S 时钟不停振）。
-        let send_bytes = if filled > 0 {
-            filled * I2S_FRAME_BYTES
-        } else {
-            XFER_BYTES
-        };
-        dma.set_length(send_bytes);
+        // 实测 22 帧预缓冲后，[spk] 从「空帧 4~13 / 半批 4~10」降到
+        // 「空帧 1 / 半批 1」；剩下这一声基本就是句尾不足 8 帧时提交短 DMA、
+        // 重启 I2S 造成的咔声。
+        //
+        // 现在不足 8 帧也按满长度提交，缺的补静音。代价是句尾最多多
+        // 224ms 静音，但不会在音频中间重启 DMA；只有 filled=0 时才用满长度
+        // 的旧逻辑也一并统一了（反正都是静音）。
+        dma.set_length(XFER_BYTES);
 
         let has_audio = filled > 0;
         if has_audio {

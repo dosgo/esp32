@@ -15,7 +15,7 @@ ESP32-S3 ──WiFi──> 手机（本 App）
 ```
 
 > **本工程已在本机实测编译通过**：`BUILD SUCCESSFUL`，产出 `app-debug.apk` 16MB，
-> 17 个单元测试全过，lint 0 error。用的工具链见下表。
+> 35 个单元测试全过，lint 0 error。用的工具链见下表。
 
 ## 目录
 
@@ -40,7 +40,7 @@ android/
 │       │   ├── AudioPcm.kt          PCM 转换 / 重采样 / RMS（纯 Kotlin，可测）
 │       │   └── Protocol.kt          协议常量 / JSON 工具
 │       └── test/java/com/dosgo/voicegw/
-│           └── ProtocolTest.kt      17 个单元测试，不需要真机
+│           └── ProtocolTest.kt      协议/PCM/VAD 等纯 JVM 单元测试，不需要真机
 └── models/
     └── vits-icefall-zh-aishell3/   TTS 模型 + 文本规则（拷到手机用）
 ```
@@ -89,7 +89,7 @@ gradlew.bat testDebugUnitTest
 
 | 方式 | 需要电脑 | 需要网络 | 说明 |
 |---|---|---|---|
-| **App 内下载** | ❌ | ✅ | 装好 APK 后**主界面**点「下载模型（约 268MB）」 |
+| **App 内下载** | ❌ | ✅ | 装好 APK 后**主界面**点「下载模型（约 347MB）」 |
 | adb push | ✅ | ❌ | `deploy.bat` 一键，局域网/数据线最快 |
 
 ### 方式 A：App 内直接下载（不用电脑）
@@ -185,7 +185,7 @@ adb push "...\android\models\vits-icefall-zh-aishell3\new_heteronym.fst"  /sdcar
 日志里 `hello` 那一行会顺手校验格式，正常长这样：
 
 ```
-hello: pcm 16000Hz/16bit/60ms 一帧
+hello: pcm 16000Hz/16bit/32ms 一帧
 ```
 
 如果不是，会直接打警告告诉你固件哪一项对不上——这比听到一堆杂音再回来猜要省事。
@@ -386,7 +386,7 @@ rec = OfflineRecognizer(config = config)
 |---|---|---|
 | ASR | sherpa-onnx 或纯 Python 自实现 | sherpa-onnx（AAR） |
 | TTS | Piper / Kokoro / 云端 | sherpa-onnx VITS |
-| 模型体积 | 229MB + 63MB | 229MB + 32MB |
+| 模型体积 | 229MB + 63MB | 229MB + 121MB（fanchen 16k） |
 | 后台稳定性 | Termux 容易被杀 | 前台服务，稳 |
 | 装法 | 装 Python 环境 | 装 APK |
 
@@ -403,7 +403,7 @@ python test_client.py --voice "你好小智" "现在几点了"
 |---|---|
 | 编译 | ✅ `BUILD SUCCESSFUL`，APK 16MB |
 | lint | ✅ 0 error（34 warning 全是「依赖有新版本」这类提示） |
-| 单元测试 | ✅ **26/26 通过**（17 个协议/PCM/VAD + 9 个下载逻辑：跳转、续传、覆盖、截断、404、取消） |
+| 单元测试 | ✅ **35/35 通过**（17 个协议/PCM/VAD + 9 个下载逻辑 + 9 个网卡选择） |
 | APK 内容 | ✅ arm64-v8a 的 `libonnxruntime.so` / `libsherpa-onnx-jni.so` 都在，图标正常 |
 | 测试页 | ✅ 已编进 APK（`TestActivity` + `RECORD_AUDIO` 权限都在清单里） |
 | 下载功能 | ⚠️ 逻辑有 9 个单测覆盖（本地服务器模拟 308/302、Range、截断），但**真实网络能不能通要你在手机上试** |

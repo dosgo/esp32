@@ -1253,6 +1253,15 @@ async fn run_session(stack: embassy_net::Stack<'static>) -> Result<(), &'static 
             }
             c.consume(total);
         }
+
+        // tts start 后先攒够一整批 8 帧再真正开始播放，避免开头
+        // 「空队列 → 补静音 → 硬切语音」那声「啵」。
+        if audio::SPK_PRIMING.load(core::sync::atomic::Ordering::Acquire)
+            && SPK_CH.len() >= audio::SPK_PRIME_FRAMES
+        {
+            audio::SPK_PRIMING.store(false, core::sync::atomic::Ordering::Release);
+            audio::set_state(State::Speaking);
+        }
     }
 }
 
@@ -1303,9 +1312,15 @@ async fn handle_text(c: &mut WsConn, s: &str) -> Result<(), &'static str> {
                     audio::SPK_USED_MS.store(0, core::sync::atomic::Ordering::Relaxed);
                     audio::SPK_PEAK.store(0, core::sync::atomic::Ordering::Relaxed);
                     audio::SPK_WAIT_MS.store(0, core::sync::atomic::Ordering::Relaxed);
-                    audio::set_state(State::Speaking);
+                    // 【不要立刻切 Speaking】先停在 Thinking，让 ws_task 把
+                    // 前 8 帧音频收进 SPK_CH；main 循环看到攒够一批后再切。
+                    // 否则 speaker_task 第一圈队列为空，会先播 8 帧静音，
+                    // 再从静音硬切到语音 —— 就是开头那声「啵」。
+                    audio::SPK_PRIMING.store(true, core::sync::atomic::Ordering::Release);
+                    audio::set_state(State::Thinking);
                 }
                 Some("stop") => {
+                    audio::SPK_PRIMING.store(false, core::sync::atomic::Ordering::Release);
                     // 等播放队列放完再回待机，否则最后一句会被截断
                     while !SPK_CH.is_empty()
                         || audio::SPK_INFLIGHT.load(core::sync::atomic::Ordering::Acquire)
