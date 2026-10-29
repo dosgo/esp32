@@ -584,7 +584,7 @@ App 里内置了一个**本地测试页**（主界面 →「本地测试（不�
 详细步骤（编译、放模型、adb push 命令、排错）见 **`android/README.md`**。
 
 **编译状态：已实测通过。** `gradlew.bat assembleDebug` → `BUILD SUCCESSFUL`，
-产出 16MB 的 `app-debug.apk`，17 个单元测试全过，lint 0 error。
+产出 16MB 的 `app-debug.apk`，35 个单元测试全过，lint 0 error。
 
 ```bat
 cd D:\esp32\esp32s3-voice-assistant\android
@@ -594,7 +594,7 @@ deploy.bat             :: 插上手机，装 APK + 推模型一步到位
 ```
 
 **模型也可以不用电脑**：只装 APK（`deploy.bat apk`），然后进 App 的
-「本地测试 → ⑤ 下载模型」点一下，手机自己下 268MB（默认走 `hf-mirror.com`
+「本地测试 → ⑤ 下载模型」点一下，手机自己下约 347MB（默认走 `hf-mirror.com`
 国内镜像，支持断点续传，也可填自己的地址）。
 
 工具链用的是本机实际装的：SDK Platform 37 + build-tools 36 + JDK 25（Studio 自带 JBR）

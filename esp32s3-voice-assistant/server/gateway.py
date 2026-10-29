@@ -123,6 +123,10 @@ DS_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 # ---- Piper 本地 TTS ----
 PIPER_MODEL = HERE / "models" / "zh_CN-huayan-medium.onnx"
 PIPER_LENGTH_SCALE = float(os.environ.get("PIPER_LENGTH_SCALE", "1.0"))  # >1 更慢
+# Piper 输出峰值归一化。用户实测 0.40 仍偏小，先抬到 0.45，配合 DAC 0dB。
+# 如果最大音量下出现明显破音/吱吱加重，先降这里到 0.35，再考虑 DAC 回 -3dB。
+# 也可以启动前 set PIPER_PEAK=0.50 临时试。
+PIPER_PEAK = float(os.environ.get("PIPER_PEAK", "0.45"))
 
 # ---- Kokoro 本地 TTS（82M 参数，音质比 Piper 好一档，但慢 6 倍）----
 KOKORO_MODEL = HERE / "models" / "tts" / "kokoro-v1.0.onnx"
@@ -871,7 +875,7 @@ class PiperTts(TtsBackend):
         # 不会出现长句变小声、短句特别炸的情况。
         peak = float(np.abs(arr).max())
         if peak > 1e-6:
-            arr = arr / peak * 0.35
+            arr = arr / peak * PIPER_PEAK
         pcm = (arr * 32767).clip(-32768, 32767).astype("<i2").tobytes()
         # Piper 的 huayan 模型是 22.05kHz，要降到设备端的 16kHz
         return resample(pcm, chunks[0].sample_rate, SAMPLE_RATE)
@@ -1238,8 +1242,11 @@ class PcmSender:
     # 只抬到 8 帧仍然会被每次 DMA 一次抽空；16 帧给下一批留下余量。
     # ESP32 一次 DMA 会取 8 帧。只保留 8 帧等于每次刚好抽空，任何调度抖动
     # 都会让下一批只拿到 1~7 帧，频繁重启 I2S DMA 并产生咔声。保留两批水位。
-    TARGET = 16     # 目标水位（帧）= 512ms
-    SAFE_MAX = 22   # 设备那边队列已加深到 24 帧，这里只是水位告警阈值
+    # 2026-10-30：实测 [spk] 丢帧=0，但空帧=4~13、半批=4~10，说明不是推太快，
+    # 而是预缓冲不够，设备偶发被抽干后补静音（听感就是破音/咔声）。
+    # 设备队列 24 帧，目标水位从 16 抬到 22（704ms），只留 2 帧余量防溢出。
+    TARGET = 22     # 目标水位（帧）= 704ms
+    SAFE_MAX = 24   # 设备队列 24 帧，逼近就说明有突发灌帧
 
     def __init__(self):
         self.level = 0.0
