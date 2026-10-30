@@ -48,6 +48,15 @@ from websockets.exceptions import ConnectionClosed
 HERE = Path(__file__).parent
 
 
+def chat_log(kind, text):
+    """Append the actual conversation text in UTF-8, independent of console encoding."""
+    try:
+        with open(HERE / "chat.log", "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%H:%M:%S')} {kind}: {text}\n")
+    except Exception:
+        pass
+
+
 def load_env():
     """读 .env（手写解析，不为了几行配置引 python-dotenv）"""
     f = HERE / ".env"
@@ -336,8 +345,25 @@ def print_runtime_config(prefix="[cfg]"):
 WAKE_WORDS = [
     # 设备端 WakeNet 用的是「小特小特」，ASR 转写可能写成下面几种
     "小特小特", "小特", "小特小",
+    "小兔小兔", "小兔",
     "你好小智", "小智小智", "嗨小智", "嘿小智", "小智",
 ]
+
+
+def strip_wake(text: str) -> str:
+    """Remove a leading/trailing wake word; the wake word is not a command."""
+    t = (text or "").strip(" \t\r\n，。！？、,.!?")
+    changed = True
+    while changed:
+        changed = False
+        for w in sorted(WAKE_WORDS, key=len, reverse=True):
+            if t.startswith(w):
+                t = t[len(w):].lstrip(" \t\r\n，。！？、,.!?")
+                changed = True
+            if t.endswith(w):
+                t = t[:-len(w)].rstrip(" \t\r\n，。！？、,.!?")
+                changed = True
+    return t
 
 # 是否要求先喊唤醒词才应答。
 #
@@ -372,7 +398,9 @@ def match_wake(text: str) -> bool:
     return 0 <= pos <= WAKE_PINYIN_MAX_POS
 
 SYSTEM_PROMPT = (
-    "你是一个运行在 ESP32 小音箱里的语音助手。"
+    "你是一个语音指令执行器。用户喊唤醒词只是为了叫醒你，不是在问你是谁。"
+    "直接执行用户的要求，不要介绍自己、不要解释身份、不要问‘有什么可以帮你’。"
+    "只有用户明确问‘你叫什么’时，才用一句话回答名字；否则不要提名字和功能。"
     "回答要短：一句话、40 个字以内，因为你的回答会被转成语音慢慢播放，说多了用户只能干等。"
     "不要用 Markdown、不要用列表、不要输出表情符号。"
     "不确定的事情直接说不知道，不要编。"
@@ -797,6 +825,12 @@ class StreamingAsr:
 
 
 STREAM_ASR = StreamingAsr()
+
+# 流式 ASR 的 feed() 是同步 CPU 推理，直接在 asyncio 事件循环里跑会
+# 把 accept()/recv() 饿死：设备一断线，新连接就卡在 SynReceived。
+# 默认关闭，走整段 ASR（在 to_thread 里跑）；需要低延迟再显式打开。
+if os.environ.get("GATEWAY_STREAM_ASR", "0") != "1":
+    STREAM_ASR.available = False
 
 
 # ============================================================================
@@ -1374,6 +1408,7 @@ async def respond(ws, sess, http, tts, user_text: str):
 
         reply = "".join(parts).strip()
         print(f"  [llm] {reply}")
+        chat_log("LLM", reply)
         if reply:
             sess.history.append({"role": "assistant", "content": reply})
             await send_json(ws, {"type": "llm", "text": reply})
@@ -1442,6 +1477,7 @@ async def handle_utterance(ws, sess, http, asr, tts):
 
     if not text:
         print(f"  [asr] 空结果（{dur_s:.2f}s 有声音但没解出内容）")
+        chat_log("ASR", f"(空 {dur_s:.2f}s)")
         # 【必须给个回应 —— 「没反应」有一半是这里】
         #
         # 用户明明说了话、设备也确实录到了，但识别器就是吐空。
@@ -1453,16 +1489,25 @@ async def handle_utterance(ws, sess, http, asr, tts):
             await send_json(ws, {"type": "stt", "text": ""})
             await respond(ws, sess, http, tts, "抱歉，我没听清，能再说一遍吗？")
         return
+    raw_text = text
+    wake_hit = match_wake(raw_text)
+    # The wake word is only a trigger; never send it to the LLM as content.
+    text = strip_wake(raw_text)
+    if not text:
+        print("  [asr] 只有唤醒词，不回复")
+        chat_log("ASR", f"(唤醒词: {raw_text})")
+        await send_json(ws, {"type": "stt", "text": ""})
+        return
     print(f"  [asr] {text}")
+    chat_log("ASR", text)
     await send_json(ws, {"type": "stt", "text": text})
 
     if REQUIRE_WAKE and not sess.awake:
-        if match_wake(text):
+        if wake_hit:
             sess.awake = True
             sess.last_talk = time.time()
             print("  [wake] 唤醒成功")
             await send_json(ws, {"type": "ack"})
-            await respond(ws, sess, http, tts, "（用户刚叫了你，用一句话简短回应，比如『我在』）")
         else:
             print("  [wake] 未命中唤醒词，忽略")
             return
