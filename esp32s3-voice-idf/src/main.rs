@@ -41,6 +41,11 @@ enum State {
     FollowUp,
 }
 
+enum Outgoing {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
 fn main() {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
@@ -101,12 +106,17 @@ fn main() {
     println!("[wifi] connected={wifi_ok}");
 
     // ---- WebSocket to the gateway ----
-    let (ws_tx, ws_rx) = mpsc::channel::<&'static str>();
+    // All sends go through a dedicated thread. esp_websocket_client's send is
+    // blocking; flushing pre-roll directly in the audio loop delayed Listening
+    // until the command was already over.
+    let (out_tx, out_rx) = mpsc::sync_channel::<Outgoing>(256);
     let (tts_tx, tts_rx) = mpsc::channel::<Vec<u8>>();
     let speaking = Arc::new(AtomicBool::new(false));
     let speaking_cb = speaking.clone();
+    let ws_connected = Arc::new(AtomicBool::new(false));
+    let ws_connected_cb = ws_connected.clone();
     let ws_cfg = EspWebSocketClientConfig::default();
-    let mut ws = EspWebSocketClient::new(
+    let ws = EspWebSocketClient::new(
         config::WS_URL,
         &ws_cfg,
         Duration::from_secs(10),
@@ -114,7 +124,7 @@ fn main() {
             if let Ok(event) = event {
                 match event.event_type {
                     WebSocketEventType::Connected => {
-                        let _ = ws_tx.send("connected");
+                        ws_connected_cb.store(true, Ordering::Relaxed);
                     }
                     WebSocketEventType::Text(text) => {
                         println!("[ws] {text}");
@@ -128,17 +138,37 @@ fn main() {
                         speaking_cb.store(true, Ordering::Relaxed);
                         let _ = tts_tx.send(data.to_vec());
                     }
-                    WebSocketEventType::Disconnected => println!("[ws] disconnected"),
+                    WebSocketEventType::Disconnected => {
+                        ws_connected_cb.store(false, Ordering::Relaxed);
+                        println!("[ws] disconnected");
+                    }
                     _ => {}
                 }
             }
         },
     )
     .expect("WebSocket init");
-    match ws_rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(_) => println!("[ws] connected"),
-        Err(e) => println!("[ws] no connect: {e:?}"),
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !ws_connected.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(100));
     }
+    if ws_connected.load(Ordering::Relaxed) {
+        println!("[ws] connected");
+    } else {
+        println!("[ws] no connect: timeout");
+    }
+    thread::spawn(move || {
+        let mut ws = ws;
+        while let Ok(msg) = out_rx.recv() {
+            let r = match msg {
+                Outgoing::Text(s) => ws.send(FrameType::Text(false), s.as_bytes()),
+                Outgoing::Binary(b) => ws.send(FrameType::Binary(false), &b),
+            };
+            if let Err(e) = r {
+                println!("[ws] send failed: {e:?}");
+            }
+        }
+    });
 
     // ---- I2C: ES8311 DAC + ES7210 ADC share SDA=42 / SCL=41 ----
     let i2c_cfg = I2cConfig::new().baudrate(100.kHz().into());
@@ -230,9 +260,12 @@ fn main() {
     let mut speech_frames = 0u32;
     let mut silence_frames = 0u32;
     let mut onset_frames = 0u32;
+    let mut ui_voice = false;
+    let mut ui_voice_until: Option<Instant> = None;
     let mut listen_grace_until: Option<Instant> = None;
     let mut thinking_until: Option<Instant> = None;
     let mut followup_until: Option<Instant> = None;
+    let mut followup_mute_until: Option<Instant> = None;
     let mut hello_sent = false;
     let mut last_hb = Instant::now();
     let mut tts_queue: VecDeque<u8> = VecDeque::new();
@@ -270,6 +303,7 @@ fn main() {
         } else if state == State::Speaking {
             state = State::FollowUp;
             followup_until = Some(Instant::now() + Duration::from_secs(5));
+            followup_mute_until = Some(Instant::now() + Duration::from_millis(1500));
             onset_frames = 0;
             let _ = lcd.send("READY");
         }
@@ -289,16 +323,14 @@ fn main() {
             tts_playing = false;
         }
 
-        if ws.is_connected() {
+        if ws_connected.load(Ordering::Relaxed) {
             if !hello_sent {
-                if ws.send(FrameType::Text(false), hello.as_bytes()).is_ok() {
-                    println!("[ws] hello sent");
-                    let _ = lcd.send("READY");
-                }
+                let _ = out_tx.send(Outgoing::Text(hello.to_string()));
                 hello_sent = true;
+                let _ = lcd.send("READY");
             }
             if last_hb.elapsed() >= Duration::from_secs(3) {
-                let _ = ws.send(FrameType::Text(false), br#"{"type":"hb"}"#);
+                let _ = out_tx.try_send(Outgoing::Text(r#"{"type":"hb"}"#.to_string()));
                 last_hb = Instant::now();
             }
         } else {
@@ -338,6 +370,9 @@ fn main() {
             }
         }
 
+        // Sum both ADC slots. The two ES7210 channels are nearly equal in
+        // noise, and picking a per-frame "louder" channel made the waveform
+        // alternate between channels every 32ms, which destroyed ASR.
         let mut rms = [0u64; 2];
         for i in 0..chunk {
             let l = i16::from_le_bytes([raw[i * 4], raw[i * 4 + 1]]);
@@ -362,25 +397,46 @@ fn main() {
 
         if state == State::Idle || state == State::FollowUp {
             pre_roll.push_back(frame_pcm.clone());
-            if pre_roll.len() > 96 {
+            if pre_roll.len() > 64 {
                 pre_roll.pop_front();
             }
+        }
+
+        if state == State::Idle && !tts_active {
+            if frame_rms > 300.0 {
+                if !ui_voice {
+                    let _ = lcd.send("LISTENING");
+                    ui_voice = true;
+                }
+                ui_voice_until = Some(Instant::now() + Duration::from_millis(800));
+            } else if ui_voice {
+                if ui_voice_until.map(|t| Instant::now() >= t).unwrap_or(true) {
+                    let _ = lcd.send("READY");
+                    ui_voice = false;
+                }
+            }
+        } else if ui_voice {
+            ui_voice = false;
         }
 
         match state {
             State::Idle => {
                 if !tts_active && unsafe { sr_wake_detect(mono.as_ptr()) } > 0 {
                     println!("[idf-kws] DETECTED after {frames} frames");
+                    // Queue the last 2s of pre-roll. The sender thread makes
+                    // this non-blocking, so LISTENING starts immediately.
+                    while pre_roll.len() > 64 {
+                        pre_roll.pop_front();
+                    }
                     for pcm in pre_roll.drain(..) {
-                        let _ = ws.send(FrameType::Binary(false), &pcm);
+                        let _ = out_tx.try_send(Outgoing::Binary(pcm));
                     }
                     let _ = lcd.send("LISTENING");
                     state = State::Listening;
                     speech_frames = 0;
                     silence_frames = 0;
                     onset_frames = 0;
-                    listen_grace_until =
-                        Some(Instant::now() + Duration::from_millis(2000));
+                    listen_grace_until = Some(Instant::now() + Duration::from_millis(2000));
                 }
             }
             State::FollowUp => {
@@ -388,18 +444,22 @@ fn main() {
                     if Instant::now() >= until {
                         state = State::Idle;
                         let _ = lcd.send("READY");
+                    } else if followup_mute_until
+                        .map(|t| Instant::now() < t)
+                        .unwrap_or(false)
+                    {
+                        onset_frames = 0;
                     } else if frame_rms > 300.0 {
                         onset_frames += 1;
                         if onset_frames >= 2 {
                             for pcm in pre_roll.drain(..) {
-                                let _ = ws.send(FrameType::Binary(false), &pcm);
+                                let _ = out_tx.try_send(Outgoing::Binary(pcm));
                             }
                             let _ = lcd.send("LISTENING");
                             state = State::Listening;
                             speech_frames = 0;
                             silence_frames = 0;
-                            listen_grace_until =
-                                Some(Instant::now() + Duration::from_millis(1000));
+                            listen_grace_until = Some(Instant::now() + Duration::from_millis(1000));
                         }
                     } else {
                         onset_frames = 0;
@@ -407,9 +467,7 @@ fn main() {
                 }
             }
             State::Listening => {
-                if let Err(e) = ws.send(FrameType::Binary(false), &frame_pcm) {
-                    println!("[ws] pcm send failed: {e:?}");
-                }
+                let _ = out_tx.try_send(Outgoing::Binary(frame_pcm.clone()));
                 speech_frames += 1;
                 if frame_rms > 300.0 {
                     silence_frames = 0;
@@ -435,7 +493,7 @@ fn main() {
 
         if tail_left > 0 {
             let silence = vec![0u8; frame_pcm.len()];
-            let _ = ws.send(FrameType::Binary(false), &silence);
+            let _ = out_tx.try_send(Outgoing::Binary(silence));
             tail_left -= 1;
         }
     }
