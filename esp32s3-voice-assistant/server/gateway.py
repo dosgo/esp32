@@ -32,6 +32,7 @@ import json
 import os
 import struct
 import sys
+import threading
 import time
 import wave
 from dataclasses import dataclass, field
@@ -1756,11 +1757,33 @@ async def device_handler(ws, asr, tts):
                   f"  会话时长 {time.time()-t_conn:.1f}s")
 
 
+_LAST_TICK = time.time()
+
+
+async def _loop_heartbeat():
+    global _LAST_TICK
+    while True:
+        _LAST_TICK = time.time()
+        await asyncio.sleep(0.5)
+
+
+def _loop_watchdog():
+    # If the asyncio loop is stuck (the usual cause of a SynReceived socket
+    # that never gets accepted), exit so the supervisor can restart us.
+    while True:
+        time.sleep(2)
+        if time.time() - _LAST_TICK > 8:
+            print("[watchdog] event loop stuck for >8s, exiting", flush=True)
+            os._exit(1)
+
+
 async def main_server(asr, tts):
     print(f"语音网关 ws://0.0.0.0:{LISTEN_PORT}")
     print(f"  ASR : {' → '.join(b.name for b in asr.backends)}")
     print(f"  LLM : {LLM_BACKEND}")
     print(f"  TTS : {' → '.join(b.name for b in tts.backends)}")
+    threading.Thread(target=_loop_watchdog, daemon=True).start()
+    asyncio.create_task(_loop_heartbeat())
 
     # 预热：所有本地 ONNX 模型的第一次推理都特别慢（懒加载 + 图优化），
     # 不预热的话用户说的第一句话要多等 1-3 秒。启动时各烧一次，输出丢掉。
