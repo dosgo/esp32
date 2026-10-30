@@ -1,0 +1,40 @@
+[package]
+name = "esp32s3-voice-idf"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+[dependencies]
+esp-idf-svc = { version = "0.53", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
+esp-idf-sys = "0.38"
+esp-idf-hal = "0.47"
+log = "0.4"
+embedded-hal = "1.0"
+embedded-hal-bus = "0.2"
+mipidsi = { version = "0.10", default-features = false }
+embedded-graphics = "0.8"
+embassy-time = { version = "0.5", features = ["generic-queue-8"] }
+
+[build-dependencies]
+embuild = "0.33"
+
+[profile.release]
+opt-level = "s"
+
+[package.metadata.esp-idf-sys]
+esp_idf_sdkconfig_defaults = ["sdkconfig.defaults"]
+
+[[package.metadata.esp-idf-sys.extra_components]]
+component_dirs = ["components/esp-sr", "components/esp_sr_shim"]
+
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/esp-dsp", version = "1.6.0" }
+
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/dl_fft", version = "0.2.0" }
+
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/cjson", version = "1.7.19" }
+
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/esp_websocket_client", version = "1.2.0" }

@@ -1,0 +1,23 @@
+# Rust / ESP-IDF build output
+target/
+build/
+sdkconfig
+sdkconfig.old
+*.log
+
+# Local secrets: copy config.example.rs to config.local.rs
+src/config.local.rs
+
+# Python gateway runtime
+server/.venv/
+server/__pycache__/
+server/*.log
+server/*.wav
+server/*.png
+server/chat.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,17 @@
+[[extra_components]]
+component_dirs = ["components/esp-sr", "components/esp_sr_shim"]
+
+[[extra_components]]
+remote_component = { name = "espressif/esp-dsp", version = "1.6.0" }
+
+[[extra_components]]
+remote_component = { name = "espressif/dl_fft", version = "0.2.0" }
+
+[[extra_components]]
+remote_component = { name = "espressif/cjson", version = "1.7.19" }
+
+[[extra_components]]
+remote_component = { name = "espressif/esp_websocket_client", version = "1.2.0" }
+
+
+
