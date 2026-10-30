@@ -339,28 +339,15 @@ fn main() {
         }
 
         let mut rms = [0u64; 2];
-        let mut frame_l = 0u64;
-        let mut frame_r = 0u64;
         for i in 0..chunk {
             let l = i16::from_le_bytes([raw[i * 4], raw[i * 4 + 1]]);
             let r = i16::from_le_bytes([raw[i * 4 + 2], raw[i * 4 + 3]]);
-            frame_l += (l as i64 * l as i64) as u64;
-            frame_r += (r as i64 * r as i64) as u64;
-        }
-        let frame_ch = if frame_r > frame_l { 1 } else { 0 };
-        for i in 0..chunk {
-            let l = i16::from_le_bytes([raw[i * 4], raw[i * 4 + 1]]);
-            let r = i16::from_le_bytes([raw[i * 4 + 2], raw[i * 4 + 3]]);
-            let v = if frame_ch == 0 { l } else { r };
-            let v = ((v as i32) * 2).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            let v = (l as i32 + r as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
             rms[0] += (v as i64 * v as i64) as u64;
             mono[i] = v;
         }
         rms[1] = 0;
-        if frame_ch != mic_ch {
-            mic_ch = frame_ch;
-            println!("[i2s] mic_ch -> {mic_ch}");
-        }
+        mic_ch = 0;
 
         frames = frames.wrapping_add(1);
         let frame_rms = ((rms[0] / chunk as u64) as f64).sqrt();
