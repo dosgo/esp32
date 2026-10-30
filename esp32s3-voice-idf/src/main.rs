@@ -230,6 +230,7 @@ fn main() {
     let mut speech_frames = 0u32;
     let mut silence_frames = 0u32;
     let mut onset_frames = 0u32;
+    let mut listen_grace_until: Option<Instant> = None;
     let mut thinking_until: Option<Instant> = None;
     let mut followup_until: Option<Instant> = None;
     let mut hello_sent = false;
@@ -374,7 +375,7 @@ fn main() {
 
         if state == State::Idle || state == State::FollowUp {
             pre_roll.push_back(frame_pcm.clone());
-            if pre_roll.len() > 50 {
+            if pre_roll.len() > 96 {
                 pre_roll.pop_front();
             }
         }
@@ -391,6 +392,8 @@ fn main() {
                     speech_frames = 0;
                     silence_frames = 0;
                     onset_frames = 0;
+                    listen_grace_until =
+                        Some(Instant::now() + Duration::from_millis(2000));
                 }
             }
             State::FollowUp => {
@@ -408,6 +411,8 @@ fn main() {
                             state = State::Listening;
                             speech_frames = 0;
                             silence_frames = 0;
+                            listen_grace_until =
+                                Some(Instant::now() + Duration::from_millis(1000));
                         }
                     } else {
                         onset_frames = 0;
@@ -424,10 +429,16 @@ fn main() {
                 } else {
                     silence_frames += 1;
                 }
-                if (speech_frames >= 10 && silence_frames >= 22) || speech_frames >= 150 {
+                let grace_done = listen_grace_until
+                    .map(|until| Instant::now() >= until)
+                    .unwrap_or(true);
+                if (grace_done && speech_frames >= 10 && silence_frames >= 22)
+                    || speech_frames >= 150
+                {
                     println!("[stream] end frames={speech_frames} silence={silence_frames}");
                     state = State::Thinking;
                     thinking_until = Some(Instant::now() + Duration::from_secs(10));
+                    listen_grace_until = None;
                     tail_left = 25;
                     let _ = lcd.send("THINKING");
                 }
