@@ -101,6 +101,12 @@ fn main() {
     }
     println!("[wifi] connected={wifi_ok}");
 
+    // Disable WiFi modem sleep: with the default PS mode the device drops ~70%
+    // of packets on this AP (ping: 3/10 replies, TCP SYN-ACK lost -> WS connect
+    // timeout), which makes the gateway handshake fail.
+    let ps = unsafe { esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE) };
+    println!("[wifi] ps=none ret={ps}");
+
     // ---- WebSocket to the gateway ----
     // All sends go through a dedicated thread. esp_websocket_client's send is
     // blocking; flushing pre-roll directly in the audio loop delayed Listening
