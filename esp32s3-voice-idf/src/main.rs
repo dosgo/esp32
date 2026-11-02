@@ -269,8 +269,10 @@ fn main() {
         }
     };
     let mut aec_out = vec![0i16; chunk];
+    // Measured speaker -> mic delay: 640 samples = 40 ms (best correlation).
+    const AEC_REF_DELAY: usize = 640;
     let mut aec_ref_ring: std::collections::VecDeque<i16> =
-        std::collections::VecDeque::with_capacity(chunk * 8);
+        std::collections::VecDeque::with_capacity(chunk * 16);
 
     // I2S std mode is stereo: 2 channels * 2 bytes per sample.
     let mut raw = vec![0u8; chunk * 4];
@@ -426,7 +428,7 @@ fn main() {
             for pair in tx_buf.chunks_exact(4) {
                 aec_ref_ring.push_back(i16::from_le_bytes([pair[0], pair[1]]));
             }
-            while aec_ref_ring.len() > chunk * 4 {
+            while aec_ref_ring.len() > chunk * 12 {
                 aec_ref_ring.pop_front();
             }
         }
@@ -445,10 +447,13 @@ fn main() {
         rms[1] = 0;
         mic_ch = 0;
 
-        // AEC: use the PCM we just pushed to the speaker as the reference.
+        // RMS of the raw mic frame, before echo cancellation.
+        let raw_rms = ((rms[0] / chunk as u64) as f64).sqrt();
+
+        // AEC: reference = the PCM played AEC_REF_DELAY samples ago (40 ms at 16 kHz).
         if let Some(a) = aec.as_mut() {
-            if aec_ref_ring.len() >= chunk {
-                let start = aec_ref_ring.len() - chunk;
+            if aec_ref_ring.len() >= chunk + AEC_REF_DELAY {
+                let start = aec_ref_ring.len() - chunk - AEC_REF_DELAY;
                 let mut ref_frame: Vec<i16> = Vec::with_capacity(chunk);
                 ref_frame.extend(aec_ref_ring.iter().skip(start).copied());
                 a.process(&mono, &ref_frame, &mut aec_out);
@@ -465,7 +470,13 @@ fn main() {
         frames = frames.wrapping_add(1);
         let frame_rms = ((rms[0] / chunk as u64) as f64).sqrt();
         if frames % 32 == 0 {
-            println!("[mic] rms={frame_rms:.0} ch={mic_ch}");
+            // ERLE 只在喇叭真的在放音时有意义。
+            let erle = if tts_active && raw_rms > 20.0 && frame_rms > 0.5 {
+                20.0 * (raw_rms / frame_rms).log10()
+            } else {
+                0.0
+            };
+            println!("[mic] rms={frame_rms:.0} raw={raw_rms:.0} erle={erle:.1}dB ch={mic_ch}");
         }
 
         let mut frame_pcm = Vec::with_capacity(mono.len() * 2);
