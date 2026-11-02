@@ -127,6 +127,11 @@ impl<I2C: I2c> Es8311<I2C> {
         Ok(())
     }
 
+    /// 读任意寄存器（调试用）
+    pub fn readback(&mut self, reg: u8) -> Option<u8> {
+        self.read_reg(reg).ok()
+    }
+
     /// 芯片是否在线（读 CHIPID1，正常应是 0x83）
     pub fn probe(&mut self) -> Option<u8> {
         self.read_reg(0xFD).ok()
