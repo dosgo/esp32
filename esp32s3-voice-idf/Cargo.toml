@@ -25,13 +25,16 @@ opt-level = "s"
 esp_idf_sdkconfig_defaults = ["sdkconfig.defaults"]
 
 [[package.metadata.esp-idf-sys.extra_components]]
-component_dirs = ["components/esp-sr", "components/esp_sr_shim"]
+bindings_header = "D:\\idf\\src\\esp_sr_bindings.h"
 
 [[package.metadata.esp-idf-sys.extra_components]]
-remote_component = { name = "espressif/esp-dsp", version = "1.6.0" }
+remote_component = { name = "espressif/esp-sr", version = "2.6.1" }
 
 [[package.metadata.esp-idf-sys.extra_components]]
-remote_component = { name = "espressif/dl_fft", version = "0.2.0" }
+remote_component = { name = "espressif/esp-dsp", version = "1.8.0" }
+
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/dl_fft", version = "0.8.0" }
 
 [[package.metadata.esp-idf-sys.extra_components]]
 remote_component = { name = "espressif/cjson", version = "1.7.19" }

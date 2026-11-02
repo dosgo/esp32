@@ -5,8 +5,11 @@ sdkconfig
 sdkconfig.old
 *.log
 
-# Local secrets: copy config.example.rs to config.local.rs
-src/config.local.rs
+# Local secrets: copy config.example.rs to config.rs
+src/config.rs
+
+# Migration / rollback scratch
+.migration-backup-*/
 
 # Python gateway runtime
 server/.venv/
