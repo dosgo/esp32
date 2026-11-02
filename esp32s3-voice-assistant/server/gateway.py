@@ -1428,6 +1428,27 @@ async def respond(ws, sess, http, tts, user_text: str):
         sess.busy = False
 
 
+async def ack_wake(ws, sess, http, tts):
+    """只听到唤醒词（或只录到很短一句话）时，回一句「我在」。
+
+    设备端把唤醒词当触发器，唤醒后没有后续内容时网关以前直接 return，
+    用户体感就是「只喊小特它不理我」。这里直接合成一小段应答，不走 LLM。
+    """
+    if sess.sender is None:
+        sess.sender = PcmSender()
+    try:
+        audio = await _synth_safe(tts, http, "我在")
+    except Exception as e:
+        print(f"  [tts] 唤醒应答失败：{e}")
+        return
+    if not audio:
+        return
+    await send_json(ws, {"type": "tts", "state": "start"})
+    await sess.sender.send(ws, audio)
+    await send_json(ws, {"type": "tts", "state": "stop"})
+    print("  [wake] 回一句「我在」")
+
+
 async def handle_utterance(ws, sess, http, asr, tts):
     # ---- 取文本：优先用流式已经解好的结果 ----
     #
@@ -1490,15 +1511,20 @@ async def handle_utterance(ws, sess, http, asr, tts):
         if dur_s >= VAD_ASK_RETRY_S:
             await send_json(ws, {"type": "stt", "text": ""})
             await respond(ws, sess, http, tts, "抱歉，我没听清，能再说一遍吗？")
+        else:
+            # 只喊了唤醒词就停住：也应一声「我在」，否则用户以为设备没理他。
+            await send_json(ws, {"type": "stt", "text": ""})
+            await ack_wake(ws, sess, http, tts)
         return
     raw_text = text
     wake_hit = match_wake(raw_text)
     # The wake word is only a trigger; never send it to the LLM as content.
     text = strip_wake(raw_text)
     if not text:
-        print("  [asr] 只有唤醒词，不回复")
+        print("  [asr] 只有唤醒词，回一句「我在」")
         chat_log("ASR", f"(唤醒词: {raw_text})")
         await send_json(ws, {"type": "stt", "text": ""})
+        await ack_wake(ws, sess, http, tts)
         return
     print(f"  [asr] {text}")
     chat_log("ASR", text)
