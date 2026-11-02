@@ -1228,6 +1228,7 @@ class Session:
     asr_stream: object = None
     # 流式识别在「说完」那一刻已经解好的文本，交给 handle_utterance 直接用
     pending_text: object = None
+    task: object = None
 
     def reset_utterance(self):
         self.buf.clear()
@@ -1602,6 +1603,14 @@ async def device_handler(ws, asr, tts):
                 })
             elif j.get("type") == "abort":
                 sess.reset_utterance()
+            elif j.get("type") == "barge_in":
+                print("  [barge] 用户打断，停止当前 TTS")
+                if sess.task is not None and not sess.task.done():
+                    sess.task.cancel()
+                sess.task = None
+                sess.busy = False
+                sess.reset_utterance()
+                sess.pending_text = None
 
         try:
             last_msg_t = time.time()
@@ -1650,6 +1659,14 @@ async def device_handler(ws, asr, tts):
                 if isinstance(msg, bytes):
                     sess.rx_msgs += 1
                     sess.rx_bytes += len(msg)
+                    # AEC calibration capture: 4-byte magic + raw mic + ref.
+                    if msg.startswith(b"AEC1") and len(msg) >= 4 + 2048:
+                        try:
+                            with open(HERE / "aec_debug.raw", "ab") as f:
+                                f.write(msg[4:])
+                        except Exception:
+                            pass
+                        continue
                     # 【正在回答上一句：这期间的音频一律不收】
                     #
                     # 这段是被设备侧的回音/用户插话触发的。以前是照样跑 VAD，
@@ -1737,7 +1754,11 @@ async def device_handler(ws, asr, tts):
                                 except Exception as e:
                                     print(f"  [asr] 流式收尾失败（{e}），改用整段识别")
                                     sess.pending_text = None
-                            await handle_utterance(ws, sess, http, asr, tts)
+                            if sess.task is not None and not sess.task.done():
+                                sess.task.cancel()
+                            sess.task = asyncio.create_task(
+                                handle_utterance(ws, sess, http, asr, tts)
+                            )
                         else:
                             sess.reset_utterance()
                 else:
