@@ -353,6 +353,9 @@ fn main() {
             }
         }
 
+        // I2S TX must be fed a full frame on *every* iteration: if the DMA
+        // underruns, the ES8311 stops getting data and the speaker stays silent
+        // (this is exactly why playback was dead while the queue was empty).
         if !tts_queue.is_empty() {
             for pair in tx_buf.chunks_exact_mut(4) {
                 let s = if tts_queue.len() >= 2 {
@@ -368,9 +371,11 @@ fn main() {
                 pair[2] = b[0];
                 pair[3] = b[1];
             }
-            if let Err(e) = i2s_tx.write(&tx_buf, BLOCK) {
-                println!("[i2s] tx error: {e:?}");
-            }
+        } else {
+            tx_buf.fill(0);
+        }
+        if let Err(e) = i2s_tx.write(&tx_buf, BLOCK) {
+            println!("[i2s] tx error: {e:?}");
         }
 
         // Sum both ADC slots. The two ES7210 channels are nearly equal in
