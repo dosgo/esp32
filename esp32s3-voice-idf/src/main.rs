@@ -26,6 +26,7 @@ mod es7210;
 mod es8311;
 mod display;
 mod config;
+mod aec;
 mod vad;
 mod wakenet;
 
@@ -255,6 +256,22 @@ fn main() {
         }
     };
 
+    // AEC (esp-sr): cancels the speaker echo from the mic stream. The
+    // reference is the PCM we actually pushed to I2S, kept in a small ring.
+    let mut aec = match aec::Aec::new(chunk) {
+        Some(a) => {
+            println!("[aec] ready frame={}", a.frame_size());
+            Some(a)
+        }
+        None => {
+            println!("[aec] create failed; mic stays unprocessed");
+            None
+        }
+    };
+    let mut aec_out = vec![0i16; chunk];
+    let mut aec_ref_ring: std::collections::VecDeque<i16> =
+        std::collections::VecDeque::with_capacity(chunk * 8);
+
     // I2S std mode is stereo: 2 channels * 2 bytes per sample.
     let mut raw = vec![0u8; chunk * 4];
     let mut mono = vec![0i16; chunk];
@@ -404,6 +421,15 @@ fn main() {
         if let Err(e) = i2s_tx.write(&tx_buf, BLOCK) {
             println!("[i2s] tx error: {e:?}");
         }
+        // Keep the played PCM as AEC reference.
+        if aec.is_some() {
+            for pair in tx_buf.chunks_exact(4) {
+                aec_ref_ring.push_back(i16::from_le_bytes([pair[0], pair[1]]));
+            }
+            while aec_ref_ring.len() > chunk * 4 {
+                aec_ref_ring.pop_front();
+            }
+        }
 
         // Sum both ADC slots. The two ES7210 channels are nearly equal in
         // noise, and picking a per-frame "louder" channel made the waveform
@@ -418,6 +444,23 @@ fn main() {
         }
         rms[1] = 0;
         mic_ch = 0;
+
+        // AEC: use the PCM we just pushed to the speaker as the reference.
+        if let Some(a) = aec.as_mut() {
+            if aec_ref_ring.len() >= chunk {
+                let start = aec_ref_ring.len() - chunk;
+                let mut ref_frame: Vec<i16> = Vec::with_capacity(chunk);
+                ref_frame.extend(aec_ref_ring.iter().skip(start).copied());
+                a.process(&mono, &ref_frame, &mut aec_out);
+                mono.copy_from_slice(&aec_out);
+                // recompute the RMS on the echo-cancelled signal for the log
+                let mut sum = 0u64;
+                for s in &mono {
+                    sum += (*s as i64 * *s as i64) as u64;
+                }
+                rms[0] = sum;
+            }
+        }
 
         frames = frames.wrapping_add(1);
         let frame_rms = ((rms[0] / chunk as u64) as f64).sqrt();
