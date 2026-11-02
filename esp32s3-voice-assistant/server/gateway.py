@@ -1627,6 +1627,13 @@ async def device_handler(ws, asr, tts):
                     "type": "hello", "transport": "websocket",
                     "audio_params": {"format": "pcm", "sample_rate": SAMPLE_RATE},
                 })
+            elif j.get("type") == "wake":
+                # 设备刚被唤醒：先回一句「我在」，让用户知道它听见了。
+                # 设备此时还没开始上传音频（要等 VAD 判到人声才传），所以这条
+                # 消息是唯一的唤醒信号。
+                print("  [wake] 设备唤醒")
+                sess.reset_utterance()
+                await ack_wake(ws, sess, http, tts)
             elif j.get("type") == "abort":
                 sess.reset_utterance()
             elif j.get("type") == "barge_in":
@@ -1815,12 +1822,18 @@ async def _loop_heartbeat():
 
 
 def _loop_watchdog():
-    # If the asyncio loop is stuck (the usual cause of a SynReceived socket
-    # that never gets accepted), exit so the supervisor can restart us.
+    # 事件循环卡住（ASR/TTS 是同步 ONNX 调用，长句合成时确实会卡几秒）时，
+    # 别直接杀进程 —— 那会把「响应慢」变成「网关没了」，设备只会提示「连不上电脑」。
+    # 这里先只打警告，真卡超过 60 秒（基本等于死锁）才退出。
+    last_warn = 0.0
     while True:
         time.sleep(2)
-        if time.time() - _LAST_TICK > 8:
-            print("[watchdog] event loop stuck for >8s, exiting", flush=True)
+        stuck = time.time() - _LAST_TICK
+        if stuck > 8 and time.time() - last_warn > 10:
+            print(f"[watchdog] event loop stuck for {stuck:.0f}s (working, not exiting)", flush=True)
+            last_warn = time.time()
+        if stuck > 60:
+            print("[watchdog] event loop stuck for >60s, exiting", flush=True)
             os._exit(1)
 
 
