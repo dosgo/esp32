@@ -77,3 +77,24 @@ D:\idf\flash.bat COM4
 - 旧 C shim：`.migration-backup-20261102-1100\esp_sr_shim`
 - 旧 2.1.2 组件：`D:\esp32\vendor\esp-sr-2.1.2`
 - 迁移前整盘备份：`D:\idf-backup-20261102-1045`
+
+## 2026-11-02 真机调试：`clean()` 会崩，已移除 reset
+
+用 `assets/wake16k.raw` 直接喂 WakeNet 自测（临时加了一段 include_bytes! 的代码）：
+
+```text
+[idf-kws] model=wn9_xiaotexiaote_tts2 chunk=512 rate=16000
+[selftest] fed 36 frames (18575 samples), hits=1     ← detect 正常，能命中
+```
+
+但紧接着调用 `esp_wn_iface_t::clean`：
+
+```text
+Guru Meditation Error: Core 0 panic'ed (LoadProhibited)
+```
+
+addr2line 定位到 `model_clean`（wakenet9_quantized.c）→ `dl_convq_queue_bzero`，即 esp-sr 2.6.1 的
+clean 在 wn9 量化模型上解引用了 NULL 队列。这是官方库内部的问题，不是绑定写错。
+
+处理：`src/wakenet.rs` 不再提供 `reset()`，需要清状态就直接 drop 整个 `WakeNet` 再 `new()`。
+去掉该调用后，干净固件上电 30 秒无 panic，mic 正常出数。

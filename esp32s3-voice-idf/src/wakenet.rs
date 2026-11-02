@@ -99,15 +99,11 @@ impl WakeNet {
         }
     }
 
-    /// Clear the detector state (e.g. after TTS playback) without recreating the model.
-    #[allow(dead_code)]
-    pub fn reset(&mut self) {
-        unsafe {
-            if let Some(clean) = (*self.iface).clean {
-                clean(self.model);
-            }
-        }
-    }
+    // NOTE: deliberately no `reset()` here.
+    // esp-sr 2.6.1's `esp_wn_iface_t::clean` (model_clean -> dl_convq_queue_bzero)
+    // dereferences a NULL queue for the quantized wn9 model on our build and
+    // panics with LoadProhibited, so we only ever create / detect / destroy.
+    // To clear the detector state, drop the whole `WakeNet` and create it again.
 }
 
 impl Drop for WakeNet {
