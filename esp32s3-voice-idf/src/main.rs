@@ -26,11 +26,7 @@ mod es7210;
 mod es8311;
 mod display;
 mod config;
-
-extern "C" {
-    fn sr_wake_init(keyword: *const core::ffi::c_char) -> i32;
-    fn sr_wake_detect(pcm: *const i16) -> i32;
-}
+mod wakenet;
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
@@ -232,15 +228,16 @@ fn main() {
     i2s_rx.rx_enable().expect("I2S RX enable");
     i2s_tx.tx_enable().expect("I2S TX enable");
 
-    let chunk = unsafe { sr_wake_init(c"灏忕壒灏忕壒".as_ptr()) };
-    if chunk <= 0 {
-        println!("[idf-kws] WakeNet init failed: {chunk}");
-        loop {
-            thread::sleep(Duration::from_secs(5));
+    let mut wake = match wakenet::WakeNet::new("xiaotexiaote") {
+        Ok(wake) => wake,
+        Err(err) => {
+            println!("[idf-kws] WakeNet init failed: {err}");
+            loop {
+                thread::sleep(Duration::from_secs(5));
+            }
         }
-    }
-    let chunk = chunk as usize;
-    println!("[idf-kws] WakeNet chunk={chunk}");
+    };
+    let chunk = wake.chunk_size();
 
     // I2S std mode is stereo: 2 channels * 2 bytes per sample.
     let mut raw = vec![0u8; chunk * 4];
@@ -421,7 +418,7 @@ fn main() {
 
         match state {
             State::Idle => {
-                if !tts_active && unsafe { sr_wake_detect(mono.as_ptr()) } > 0 {
+                if !tts_active && wake.detect(&mono) {
                     println!("[idf-kws] DETECTED after {frames} frames");
                     // Queue the last 2s of pre-roll. The sender thread makes
                     // this non-blocking, so LISTENING starts immediately.

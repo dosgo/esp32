@@ -4,14 +4,16 @@ set PORT=%1
 if "%PORT%"=="" set PORT=COM4
 set ROOT=%~dp0
 set TARGET=D:\t\xtensa-esp32s3-espidf\release
+set SRMODEL_OFFSET=0x410000
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command ". '%ROOT%activate.ps1'; Set-Location '%ROOT%'; cargo build --release -j 1" || exit /b 1
 
-if not exist "%ROOT%components\esp-sr\model\srmodels.bin" (
-  echo [flash] packing srmodels.bin
-  "D:\esp32\toolchain\espressif\idf-tools\python_env\idf5.4_py3.12_env\Scripts\python.exe" ^
-    "%ROOT%components\esp-sr\model\pack_model.py" ^
-    -m "%ROOT%components\esp-sr\model" -o srmodels.bin || exit /b 1
+rem esp-sr >= 2.6 packs the Kconfig-selected models (CONFIG_SR_WN_*) during the CMake build.
+set SRMODELS=
+for /d %%D in ("%TARGET%\build\esp-idf-sys-*") do if exist "%%D\out\build\srmodels\srmodels.bin" set SRMODELS=%%D\out\build\srmodels\srmodels.bin
+if not exist "%SRMODELS%" (
+  echo [flash] srmodels.bin not found - build the project first / check CONFIG_SR_WN_* in sdkconfig
+  exit /b 1
 )
 
 espflash flash --port %PORT% --baud 921600 ^
@@ -20,7 +22,6 @@ espflash flash --port %PORT% --baud 921600 ^
   --partition-table-offset 0x8000 ^
   "%TARGET%\esp32s3-voice-idf" || exit /b 1
 
-espflash write-bin --port %PORT% --baud 921600 0x410000 ^
-  "%ROOT%components\esp-sr\model\srmodels.bin" || exit /b 1
+espflash write-bin --port %PORT% --baud 921600 %SRMODEL_OFFSET% "%SRMODELS%" || exit /b 1
 
 echo [flash] done

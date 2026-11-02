@@ -1,6 +1,6 @@
 [build]
 target = "xtensa-esp32s3-espidf"
-target-dir = "target"
+target-dir = "D:\\t"
 
 [target.'cfg(target_os = "espidf")']
 linker = "ldproxy"
