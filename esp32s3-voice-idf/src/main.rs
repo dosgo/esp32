@@ -26,6 +26,7 @@ mod es7210;
 mod es8311;
 mod display;
 mod config;
+mod vad;
 mod wakenet;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -245,6 +246,15 @@ fn main() {
     };
     let chunk = wake.chunk_size();
 
+    // VAD (esp-sr / WebRTC) is used to find the end of the utterance.
+    let mut vad = match vad::Vad::new() {
+        Ok(v) => Some(v),
+        Err(e) => {
+            println!("[vad] init failed: {e}; falling back to RMS");
+            None
+        }
+    };
+
     // I2S std mode is stereo: 2 channels * 2 bytes per sample.
     let mut raw = vec![0u8; chunk * 4];
     let mut mono = vec![0i16; chunk];
@@ -258,6 +268,7 @@ fn main() {
 
     let mut frames = 0u32;
     let mut mic_ch = 0usize;
+    let mut last_wifi_check = Instant::now();
     let mut state = State::Idle;
     let mut tail_left = 0u32;
     let mut speech_frames = 0u32;
@@ -278,6 +289,18 @@ fn main() {
     let mut pre_roll: VecDeque<Vec<u8>> = VecDeque::new();
 
     loop {
+        // WiFi 掉线后不会自己重连（esp_wifi 只在 connect() 时发起关联），这里每 10 秒
+        // 检查一次，掉线就重新关联；WS 客户端自己会重连。
+        if last_wifi_check.elapsed() > Duration::from_secs(10) {
+            last_wifi_check = Instant::now();
+            if !wifi.is_connected().unwrap_or(false) {
+                println!("[wifi] reconnecting...");
+                if let Err(e) = wifi.wifi_mut().connect() {
+                    println!("[wifi] reconnect request failed: {e:?}");
+                }
+            }
+        }
+
         while let Ok(v) = tts_rx.try_recv() {
             tts_queue.extend(v);
         }
@@ -305,9 +328,13 @@ fn main() {
             pre_roll.clear();
         } else if state == State::Speaking {
             state = State::FollowUp;
-            followup_until = Some(Instant::now() + Duration::from_secs(5));
-            followup_mute_until = Some(Instant::now() + Duration::from_millis(1500));
+            followup_until = Some(Instant::now() + Duration::from_secs(8));
+            followup_mute_until = Some(Instant::now() + Duration::from_millis(1000));
             onset_frames = 0;
+            // Start the follow-up turn from a clean VAD trigger state.
+            if let Some(v) = vad.as_mut() {
+                v.reset();
+            }
             let _ = lcd.send("READY");
         }
 
@@ -440,6 +467,9 @@ fn main() {
                         let _ = out_tx.try_send(Outgoing::Binary(pcm));
                     }
                     let _ = lcd.send("LISTENING");
+                    if let Some(v) = vad.as_mut() {
+                        v.reset();
+                    }
                     state = State::Listening;
                     speech_frames = 0;
                     silence_frames = 0;
@@ -457,9 +487,12 @@ fn main() {
                         .unwrap_or(false)
                     {
                         onset_frames = 0;
-                    } else if frame_rms > 300.0 {
+                    } else if match vad.as_mut() {
+                        Some(v) => v.speech(&mono),
+                        None => frame_rms > 300.0,
+                    } {
                         onset_frames += 1;
-                        if onset_frames >= 2 {
+                        if onset_frames >= 1 {
                             for pcm in pre_roll.drain(..) {
                                 let _ = out_tx.try_send(Outgoing::Binary(pcm));
                             }
@@ -477,7 +510,11 @@ fn main() {
             State::Listening => {
                 let _ = out_tx.try_send(Outgoing::Binary(frame_pcm.clone()));
                 speech_frames += 1;
-                if frame_rms > 300.0 {
+                let voiced = match vad.as_mut() {
+                    Some(v) => v.speech(&mono),
+                    None => frame_rms > 300.0,
+                };
+                if voiced {
                     silence_frames = 0;
                 } else {
                     silence_frames += 1;
