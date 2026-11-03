@@ -22,6 +22,8 @@ pub const DASHSCOPE_WS_URL: &str = "wss://ws-ebekoepr6y8ojg9x.cn-beijing.maas.al
 enum Host {
     Dash,
     Deep,
+    /// Audio files live on OSS: a different host, never reused with Dash.
+    Oss,
 }
 
 fn client() -> Result<EspHttpConnection, String> {
@@ -30,7 +32,7 @@ fn client() -> Result<EspHttpConnection, String> {
         buffer_size_tx: Some(4096),
         timeout: Some(Duration::from_secs(10)),
         crt_bundle_attach: Some(esp_idf_sys::esp_crt_bundle_attach),
-        keep_alive_enable: false,
+        keep_alive_enable: true,
         keep_alive_idle: Some(30),
         keep_alive_interval: Some(5),
         keep_alive_count: Some(3),
@@ -42,6 +44,7 @@ fn client() -> Result<EspHttpConnection, String> {
 pub struct Cloud {
     dash: Option<EspHttpConnection>,
     deep: Option<EspHttpConnection>,
+    oss: Option<EspHttpConnection>,
     deep_ok: bool,
 }
 
@@ -50,6 +53,7 @@ impl Cloud {
         Self {
             dash: None,
             deep: None,
+            oss: None,
             deep_ok: true,
         }
     }
@@ -57,6 +61,7 @@ impl Cloud {
         match host {
             Host::Dash => &mut self.dash,
             Host::Deep => &mut self.deep,
+            Host::Oss => &mut self.oss,
         }
     }
 
@@ -71,9 +76,12 @@ impl Cloud {
             let conn = self.slot(host).as_mut().unwrap();
             f(conn)
         };
-        // Always drop the connection: reusing an EspHttpConnection whose socket
-        // the server already closed ends in repeated poll timeouts.
-        *self.slot(host) = None;
+        // Keep the socket on success so a turn can reuse it (LLM + TTS go to
+        // the same host). On error drop it so the next attempt reconnects.
+        if res.is_err() {
+            *self.slot(host) = None;
+        }
+
         res
     }
 
@@ -169,7 +177,7 @@ impl Cloud {
             .ok_or_else(|| format!("tts: no url in {}", truncate(&resp, 200)))?;
 
         let mut wav = Vec::new();
-        self.with_conn(Host::Dash, |conn| {
+        self.with_conn(Host::Oss, |conn| {
             conn.initiate_request(Method::Get, &audio_url, &[])
                 .map_err(|e| format!("tts get: {e:?}"))?;
             conn.initiate_response()
@@ -534,7 +542,7 @@ impl Cloud {
         let mut skip = 44usize;
         let mut total = 0usize;
         let mut first = true;
-        self.with_conn(Host::Dash, |conn| {
+        self.with_conn(Host::Oss, |conn| {
             conn.initiate_request(Method::Get, &audio_url, &[])
                 .map_err(|e| format!("tts get: {e:?}"))?;
             conn.initiate_response().map_err(|e| format!("tts resp: {e:?}"))?;
@@ -569,4 +577,58 @@ impl Cloud {
         })?;
         Ok(())
     }
+}
+
+/// TEMP throughput probe: GET a URL, return (bytes, milliseconds).
+pub fn speed_test(url: &str) -> Result<(usize, u128), String> {
+    let cfg = Configuration {
+        buffer_size: Some(8192),
+        buffer_size_tx: Some(2048),
+        timeout: Some(Duration::from_secs(60)),
+        crt_bundle_attach: Some(esp_idf_sys::esp_crt_bundle_attach),
+        ..Default::default()
+    };
+    let mut conn = EspHttpConnection::new(&cfg).map_err(|e| format!("new {e:?}"))?;
+    let t0 = std::time::Instant::now();
+    conn.initiate_request(Method::Get, url, &[])
+        .map_err(|e| format!("req {e:?}"))?;
+    conn.initiate_response().map_err(|e| format!("resp {e:?}"))?;
+    let tls = t0.elapsed().as_millis();
+    let mut total = 0usize;
+    let mut buf = vec![0u8; 16384];
+    loop {
+        match conn.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(e) => return Err(format!("read {e:?} ({total} bytes)")),
+        }
+    }
+    Ok((total, tls))
+}
+
+/// TEMP: same probe but without certificate verification, to measure how much
+/// of the TLS handshake is spent in chain validation against the CA bundle.
+pub fn speed_test_noverify(url: &str) -> Result<(usize, u128), String> {
+    let cfg = Configuration {
+        buffer_size: Some(8192),
+        buffer_size_tx: Some(2048),
+        timeout: Some(Duration::from_secs(60)),
+        ..Default::default()
+    };
+    let mut conn = EspHttpConnection::new(&cfg).map_err(|e| format!("new {e:?}"))?;
+    let t0 = std::time::Instant::now();
+    conn.initiate_request(Method::Get, url, &[])
+        .map_err(|e| format!("req {e:?}"))?;
+    conn.initiate_response().map_err(|e| format!("resp {e:?}"))?;
+    let setup = t0.elapsed().as_millis();
+    let mut total = 0usize;
+    let mut buf = vec![0u8; 16384];
+    loop {
+        match conn.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(e) => return Err(format!("read {e:?}")),
+        }
+    }
+    Ok((total, setup))
 }
