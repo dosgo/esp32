@@ -1,9 +1,12 @@
-//! ESP-IDF std Rust + official esp-sr WakeNet + I2S microphone.
+//! ESP32-S3 voice assistant.
+//!
+//! The audio thread owns I2S / mic / VAD / the state machine and never blocks;
+//! `net.rs` owns the ASR WebSocket and all HTTPS calls.
+//!
+//! Turn: wake -> greeting -> listen -> think -> speak -> follow-up.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,37 +21,51 @@ use esp_idf_hal::units::FromValueType;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
-use esp_idf_svc::ws::client::{
-    EspWebSocketClient, EspWebSocketClientConfig, FrameType, WebSocketEventType,
-};
 
+mod asr_ws;
+mod cloud;
+mod config;
+mod display;
 mod es7210;
 mod es8311;
-mod display;
-mod config;
-mod aec;
+mod net;
+mod prompts;
 mod vad;
 mod wakenet;
 
-#[derive(Clone, Copy, PartialEq)]
+/// Frames of silence that end an utterance (~0.64 s).
+const SILENCE_FRAMES: u32 = 20;
+
+/// Frames without speech after the wake word before giving up (~4.8 s).
+const NO_SPEECH_FRAMES: u32 = 150;
+
+/// Hard cap on one utterance (~3.2 s).
+const MAX_SPEECH_FRAMES: u32 = 100;
+
+/// Minimum speech frames for a valid utterance (~0.5 s).
+const MIN_SPEECH_FRAMES: u32 = 15;
+
+/// Speech / noise gate on the 32 ms frame RMS.
+const SPEECH_RMS: f64 = 250.0;
+
+/// Frames of quiet after the greeting before the mic is trusted (~0.3 s).
+const GREETING_QUIET_FRAMES: u32 = 10;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum State {
     Idle,
+    Greeting,
     Listening,
     Thinking,
     Speaking,
     FollowUp,
 }
 
-enum Outgoing {
-    Text(String),
-    Binary(Vec<u8>),
-}
-
 fn main() {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
-    println!("[idf-kws] boot (I2S + ES7210)");
+    println!("[boot] voice assistant");
 
     let peripherals = Peripherals::take().unwrap();
     let lcd = display::start(
@@ -62,7 +79,7 @@ fn main() {
     );
     let _ = lcd.send("BOOT");
 
-    // ---- WiFi: must be connected before allocating WakeNet/audio ----
+    // ---- WiFi ----
     let sys_loop = EspSystemEventLoop::take().unwrap();
     let nvs = EspDefaultNvsPartition::take().unwrap();
     let mut wifi = BlockingWifi::wrap(
@@ -77,114 +94,19 @@ fn main() {
         ..Default::default()
     });
     wifi.set_configuration(&wifi_cfg).unwrap();
-    let _ = lcd.send("WIFI");
     wifi.start().unwrap();
-    // Non-blocking connect: BlockingWifi::connect() can sit in its 15s
-    // CONNECT_TIMEOUT even though the link is already up, which is why the
-    // screen stayed on BOOT for so long.
-    if let Err(e) = wifi.wifi_mut().connect() {
-        println!("[wifi] connect request: {e:?}");
-    }
+    let _ = wifi.wifi_mut().connect();
     let deadline = Instant::now() + Duration::from_secs(10);
-    let mut wifi_ok = false;
-    while Instant::now() < deadline {
-        if wifi.is_connected().unwrap_or(false) {
-            wifi_ok = true;
-            break;
-        }
+    while Instant::now() < deadline && !wifi.is_connected().unwrap_or(false) {
         thread::sleep(Duration::from_millis(150));
     }
-    if wifi_ok {
-        let up_deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < up_deadline && !wifi.is_up().unwrap_or(false) {
-            thread::sleep(Duration::from_millis(100));
-        }
-        let _ = lcd.send("WIFI OK");
-    }
-    println!("[wifi] connected={wifi_ok}");
+    unsafe { esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE) };
+    println!("[wifi] connected={}", wifi.is_connected().unwrap_or(false));
 
-    // Disable WiFi modem sleep: with the default PS mode the device drops ~70%
-    // of packets on this AP (ping: 3/10 replies, TCP SYN-ACK lost -> WS connect
-    // timeout), which makes the gateway handshake fail.
-    let ps = unsafe { esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE) };
-    println!("[wifi] ps=none ret={ps}");
+    // ---- network worker ----
+    let (net_cmd, net_ev) = net::start();
 
-    // ---- WebSocket to the gateway ----
-    // All sends go through a dedicated thread. esp_websocket_client's send is
-    // blocking; flushing pre-roll directly in the audio loop delayed Listening
-    // until the command was already over.
-    let (out_tx, out_rx) = mpsc::sync_channel::<Outgoing>(256);
-    let (tts_tx, tts_rx) = mpsc::channel::<Vec<u8>>();
-    let speaking = Arc::new(AtomicBool::new(false));
-    let speaking_cb = speaking.clone();
-    let ws_connected = Arc::new(AtomicBool::new(false));
-    let ws_connected_cb = ws_connected.clone();
-    let ws_cfg = EspWebSocketClientConfig {
-        // 3s 重连间隔（默认 10s 太慢），握手给 15s（这条 WiFi 链路丢包严重）
-        reconnect_timeout_ms: Duration::from_secs(3),
-        network_timeout_ms: Duration::from_secs(15),
-        ..Default::default()
-    };
-    let ws = EspWebSocketClient::new(
-        config::WS_URL,
-        &ws_cfg,
-        Duration::from_secs(10),
-        move |event| {
-            if let Ok(event) = event {
-                match event.event_type {
-                    WebSocketEventType::Connected => {
-                        ws_connected_cb.store(true, Ordering::Relaxed);
-                    }
-                    WebSocketEventType::Text(text) => {
-                        println!("[ws] {text}");
-                        if text.contains("\"tts\"") && text.contains("start") {
-                            speaking_cb.store(true, Ordering::Relaxed);
-                        } else if text.contains("\"tts\"") && text.contains("stop") {
-                            speaking_cb.store(false, Ordering::Relaxed);
-                        }
-                    }
-                    WebSocketEventType::Binary(data) => {
-                        speaking_cb.store(true, Ordering::Relaxed);
-                        let _ = tts_tx.send(data.to_vec());
-                    }
-                    WebSocketEventType::Disconnected => {
-                        ws_connected_cb.store(false, Ordering::Relaxed);
-                        println!("[ws] disconnected");
-                    }
-                    _ => {}
-                }
-            }
-        },
-    )
-    .expect("WebSocket init");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline && !ws_connected.load(Ordering::Relaxed) {
-        thread::sleep(Duration::from_millis(100));
-    }
-    if ws_connected.load(Ordering::Relaxed) {
-        println!("[ws] connected");
-    } else {
-        println!("[ws] no connect: timeout");
-    }
-    let ws_connected_tx = ws_connected.clone();
-    thread::spawn(move || {
-        let mut ws = ws;
-        while let Ok(msg) = out_rx.recv() {
-            if !ws_connected_tx.load(Ordering::Relaxed) {
-                // 断线期间直接丢弃，别刷屏也别让队列堆积
-                continue;
-            }
-            let r = match msg {
-                Outgoing::Text(s) => ws.send(FrameType::Text(false), s.as_bytes()),
-                Outgoing::Binary(b) => ws.send(FrameType::Binary(false), &b),
-            };
-            if let Err(e) = r {
-                println!("[ws] send failed: {e:?}");
-            }
-        }
-    });
-
-    // ---- I2C: ES8311 DAC + ES7210 ADC share SDA=42 / SCL=41 ----
+    // ---- I2C: ES8311 (DAC) + ES7210 (ADC) ----
     let i2c_cfg = I2cConfig::new().baudrate(100.kHz().into());
     let i2c = I2cDriver::new(
         peripherals.i2c0,
@@ -196,37 +118,27 @@ fn main() {
     let i2c_bus = RefCell::new(i2c);
 
     let mut amp = es8311::Es8311::new(RefCellDevice::new(&i2c_bus), 0x18);
-    let mut amp_ok = false;
     for attempt in 1..=3 {
         if amp.probe().is_some() && amp.init().is_ok() {
             println!("[es8311] ready (attempt {attempt})");
-            amp_ok = true;
             break;
         }
         thread::sleep(Duration::from_millis(200));
     }
-    if !amp_ok {
-        println!("[es8311] init failed; speaker will be silent");
-    }
 
     let mut codec = es7210::Es7210::new(RefCellDevice::new(&i2c_bus), es7210::ADDR);
-    let mut codec_ok = false;
-    for attempt in 1..=3 {
+    for attempt in 1..=6 {
         match codec.init() {
             Ok(()) => {
                 println!("[es7210] ready (attempt {attempt})");
-                codec_ok = true;
                 break;
             }
             Err(e) => println!("[es7210] init failed: {e}"),
         }
-        thread::sleep(Duration::from_millis(200));
-    }
-    if !codec_ok {
-        println!("[es7210] giving up; microphone will be silent");
+        thread::sleep(Duration::from_millis(300));
     }
 
-    // NS4150B PA enable: GPIO7 high.
+    // NS4150B PA enable.
     let mut pa = PinDriver::output(peripherals.pins.gpio7).expect("PA pin");
     pa.set_high().expect("PA high");
 
@@ -249,7 +161,7 @@ fn main() {
     let mut wake = match wakenet::WakeNet::new("xiaotexiaote") {
         Ok(wake) => wake,
         Err(err) => {
-            println!("[idf-kws] WakeNet init failed: {err}");
+            println!("[kws] WakeNet init failed: {err}");
             loop {
                 thread::sleep(Duration::from_secs(5));
             }
@@ -257,178 +169,165 @@ fn main() {
     };
     let chunk = wake.chunk_size();
 
-    // VAD (esp-sr / WebRTC) is used to find the end of the utterance.
     let mut vad = match vad::Vad::new() {
         Ok(v) => Some(v),
         Err(e) => {
-            println!("[vad] init failed: {e}; falling back to RMS");
+            println!("[vad] init failed: {e}");
             None
         }
     };
 
-    // AEC (esp-sr): cancels the speaker echo from the mic stream. The
-    // reference is the PCM we actually pushed to I2S, kept in a small ring.
-    let mut aec = match aec::Aec::new(chunk) {
-        Some(a) => {
-            println!("[aec] ready frame={}", a.frame_size());
-            Some(a)
-        }
-        None => {
-            println!("[aec] create failed; mic stays unprocessed");
-            None
-        }
-    };
-    let mut aec_out = vec![0i16; chunk];
-    // Measured speaker -> mic delay: 640 samples = 40 ms (best correlation).
-    const AEC_REF_DELAY: usize = 640;
-    let mut aec_ref_ring: std::collections::VecDeque<i16> =
-        std::collections::VecDeque::with_capacity(chunk * 16);
-
-    // I2S std mode is stereo: 2 channels * 2 bytes per sample.
     let mut raw = vec![0u8; chunk * 4];
     let mut mono = vec![0i16; chunk];
-    let mut hello = String::from(
-        r#"{"type":"hello","version":2,"format":"pcm","sample_rate":16000,"channels":1,"bits":16,"frame_ms":32,"config":{"llm":{"backend":"deepseek","key":""#,
-    );
-    hello.push_str(config::DEEPSEEK_KEY);
-    hello.push_str(
-        r#"","model":"deepseek-chat","base":""},"asr":{"chain":"local","key":"","model":""},"tts":{"chain":"piper","voice":""}}}"#,
-    );
+    let mut tx_buf = vec![0u8; chunk * 4];
+    let mut tts_queue: VecDeque<u8> = VecDeque::new();
+    let mut utt: Vec<u8> = Vec::new();
 
-    let mut frames = 0u32;
-    let mut mic_ch = 0usize;
+    let mut state = State::Idle;
     let mut last_wifi_check = Instant::now();
     let mut no_ip_checks = 0u32;
-    let mut state = State::Idle;
-    let mut tail_left = 0u32;
     let mut speech_frames = 0u32;
     let mut speech_started = false;
     let mut no_speech_frames = 0u32;
     let mut silence_frames = 0u32;
     let mut onset_frames = 0u32;
-    let mut ui_voice = false;
-    let mut ui_voice_until: Option<Instant> = None;
+    let mut greeting_quiet = 0u32;
     let mut listen_grace_until: Option<Instant> = None;
-    let mut thinking_until: Option<Instant> = None;
     let mut followup_until: Option<Instant> = None;
     let mut followup_mute_until: Option<Instant> = None;
-    let mut hello_sent = false;
-    let mut last_hb = Instant::now();
-    // Pre-recorded prompts played when the device cannot reach the gateway.
-    const NO_WIFI_PCM: &[u8] = include_bytes!("../assets/no_wifi.raw");
-    const NO_GW_PCM: &[u8] = include_bytes!("../assets/no_gateway.raw");
-    let mut tts_queue: VecDeque<u8> = VecDeque::new();
-    let mut tx_buf = vec![0u8; chunk * 4];
+    let mut thinking_until: Option<Instant> = None;
+    let mut turn_done = false;
+    let mut net_pending = false;
+    let mut net_since = Instant::now();
+    let mut ui_voice = false;
+    let mut ui_voice_until: Option<Instant> = None;
     let mut tts_playing = false;
     let mut speaking_idle = 0u32;
-    let mut pre_roll: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut last_state_log = Instant::now();
+    let mut peak_rms: f64 = 0.0;
+
+    let _ = lcd.send("READY");
+    println!("[boot] ready");
 
     loop {
-        // WiFi 掉线后不会自己重连（esp_wifi 只在 connect() 时发起关联），这里每 10 秒
-        // 检查一次，掉线就重新关联；WS 客户端自己会重连。
+        // ---- WiFi watchdog ----
         if last_wifi_check.elapsed() > Duration::from_secs(5) {
             last_wifi_check = Instant::now();
-            let associated = wifi.is_connected().unwrap_or(false);
-            let has_ip = wifi.is_up().unwrap_or(false);
-            if !associated {
-                println!("[wifi] not associated -> connect()");
-                let _ = wifi.wifi_mut().connect();
-            } else if !has_ip {
-                no_ip_checks += 1;
-                if no_ip_checks >= 3 {
-                    // 关联上了却拿不到 IP：断开重来一次
-                    println!("[wifi] no IP after 15s -> reconnect");
-                    let _ = wifi.wifi_mut().disconnect();
-                    let _ = wifi.wifi_mut().connect();
-                    no_ip_checks = 0;
-                }
-            } else {
+            if wifi.is_up().unwrap_or(false) {
                 no_ip_checks = 0;
+            } else {
+                no_ip_checks += 1;
+                println!("[wifi] down, attempt {no_ip_checks}");
+                if no_ip_checks % 4 == 0 {
+                    let _ = wifi.stop();
+                    thread::sleep(Duration::from_millis(400));
+                    let _ = wifi.start();
+                }
+                let _ = wifi.wifi_mut().connect();
             }
         }
 
-        while let Ok(v) = tts_rx.try_recv() {
-            tts_queue.extend(v);
-        }
-
-        let mut speaking_now = speaking.load(Ordering::Relaxed);
-        if speaking_now && tts_queue.is_empty() {
-            speaking_idle += 1;
-            if speaking_idle > 100 {
-                speaking.store(false, Ordering::Relaxed);
-                speaking_now = false;
-                speaking_idle = 0;
-            }
-        } else {
-            speaking_idle = 0;
-        }
-        let tts_active = speaking_now || !tts_queue.is_empty();
-
-        if tts_active {
-            if state != State::Speaking {
-                state = State::Speaking;
-                let _ = lcd.send("SPEAKING");
-            }
-            thinking_until = None;
-            tail_left = 0;
-            pre_roll.clear();
-        } else if state == State::Speaking {
-            state = State::FollowUp;
-            followup_until = Some(Instant::now() + Duration::from_secs(8));
-            followup_mute_until = Some(Instant::now() + Duration::from_millis(1000));
-            onset_frames = 0;
-            // Start the follow-up turn from a clean VAD trigger state.
-            if let Some(v) = vad.as_mut() {
-                v.reset();
-            }
+        // Safety valve for a network turn that never reports back.
+        if net_pending && net_since.elapsed() > Duration::from_secs(30) {
+            println!("[net] turn timeout, resetting");
+            net_pending = false;
+            turn_done = false;
+            state = State::Idle;
             let _ = lcd.send("READY");
+        }
+
+        // ---- events from the network thread ----
+        while let Ok(ev) = net_ev.try_recv() {
+            match ev {
+                net::Ev::Text(t) => {
+                    println!("[net] text: {t}");
+                    let _ = lcd.send(if t.trim().is_empty() { "ASR EMPTY" } else { "ASR OK" });
+                }
+                net::Ev::Pcm(pcm) => {
+                    if state == State::Thinking {
+                        state = State::Speaking;
+                        let _ = lcd.send("SPEAKING");
+                        thinking_until = None;
+                    }
+                    tts_queue.extend(pcm);
+                }
+                net::Ev::Done => {
+                    turn_done = true;
+                    net_pending = false;
+                }
+            }
+        }
+
+        // ---- playback bookkeeping ----
+        let tts_active = !tts_queue.is_empty() || tts_playing;
+        if !tts_queue.is_empty() && !tts_playing {
+            tts_playing = true;
+            speaking_idle = 0;
+        } else if tts_queue.is_empty() && tts_playing {
+            speaking_idle += 1;
+            if speaking_idle > 30 {
+                tts_playing = false;
+            }
+        }
+
+        if !tts_active {
+            match state {
+                State::Greeting => {
+                    greeting_quiet += 1;
+                    if greeting_quiet >= GREETING_QUIET_FRAMES {
+                        greeting_quiet = 0;
+                        state = State::Listening;
+                        speech_frames = 0;
+                        speech_started = false;
+                        no_speech_frames = 0;
+                        silence_frames = 0;
+                        utt.clear();
+                        listen_grace_until = Some(Instant::now() + Duration::from_millis(500));
+                        if let Some(v) = vad.as_mut() {
+                            v.reset();
+                        }
+                        let _ = lcd.send("LISTENING");
+                    }
+                }
+                State::Speaking => {
+                    state = State::FollowUp;
+                    followup_until = Some(Instant::now() + Duration::from_secs(3));
+                    followup_mute_until = Some(Instant::now() + Duration::from_millis(400));
+                    onset_frames = 0;
+                    if let Some(v) = vad.as_mut() {
+                        v.reset();
+                    }
+                    let _ = lcd.send("READY");
+                }
+                State::Thinking if turn_done => {
+                    state = State::Idle;
+                    turn_done = false;
+                    thinking_until = None;
+                    let _ = lcd.send("READY");
+                }
+                _ => {}
+            }
         }
 
         if state == State::Thinking {
             if let Some(until) = thinking_until {
-                if Instant::now() >= until {
+                if Instant::now() >= until && !tts_active {
+                    println!("[state] thinking timeout");
                     state = State::Idle;
+                    turn_done = false;
+                    net_pending = false;
                     let _ = lcd.send("READY");
                 }
             }
         }
 
-        if !tts_queue.is_empty() && !tts_playing {
-            tts_playing = true;
-        } else if tts_queue.is_empty() && tts_playing {
-            tts_playing = false;
-        }
-
-        if ws_connected.load(Ordering::Relaxed) {
-            if !hello_sent {
-                let _ = out_tx.send(Outgoing::Text(hello.to_string()));
-                hello_sent = true;
-                let _ = lcd.send("READY");
-            }
-            if last_hb.elapsed() >= Duration::from_secs(3) {
-                let _ = out_tx.try_send(Outgoing::Text(r#"{"type":"hb"}"#.to_string()));
-                last_hb = Instant::now();
-            }
-        } else {
-            hello_sent = false;
-        }
-
+        // ---- audio in ----
         match i2s_rx.read(&mut raw, BLOCK) {
             Ok(n) if n >= chunk * 4 => {}
-            Ok(n) => {
-                println!("[i2s] short read {n}/{}", chunk * 4);
-                continue;
-            }
-            Err(e) => {
-                println!("[i2s] read error: {e:?}");
-                thread::sleep(Duration::from_millis(100));
-                continue;
-            }
+            _ => continue,
         }
 
-        // I2S TX must be fed a full frame on *every* iteration: if the DMA
-        // underruns, the ES8311 stops getting data and the speaker stays silent
-        // (this is exactly why playback was dead while the queue was empty).
+        // ---- audio out ----
         if !tts_queue.is_empty() {
             for pair in tx_buf.chunks_exact_mut(4) {
                 let s = if tts_queue.len() >= 2 {
@@ -447,89 +346,54 @@ fn main() {
         } else {
             tx_buf.fill(0);
         }
-        if let Err(e) = i2s_tx.write(&tx_buf, BLOCK) {
-            println!("[i2s] tx error: {e:?}");
-        }
-        // Keep the played PCM as AEC reference.
-        if aec.is_some() {
-            for pair in tx_buf.chunks_exact(4) {
-                aec_ref_ring.push_back(i16::from_le_bytes([pair[0], pair[1]]));
-            }
-            while aec_ref_ring.len() > chunk * 12 {
-                aec_ref_ring.pop_front();
-            }
+        if i2s_tx.write(&tx_buf, BLOCK).is_err() {
+            println!("[i2s] tx error");
         }
 
-        // Sum both ADC slots. The two ES7210 channels are nearly equal in
-        // noise, and picking a per-frame "louder" channel made the waveform
-        // alternate between channels every 32ms, which destroyed ASR.
-        let mut rms = [0u64; 2];
+        // ---- mic ----
+        let mut rms = 0u64;
         for i in 0..chunk {
             let l = i16::from_le_bytes([raw[i * 4], raw[i * 4 + 1]]);
             let r = i16::from_le_bytes([raw[i * 4 + 2], raw[i * 4 + 3]]);
             let v = (l as i32 + r as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-            rms[0] += (v as i64 * v as i64) as u64;
+            rms += (v as i64 * v as i64) as u64;
             mono[i] = v;
         }
-        rms[1] = 0;
-        mic_ch = 0;
+        let frame_rms = ((rms / chunk as u64) as f64).sqrt();
 
-        // RMS of the raw mic frame, before echo cancellation.
-        let raw_rms = ((rms[0] / chunk as u64) as f64).sqrt();
-
-        // AEC: reference = the PCM played AEC_REF_DELAY samples ago (40 ms at 16 kHz).
-        if let Some(a) = aec.as_mut() {
-            if aec_ref_ring.len() >= chunk + AEC_REF_DELAY {
-                let start = aec_ref_ring.len() - chunk - AEC_REF_DELAY;
-                let mut ref_frame: Vec<i16> = Vec::with_capacity(chunk);
-                ref_frame.extend(aec_ref_ring.iter().skip(start).copied());
-                a.process(&mono, &ref_frame, &mut aec_out);
-                mono.copy_from_slice(&aec_out);
-                // recompute the RMS on the echo-cancelled signal for the log
-                let mut sum = 0u64;
-                for s in &mono {
-                    sum += (*s as i64 * *s as i64) as u64;
-                }
-                rms[0] = sum;
-            }
+        peak_rms = peak_rms.max(frame_rms);
+        if last_state_log.elapsed() > Duration::from_secs(5) {
+            last_state_log = Instant::now();
+            println!(
+                "[state] {:?} q={} rms={:.0} peak={:.0}",
+                state,
+                tts_queue.len(),
+                frame_rms,
+                peak_rms
+            );
+            peak_rms = 0.0;
         }
 
-        frames = frames.wrapping_add(1);
-        let frame_rms = ((rms[0] / chunk as u64) as f64).sqrt();
-        if frames % 32 == 0 {
-            // ERLE 只在喇叭真的在放音时有意义。
-            let erle = if tts_active && raw_rms > 20.0 && frame_rms > 0.5 {
-                20.0 * (raw_rms / frame_rms).log10()
-            } else {
-                0.0
-            };
-            println!("[mic] rms={frame_rms:.0} raw={raw_rms:.0} erle={erle:.1}dB ch={mic_ch}");
-        }
-
-        let mut frame_pcm = Vec::with_capacity(mono.len() * 2);
+        let mut frame_pcm = Vec::with_capacity(chunk * 2);
         for s in &mono {
             frame_pcm.extend_from_slice(&s.to_le_bytes());
         }
 
-        if state == State::Idle || state == State::FollowUp {
-            pre_roll.push_back(frame_pcm.clone());
-            if pre_roll.len() > 64 {
-                pre_roll.pop_front();
-            }
-        }
-
-        if state == State::Idle && !tts_active {
+        // LCD hint while idle.
+        if state == State::Idle {
             if frame_rms > 300.0 {
                 if !ui_voice {
                     let _ = lcd.send("LISTENING");
                     ui_voice = true;
                 }
                 ui_voice_until = Some(Instant::now() + Duration::from_millis(800));
-            } else if ui_voice {
-                if ui_voice_until.map(|t| Instant::now() >= t).unwrap_or(true) {
-                    let _ = lcd.send("READY");
-                    ui_voice = false;
-                }
+            } else if ui_voice
+                && ui_voice_until
+                    .map(|t| Instant::now() >= t)
+                    .unwrap_or(true)
+            {
+                let _ = lcd.send("READY");
+                ui_voice = false;
             }
         } else if ui_voice {
             ui_voice = false;
@@ -537,95 +401,70 @@ fn main() {
 
         match state {
             State::Idle => {
-                if !tts_active && wake.detect(&mono) {
-                    if !ws_connected.load(Ordering::Relaxed) {
-                        // 本地播提示：WiFi 没连上说「没有连上网络」，WiFi 正常但网关连不上说「连不上电脑」。
-                        let wifi_up = wifi.is_connected().unwrap_or(false);
-                        println!("[idf-kws] DETECTED but WS offline (wifi_up={wifi_up}) -> local prompt");
-                        let _ = lcd.send(if wifi_up { "NO GW" } else { "NO WIFI" });
-                        tts_queue.clear();
-                        tts_queue.extend(if wifi_up { NO_GW_PCM } else { NO_WIFI_PCM }.iter().copied());
-                    } else {
-                        println!("[idf-kws] DETECTED after {frames} frames");
-                        // Queue the last 2s of pre-roll. The sender thread makes
-                        // this non-blocking, so LISTENING starts immediately.
-                        while pre_roll.len() > 64 {
-                            pre_roll.pop_front();
-                        }
-                        for pcm in pre_roll.drain(..) {
-                            let _ = out_tx.try_send(Outgoing::Binary(pcm));
-                        }
-                        let _ = lcd.send("LISTENING");
-                        if let Some(v) = vad.as_mut() {
-                            v.reset();
-                        }
-                        // 告诉网关「刚被唤醒」，让它先回一句「我在」
-                        let _ = out_tx.try_send(Outgoing::Text(
-                            r#"{"type":"wake"}"#.to_string(),
-                        ));
+                if !tts_active && !net_pending && wake.detect(&mono) {
+                    println!("[kws] wake");
+                    let _ = net_cmd.send(net::Cmd::Wake);
+                    tts_queue.clear();
+                    tts_queue.extend(prompts::HERE.iter().copied());
+                    state = State::Greeting;
+                    greeting_quiet = 0;
+                    let _ = lcd.send("LISTENING");
+                }
+            }
+            State::Greeting => {}
+            State::FollowUp => {
+                let expired = followup_until.map(|t| Instant::now() >= t).unwrap_or(true);
+                if expired {
+                    state = State::Idle;
+                    let _ = lcd.send("READY");
+                } else if followup_mute_until
+                    .map(|t| Instant::now() < t)
+                    .unwrap_or(false)
+                {
+                    onset_frames = 0;
+                } else if match vad.as_mut() {
+                    Some(v) => v.speech(&mono) && frame_rms > SPEECH_RMS,
+                    None => frame_rms > SPEECH_RMS,
+                } {
+                    onset_frames += 1;
+                    if onset_frames >= 1 {
+                        let _ = net_cmd.send(net::Cmd::Wake);
                         state = State::Listening;
                         speech_frames = 0;
                         speech_started = false;
                         no_speech_frames = 0;
                         silence_frames = 0;
-                        onset_frames = 0;
-                        listen_grace_until = Some(Instant::now() + Duration::from_millis(2000));
-                    }
-                }
-            }
-            State::FollowUp => {
-                if let Some(until) = followup_until {
-                    if Instant::now() >= until {
-                        state = State::Idle;
-                        let _ = lcd.send("READY");
-                    } else if followup_mute_until
-                        .map(|t| Instant::now() < t)
-                        .unwrap_or(false)
-                    {
-                        onset_frames = 0;
-                    } else if match vad.as_mut() {
-                        Some(v) => v.speech(&mono),
-                        None => frame_rms > 300.0,
-                    } {
-                        onset_frames += 1;
-                        if onset_frames >= 1 {
-                            for pcm in pre_roll.drain(..) {
-                                let _ = out_tx.try_send(Outgoing::Binary(pcm));
-                            }
-                            let _ = lcd.send("LISTENING");
-                            state = State::Listening;
-                            speech_frames = 0;
-                            speech_started = true;
-                            no_speech_frames = 0;
-                            silence_frames = 0;
-                            listen_grace_until = Some(Instant::now() + Duration::from_millis(1000));
+                        utt.clear();
+                        listen_grace_until = Some(Instant::now() + Duration::from_millis(400));
+                        if let Some(v) = vad.as_mut() {
+                            v.reset();
                         }
-                    } else {
-                        onset_frames = 0;
+                        let _ = lcd.send("LISTENING");
                     }
+                } else {
+                    onset_frames = 0;
                 }
             }
             State::Listening => {
+                utt.extend_from_slice(&frame_pcm);
+                let _ = net_cmd.send(net::Cmd::Audio(frame_pcm));
                 let voiced = match vad.as_mut() {
-                    Some(v) => v.speech(&mono),
-                    None => frame_rms > 300.0,
+                    Some(v) => v.speech(&mono) && frame_rms > SPEECH_RMS,
+                    None => frame_rms > SPEECH_RMS,
                 };
-
                 if !speech_started && !voiced {
-                    // 唤醒后还没听到人说话：不要把噪声传上去，最多等 3 秒。
                     no_speech_frames += 1;
-                    if no_speech_frames >= 95 {
-                        println!("[vad] no speech after wake ({} frames) -> idle", no_speech_frames);
+                    if no_speech_frames >= NO_SPEECH_FRAMES {
+                        println!("[state] no speech");
                         state = State::Idle;
-                        listen_grace_until = None;
-                        let _ = lcd.send("READY");
+                        utt.clear();
+                        tts_queue.extend(prompts::AGAIN.iter().copied());
                     }
                 } else {
                     if !speech_started {
                         speech_started = true;
-                        println!("[vad] speech started");
+                        println!("[vad] start");
                     }
-                    let _ = out_tx.try_send(Outgoing::Binary(frame_pcm.clone()));
                     speech_frames += 1;
                     if voiced {
                         silence_frames = 0;
@@ -633,27 +472,67 @@ fn main() {
                         silence_frames += 1;
                     }
                     let grace_done = listen_grace_until
-                        .map(|until| Instant::now() >= until)
+                        .map(|t| Instant::now() >= t)
                         .unwrap_or(true);
-                    if (grace_done && speech_frames >= 10 && silence_frames >= 22)
-                        || speech_frames >= 150
+                    if (grace_done
+                        && speech_frames >= MIN_SPEECH_FRAMES
+                        && silence_frames >= SILENCE_FRAMES)
+                        || speech_frames >= MAX_SPEECH_FRAMES
                     {
-                        println!("[stream] end frames={speech_frames} silence={silence_frames}");
+                        println!("[vad] end speech={speech_frames} sil={silence_frames}");
+                        let _ = net_cmd.send(net::Cmd::End);
+                        net_pending = true;
+                        net_since = Instant::now();
+                        utt.clear();
                         state = State::Thinking;
-                        thinking_until = Some(Instant::now() + Duration::from_secs(10));
-                        listen_grace_until = None;
-                        tail_left = 25;
+                        turn_done = false;
+                        thinking_until = Some(Instant::now() + Duration::from_secs(25));
                         let _ = lcd.send("THINKING");
                     }
                 }
             }
             State::Thinking | State::Speaking => {}
         }
+    }
+}
 
-        if tail_left > 0 {
-            let silence = vec![0u8; frame_pcm.len()];
-            let _ = out_tx.try_send(Outgoing::Binary(silence));
-            tail_left -= 1;
+/// Public DNS fallback: resolvers handed out by some hotspots cannot see the
+/// Alibaba endpoints.
+pub(crate) fn set_public_dns() {
+    unsafe {
+        let netif =
+            esp_idf_sys::esp_netif_get_handle_from_ifkey(b"WIFI_STA_DEF\0".as_ptr() as *const _);
+        if netif.is_null() {
+            return;
         }
+        for (idx, server) in [&b"223.5.5.5\0"[..], &b"119.29.29.29\0"[..]]
+            .iter()
+            .enumerate()
+        {
+            let mut info: esp_idf_sys::esp_netif_dns_info_t = core::mem::zeroed();
+            info.ip.type_ = esp_idf_sys::ESP_IPADDR_TYPE_V4 as _;
+            info.ip.u_addr.ip4.addr = esp_idf_sys::esp_ip4addr_aton(server.as_ptr() as *const _);
+            let kind = if idx == 0 {
+                esp_idf_sys::esp_netif_dns_type_t_ESP_NETIF_DNS_MAIN
+            } else {
+                esp_idf_sys::esp_netif_dns_type_t_ESP_NETIF_DNS_BACKUP
+            };
+            esp_idf_sys::esp_netif_set_dns_info(netif, kind, &mut info);
+        }
+        println!("[wifi] public dns set");
+    }
+}
+
+/// Called from the network thread before connecting.
+pub(crate) fn ensure_dns() {
+    use std::net::ToSocketAddrs;
+    let host = "ws-ebekoepr6y8ojg9x.cn-beijing.maas.aliyuncs.com:443";
+    let ok = host
+        .to_socket_addrs()
+        .map(|mut it| it.next().is_some())
+        .unwrap_or(false);
+    if !ok {
+        println!("[dns] resolve failed, switching to public dns");
+        set_public_dns();
     }
 }

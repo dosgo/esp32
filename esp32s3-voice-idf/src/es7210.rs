@@ -79,7 +79,7 @@ const MIC_BIAS_2V87: u8 = 0x70;
 ///
 /// 降 12dB（幅度约 1/4）之后峰值回到 8000 左右，留足余量不再削波。
 /// 同时网关侧的 VAD 阈值要跟着从 250 降到 100（信号等比变小）。
-const MIC_GAIN_DB_STEP: u8 = 10; // 10 × 3dB = 30dB
+const MIC_GAIN_DB_STEP: u8 = 11; // 11 × 3dB = 33dB
 
 pub struct Es7210<'d, I> {
     i2c: I,
