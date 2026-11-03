@@ -20,3 +20,20 @@ CONFIG_PARTITION_TABLE_FILENAME="D:/idf/partitions.csv"
 # esp-sr 2.6.x: model partition + WakeNet9 小特小特 (wn9_xiaotexiaote_tts2)
 CONFIG_MODEL_IN_FLASH=y
 CONFIG_SR_WN_WN9_XIAOTEXIAOTE_TTS2=y
+
+# Bigger TCP windows: the default 5.7 KB window limits throughput to ~20 KB/s
+# on this link (high RTT to the cloud), which made audio uploads take 20 s.
+CONFIG_LWIP_TCP_WND_DEFAULT=32768
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
+# TLS buffers: with the SPIRAM settings below these live in PSRAM, so the
+# defaults fit again (a large record no longer has to be truncated).
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=8192
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=2048
+
+# Use the 8 MB PSRAM for anything bigger than 4 KB: TLS sessions, WebSocket
+# buffers and audio buffers then stop competing with WiFi/DMA for internal RAM
+# (that starvation was what made HTTPS handshakes fail with ESP_ERR_HTTP_CONNECT).
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=2048
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y

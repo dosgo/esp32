@@ -24,3 +24,4 @@ server/chat.log
 .idea/
 .DS_Store
 Thumbs.db
+.workbuddy/
