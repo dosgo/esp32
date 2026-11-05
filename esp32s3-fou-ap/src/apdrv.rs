@@ -56,6 +56,8 @@ enum Plan {
     ToHost,
     /// 自己发一帧，长度已写进 out
     Send(usize),
+    /// 走上行网卡：out 里是内层 IP 包，交给 uplink 任务封 UDP 发出去
+    Uplink(usize),
     /// 丢弃
     Drop,
 }
@@ -112,6 +114,21 @@ impl Driver for ApDriver<'_> {
         } = self;
 
         loop {
+            // 上行模式下，隧道回包从 station 网卡收上来，由 uplink 任务塞进队列。
+            // 这里先把它组装成以太网帧发给客户端，再回去处理空中收到的帧。
+            if let Ok(v) = state::AP_RX_Q.try_receive() {
+                if let Some(n) = frame_from_inner(&v, *mac, buf) {
+                    if let Some(tx) = Driver::transmit(inner, cx) {
+                        return Some((SliceRx(&mut buf[..n]), ApTx { inner: tx }));
+                    }
+                    // 暂时没有发送缓冲，放回队列下次再送
+                    let mut back: heapless::Vec<u8, 1500> = heapless::Vec::new();
+                    if back.extend_from_slice(&v).is_ok() {
+                        let _ = state::AP_RX_Q.try_send(back);
+                    }
+                }
+            }
+
             let (rx, tx) = Driver::receive(inner, cx)?;
 
             let mut n = 0usize;
@@ -140,6 +157,16 @@ impl Driver for ApDriver<'_> {
                         let l = len.min(d.len());
                         d[..l].copy_from_slice(&out[..l]);
                     });
+                    continue;
+                }
+                Plan::Uplink(len) => {
+                    // 交给 uplink 任务从 station 网卡发 UDP
+                    let mut v: heapless::Vec<u8, 1500> = heapless::Vec::new();
+                    if v.extend_from_slice(&out[..len]).is_ok() {
+                        if state::UP_Q.try_send(v).is_err() {
+                            state::DROPPED.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     continue;
                 }
                 Plan::Drop => continue,
@@ -423,6 +450,22 @@ fn encap(
     }
 
     let peer = state::fou_ip();
+
+    // 上行模式：FOU 节点在上游 Wi-Fi 里，封装后的 UDP 从 station 网卡发，
+    // 这里只需要把内层 IP 包交给 uplink 任务
+    if state::uplink_up() {
+        let n = ip.len().min(out.len());
+        out[..n].copy_from_slice(&ip[..n]);
+        state::set_last_flow(src, dst);
+        state::FWD_OUT.fetch_add(1, Ordering::Relaxed);
+        return Plan::Uplink(n);
+    }
+    // 上行开着但还没拿到地址：别去 ARP 一个根本不存在的邻居
+    if state::uplink_on() {
+        bump_drop();
+        return Plan::Drop;
+    }
+
     let Some(peer_mac) = state::arp_lookup(peer) else {
         // 还不知道手机 MAC，发个 ARP 请求问一下（1 秒最多一次）
         state::NO_MAC.fetch_add(1, Ordering::Relaxed);
@@ -523,6 +566,26 @@ fn frag_needed(ip: &[u8], ihl: usize, mac: [u8; 6], out: &mut [u8]) -> Plan {
 }
 
 // ---------------------------------------------------------------- FOU 解封装
+
+/// 上行模式专用：把 station 网卡收回来的内层 IP 包组装成以太网帧发给客户端。
+/// 目的 MAC 从 ARP 表里查（客户端发过包就会有）。
+fn frame_from_inner(inner: &[u8], ap_mac: [u8; 6], out: &mut [u8]) -> Option<usize> {
+    if inner.len() < 20 || inner[0] >> 4 != 4 {
+        return None;
+    }
+    let dst = u32::from_be_bytes([inner[16], inner[17], inner[18], inner[19]]);
+    let client_mac = state::arp_lookup(Ipv4Addr::from(dst))?;
+
+    let total = 14 + inner.len();
+    if total > out.len() {
+        return None;
+    }
+    out[0..6].copy_from_slice(&client_mac);
+    out[6..12].copy_from_slice(&ap_mac);
+    out[12..14].copy_from_slice(&ETH_IPV4.to_be_bytes());
+    out[14..total].copy_from_slice(inner);
+    Some(total)
+}
 
 fn decap(ip: &[u8], ihl: usize, mac: [u8; 6], out: &mut [u8]) -> Plan {
     let udp = &ip[ihl..];

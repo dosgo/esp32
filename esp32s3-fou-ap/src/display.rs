@@ -144,6 +144,10 @@ struct StatusSig {
     fou_port: u16,
     ssid_len: u8,
     pass_len: u8,
+    /// 上行 Wi-Fi：开着没有、连上没有
+    up_on: bool,
+    up_ip: u32,
+    up_state: u8,
 }
 
 impl StatusSig {
@@ -152,7 +156,12 @@ impl StatusSig {
         let (ssid, pass) = state::net_copy();
         Self {
             enabled: s.up,
-            linked: s.client_mac.is_some(),
+            // 上行模式下"连上"指的是上游拿到地址；否则看 AP 侧 ARP 表
+            linked: if s.up_on {
+                !s.up_ip.is_unspecified()
+            } else {
+                s.client_mac.is_some()
+            },
             tx: s.fwd_out,
             rx: s.fwd_in,
             client: u32::from(s.client_ip),
@@ -160,6 +169,9 @@ impl StatusSig {
             fou_port: state::fou_port(),
             ssid_len: ssid.len() as u8,
             pass_len: pass.len() as u8,
+            up_on: s.up_on,
+            up_ip: u32::from(s.up_ip),
+            up_state: s.up_state,
         }
     }
 }
@@ -292,7 +304,20 @@ where
 
     // 客户端信息：连着哪台手机
     let mut cli = heapless::String::<48>::new();
-    if sig.client == 0 {
+    if sig.up_on {
+        if sig.up_ip == 0 {
+            let _ = cli.push_str(match sig.up_state {
+                3 => "up: connect failed",
+                _ => "up: connecting...",
+            });
+        } else {
+            let o = sig.up_ip.to_be_bytes();
+            let _ = core::fmt::Write::write_fmt(
+                &mut cli,
+                format_args!("up: {}.{}.{}.{}", o[0], o[1], o[2], o[3]),
+            );
+        }
+    } else if sig.client == 0 {
         let _ = cli.push_str("client: none");
     } else {
         let o = sig.client.to_be_bytes();
@@ -313,6 +338,8 @@ where
     // ---------------- 底部提示 ----------------
     let hint = if !sig.enabled {
         "FOU tunnel is OFF"
+    } else if sig.up_on && sig.up_ip == 0 {
+        "Uplink Wi-Fi not connected"
     } else if sig.tx > 0 && sig.rx == 0 {
         "No reply from phone - check tunnel"
     } else if sig.linked {

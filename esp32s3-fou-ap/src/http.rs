@@ -75,13 +75,13 @@ async fn serve(sock: &mut TcpSocket<'_>) -> Result<(), ()> {
 
     if method == "POST" {
         // body 可能已经跟着读进来一部分
-        let mut body = String::<256>::new();
+        let mut body = String::<512>::new();
         let already = n - head_end;
-        let mut take = already.min(content_len).min(256);
+        let mut take = already.min(content_len).min(512);
         for &b in &head[head_end..head_end + take] {
             let _ = body.push(b as char);
         }
-        while take < content_len && body.len() < 256 {
+        while take < content_len && body.len() < 512 {
             let mut tmp = [0u8; 128];
             let want = (content_len - take).min(tmp.len());
             let r = sock.read(&mut tmp[..want]).await.map_err(|_| ())?;
@@ -161,6 +161,9 @@ fn apply(body: &str) {
     let mut ip = None::<[u8; 4]>;
     let mut port = None::<u16>;
     let mut on = true;
+    let mut up_ssid = None::<String<64>>;
+    let mut up_pass = None::<String<64>>;
+    let mut upon = None::<bool>;
 
     for kv in body.split('&') {
         let mut p = kv.splitn(2, '=');
@@ -172,6 +175,9 @@ fn apply(body: &str) {
             "ip" => ip = parse_ip(&urldecode(v)),
             "port" => port = urldecode(v).parse().ok(),
             "on" => on = v == "on" || v == "1",
+            "upssid" => up_ssid = decode(v),
+            "uppass" => up_pass = decode(v),
+            "upon" => upon = Some(v == "on" || v == "1"),
             _ => {}
         }
     }
@@ -190,6 +196,14 @@ fn apply(body: &str) {
         }
     }
     state::set_enabled(on);
+
+    // 上行配置：SSID 留空 = 关掉上行
+    if let Some(us) = up_ssid {
+        let up_p = up_pass.unwrap_or_default();
+        let want = upon.unwrap_or(false) && !us.is_empty();
+        // 密码非空却太短会被 set_uplink 拒掉，此时保留原配置
+        let _ = state::set_uplink(us.as_str(), up_p.as_str(), want);
+    }
 }
 
 fn decode(s: &str) -> Option<String<64>> {
@@ -311,6 +325,47 @@ border-bottom:1px solid #21262d}}
         GW_IP
     );
 
+    // 上行（STA）状态
+    {
+        let (up_ssid, _, up_on) = state::uplink_copy();
+        let (txt, cls) = match s.up_state {
+            2 => ("已连接", "ok"),
+            1 => ("连接中", ""),
+            3 => ("连接失败", "bad"),
+            _ => ("未启用", ""),
+        };
+        let _ = write!(
+            p,
+            r#"<div class="card"><div class="row"><span>上行 Wi-Fi</span><b class="{}">{}</b></div>"#,
+            cls, txt
+        );
+        if up_on {
+            let _ = write!(
+                p,
+                r#"<div class="row"><span>上行网络</span><b>{}</b></div>"#,
+                up_ssid.as_str()
+            );
+            let _ = write!(
+                p,
+                r#"<div class="row"><span>上行地址</span><b>{}</b></div>"#,
+                if s.up_ip.is_unspecified() { "等待 DHCP".into() } else { alloc::format!("{}", s.up_ip) }
+            );
+            if s.up_ch > 0 {
+                let _ = write!(
+                    p,
+                    r#"<div class="row"><span>信道（AP 跟随）</span><b>{}</b></div>"#,
+                    s.up_ch
+                );
+            }
+            let _ = write!(
+                p,
+                r#"<div class="row"><span>隧道出口</span><b>{}</b></div>"#,
+                if s.up_on { "上行网卡" } else { "AP 内客户端" }
+            );
+        }
+        let _ = write!(p, "</div>");
+    }
+
     // 状态卡片
     let up = s.up;
     let _ = write!(
@@ -364,13 +419,13 @@ border-bottom:1px solid #21262d}}
     }
     let _ = write!(p, "</div>");
 
-    if s.client_mac.is_none() {
+    if s.client_mac.is_none() && !s.up_on {
         let _ = write!(
             p,
-            r#"<div class="card"><span class="bad">还没找到手机</span><span class="dim"> · 让手机连上本热点，并把它的 IP 填到下面（默认 192.168.4.2）</span></div>"#
+            r#"<div class="card"><span class="bad">还没找到手机</span><span class="dim"> · 让手机连上本热点，并把它的 IP 填到下面（默认 192.168.4.2）；或启用上行 Wi-Fi，把手机的 upstream IP 填进去</span></div>"#
         );
     }
-    if s.no_mac > 0 && s.fwd_out == 0 && s.client_mac.is_none() {
+    if s.no_mac > 0 && s.fwd_out == 0 && s.client_mac.is_none() && !s.up_on {
         let _ = write!(
             p,
             r#"<div class="card"><span class="bad">检测到无效目标</span><span class="dim"> · 目标 IP 不在本网段，或手机没连上这个热点</span></div>"#
@@ -378,6 +433,7 @@ border-bottom:1px solid #21262d}}
     }
 
     // 表单
+    let (up_ssid_val, up_pass_val, up_on_ui) = state::uplink_copy();
     let _ = write!(
         p,
         r#"<form class="card" method="post" action="/set">
@@ -388,6 +444,10 @@ border-bottom:1px solid #21262d}}
 <label>手机 IP<input type="text" name="ip" value="{}"></label>
 <label>端口<input type="number" name="port" value="{}" min="1024" max="65535"></label>
 <label class="chk"><input type="checkbox" name="on" {}> 启用转发</label>
+<div style="font-size:13px;color:#8b949e;margin-top:18px">上行 Wi-Fi（连到路由器，隧道走上游网段）</div>
+<label>上游 Wi-Fi 名称<input type="text" name="upssid" value="{}" maxlength="31" placeholder="留空则不启用"></label>
+<label>上游 Wi-Fi 密码<input type="text" name="uppass" value="{}" maxlength="63"></label>
+<label class="chk"><input type="checkbox" name="upon" {}> 启用上行</label>
 <button>保存</button>
 </form>
 "#,
@@ -395,7 +455,10 @@ border-bottom:1px solid #21262d}}
         pass.as_str(),
         s.client_ip,
         state::fou_port(),
-        if up { "checked" } else { "" }
+        if up { "checked" } else { "" },
+        up_ssid_val.as_str(),
+        up_pass_val.as_str(),
+        if up_on_ui { "checked" } else { "" }
     );
 
     let _ = write!(

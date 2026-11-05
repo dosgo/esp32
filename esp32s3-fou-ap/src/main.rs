@@ -15,6 +15,7 @@ mod dhcp;
 mod display;
 mod http;
 mod state;
+mod uplink;
 
 use core::net::Ipv4Addr;
 
@@ -69,17 +70,32 @@ async fn main(spawner: Spawner) -> ! {
 
     state::init();
     let (ssid, pass) = state::net_copy();
+    let (up_ssid, up_pass, up_on) = state::uplink_copy();
+    let up_on = up_on && !up_ssid.is_empty();
 
     let ap_config = AccessPointConfig::default()
-        .with_ssid(ssid.as_str())
+        .with_ssid(alloc::string::String::from(ssid.as_str()))
         .with_password(alloc::string::String::from(pass.as_str()))
-        .with_channel(6)
+        // 双模时 AP 必须跟着 STA 的信道走，0 = 自动跟随
+        .with_channel(if up_on { 0 } else { 6 })
         .with_auth_method(AuthenticationMethod::Wpa2Personal)
         .with_max_connections(8);
 
+    let wifi_config = if up_on {
+        // 上行：AP + STA 双模，两个接口共用一块射频
+        WifiConfig::AccessPointStation(
+            esp_radio::wifi::sta::StationConfig::default()
+                .with_ssid(alloc::string::String::from(up_ssid.as_str()))
+                .with_password(alloc::string::String::from(up_pass.as_str())),
+            ap_config,
+        )
+    } else {
+        WifiConfig::AccessPoint(ap_config)
+    };
+
     let (mut controller, interfaces) = esp_radio::wifi::new(
         hw.WIFI,
-        ControllerConfig::default().with_initial_config(WifiConfig::AccessPoint(ap_config)),
+        ControllerConfig::default().with_initial_config(wifi_config),
     )
     .expect("WiFi 初始化失败");
 
@@ -92,12 +108,17 @@ async fn main(spawner: Spawner) -> ! {
         dns_servers: heapless::Vec::new(),
     });
 
+    let ap_iface = interfaces.access_point;
+    state::set_ap_mac(ap_iface.mac_address());
     let (stack, runner) = embassy_net::new(
-        apdrv::ApDriver::new(interfaces.access_point),
+        apdrv::ApDriver::new(ap_iface),
         net_config,
         mk_static!(StackResources<6>, StackResources::<6>::new()),
         seed,
     );
+
+    // 上行用的 station 协议栈：DHCP 客户端拿上游路由器的地址
+    let (sta_stack, sta_runner) = uplink::new_station(interfaces.station, seed ^ 0x5a5a);
 
     info!("AP started: SSID={} gw={}", ssid.as_str(), GW_IP);
 
@@ -150,7 +171,10 @@ async fn main(spawner: Spawner) -> ! {
         }
     }
 
-    spawner.spawn(wifi_keeper(controller).expect("spawn wifi_keeper"));
+    // controller 交给 uplink 任务持有（Wi-Fi 停不停取决于它活着）
+    spawner.spawn(uplink::uplink_task(controller, sta_stack).expect("spawn uplink"));
+    spawner.spawn(uplink::sta_net_task(sta_runner).expect("spawn sta_net"));
+    spawner.spawn(uplink::sta_monitor_task(sta_stack).expect("spawn sta_monitor"));
     spawner.spawn(net_task(runner).expect("spawn net_task"));
     spawner.spawn(dhcp_task(stack).expect("spawn dhcp"));
     spawner.spawn(http::web_task(stack).expect("spawn http"));
@@ -173,32 +197,6 @@ async fn main(spawner: Spawner) -> ! {
 
     loop {
         Timer::after(Duration::from_secs(3600)).await;
-    }
-}
-
-/// controller 必须一直被持有，否则 Wi-Fi 会停。
-///
-/// 这里同时把 Wi-Fi 驱动事件全部打到串口 —— 手机连不上时，
-/// 只能靠"有没有 ProbeRequest / StationConnected / AccessPointStop"判断卡在哪一层。
-#[embassy_executor::task]
-async fn wifi_keeper(controller: esp_radio::wifi::WifiController<'static>) {
-    use esp_radio::wifi::event::MessageResult;
-
-    let _controller = controller;
-    let mut sub = match _controller.subscribe() {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("wifi event subscribe failed: {:?}", e);
-            loop {
-                Timer::after(Duration::from_secs(3600)).await;
-            }
-        }
-    };
-    loop {
-        match sub.next_event().await {
-            MessageResult::Message(ev) => info!("wifi event: {:?}", ev),
-            MessageResult::Lagged(n) => warn!("wifi event lagged, dropped {}", n),
-        }
     }
 }
 
@@ -254,6 +252,13 @@ async fn stat_task(stack: Stack<'static>) {
             s.rx_mac[3],
             s.rx_mac[4],
             s.rx_mac[5],
+        );
+        info!(
+            "  uplink on={} state={} ip={} ch={}",
+            s.up_on,
+            s.up_state,
+            if s.up_ip.is_unspecified() { 0 } else { u32::from(s.up_ip) },
+            s.up_ch
         );
         info!("  dhcp_rx: {}", state::last_dhcp(true).as_str());
         info!("  dhcp_tx: {}", state::last_dhcp(false).as_str());
