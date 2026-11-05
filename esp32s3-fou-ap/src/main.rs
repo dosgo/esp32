@@ -60,7 +60,8 @@ macro_rules! mk_static {
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
-    esp_alloc::heap_allocator!(size: 96 * 1024);
+    // 驱动 RX/TX 队列和 AMPDU BA 窗口都调大了，给 WiFi 驱动留足堆。
+    esp_alloc::heap_allocator!(size: 160 * 1024);
 
     let hw = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
     // Flash 外设先拿出来：配置要在 Wi-Fi 初始化之前恢复
@@ -97,11 +98,17 @@ async fn main(spawner: Spawner) -> ! {
         WifiConfig::AccessPoint(ap_config)
     };
 
-    let (mut controller, interfaces) = esp_radio::wifi::new(
-        hw.WIFI,
-        ControllerConfig::default().with_initial_config(wifi_config),
-    )
-    .expect("WiFi 初始化失败");
+    // esp-radio 默认值是给低吞吐场景的：tx_queue_size=3 / rx_queue_size=5。
+    // AP 转发每包都要 RX+TX，而 rx_token() 只有在 tx_token() 拿到额度时才返回，
+    // 3 个在途帧会把整条数据面（连收包一起）锁死；RX 队列满 5 帧还会直接丢包。
+    let radio_cfg = ControllerConfig::default()
+        .with_tx_queue_size(16)
+        .with_rx_queue_size(24)
+        .with_static_rx_buf_num(16)
+        .with_rx_ba_win(12)
+        .with_initial_config(wifi_config);
+    let (mut controller, interfaces) =
+        esp_radio::wifi::new(hw.WIFI, radio_cfg).expect("WiFi 初始化失败");
 
     let rng = Rng::new();
     let seed = ((rng.random() as u64) << 32) | rng.random() as u64;
@@ -259,15 +266,16 @@ pub fn apply_rf(ch: u8, wide: bool) {
 async fn stat_task(stack: Stack<'static>) {
     let mut prev_out: u32 = 0;
     let mut prev_in: u32 = 0;
-    let mut tick: u32 = 0;
+    // 串口是同步阻塞写，一次约 500B @115200 ≈ 45ms。原来的 5 秒周期会每 5 秒
+    // 卡住 executor 一次，降成 30 秒，流量计数按 30 秒窗口算平均。
+    const PERIOD: u32 = 30;
     loop {
-        Timer::after(Duration::from_secs(5)).await;
-        tick = tick.wrapping_add(1);
+        Timer::after(Duration::from_secs(PERIOD as u64)).await;
         let out = state::TUN_BYTES_OUT.load(core::sync::atomic::Ordering::Relaxed);
         let inp = state::TUN_BYTES_IN.load(core::sync::atomic::Ordering::Relaxed);
         // 回绕安全：u32 减法天然按 2^32 取模
-        let kbps_out = out.wrapping_sub(prev_out) / 5 / 1024;
-        let kbps_in = inp.wrapping_sub(prev_in) / 5 / 1024;
+        let kbps_out = out.wrapping_sub(prev_out) / PERIOD / 1024;
+        let kbps_in = inp.wrapping_sub(prev_in) / PERIOD / 1024;
         prev_out = out;
         prev_in = inp;
 
@@ -298,32 +306,29 @@ async fn stat_task(stack: Stack<'static>) {
             s.rx_mac[5],
         );
         // 空口诊断：确认 HT40 / 11n 是否真的协商上了，以及信号强度。
-        // 串口是同步阻塞写，30 秒打一次，别拖累数据面。
-        if tick % 6 == 0 {
-            use esp_wifi_sys_esp32s3::include as wifi;
-            let mut list: wifi::wifi_sta_list_t = unsafe { core::mem::zeroed() };
-            let r = unsafe { wifi::esp_wifi_ap_get_sta_list(&mut list) };
-            if r == 0 {
-                let n = (list.num.max(0) as usize).min(4);
-                let mut d = alloc::string::String::new();
-                for i in 0..n {
-                    let st = &list.sta[i];
-                    let _ = core::fmt::Write::write_fmt(
-                        &mut d,
-                        format_args!(
-                            " [{}] rssi={}dBm 11n={} 11g={} 11b={}",
-                            i,
-                            st.rssi,
-                            st.phy_11n(),
-                            st.phy_11g(),
-                            st.phy_11b()
-                        ),
-                    );
-                }
-                info!("  air sta={}{}", list.num, d.as_str());
-            } else {
-                info!("  air sta list failed: {}", r);
+        use esp_wifi_sys_esp32s3::include as wifi;
+        let mut list: wifi::wifi_sta_list_t = unsafe { core::mem::zeroed() };
+        let r = unsafe { wifi::esp_wifi_ap_get_sta_list(&mut list) };
+        if r == 0 {
+            let n = (list.num.max(0) as usize).min(4);
+            let mut d = alloc::string::String::new();
+            for i in 0..n {
+                let st = &list.sta[i];
+                let _ = core::fmt::Write::write_fmt(
+                    &mut d,
+                    format_args!(
+                        " [{}] rssi={}dBm 11n={} 11g={} 11b={}",
+                        i,
+                        st.rssi,
+                        st.phy_11n(),
+                        st.phy_11g(),
+                        st.phy_11b()
+                    ),
+                );
             }
+            info!("  air sta={}{}", list.num, d.as_str());
+        } else {
+            info!("  air sta list failed: {}", r);
         }
 
         info!(
