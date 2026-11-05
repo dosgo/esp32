@@ -14,5 +14,5 @@ build-std = ["alloc", "core"]
 ESP_LOG = "debug"
 # esp-radio 默认 3：embassy-net 一次 poll 最多处理 3 帧。队列调大后要同步
 # 放大这个突发上限，否则队列里堆着的帧仍然要分很多轮才能排空。
-# 必须与 ControllerConfig::with_tx_queue_size() 配平：24 / 24。
-ESP_RADIO_CONFIG_WIFI_MAX_BURST_SIZE = "24"
+# 必须与 ControllerConfig::with_tx_queue_size() 配平：16 / 16。
+ESP_RADIO_CONFIG_WIFI_MAX_BURST_SIZE = "16"
