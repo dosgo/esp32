@@ -1093,6 +1093,7 @@ dependencies = [
  "esp-println",
  "esp-radio",
  "esp-rtos",
+ "esp-wifi-sys-esp32s3",
  "heapless 0.9.3",
  "log",
  "mipidsi",

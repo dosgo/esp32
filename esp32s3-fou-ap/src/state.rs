@@ -15,6 +15,8 @@ static FOU_IP: AtomicU32 = AtomicU32::new(u32::from_be_bytes([192, 168, 4, 2]));
 static FOU_PORT: AtomicU32 = AtomicU32::new(5555);
 /// 转发总开关
 static ENABLED: AtomicBool = AtomicBool::new(true);
+/// 是否用 HT40（40 MHz）。默认开，附近 2.4G 拥挤时关掉反而更快
+static WIDE_BAND: AtomicBool = AtomicBool::new(true);
 
 /// IP -> MAC，最多记 8 个客户端，够用了（8 条线性查比哈希还快）
 pub static ARP: Mutex<RefCell<Vec<(u32, [u8; 6]), 8>>> = Mutex::new(RefCell::new(Vec::new()));
@@ -22,6 +24,9 @@ pub static ARP: Mutex<RefCell<Vec<(u32, [u8; 6]), 8>>> = Mutex::new(RefCell::new
 /// 统计
 pub static FWD_OUT: AtomicU32 = AtomicU32::new(0);
 pub static FWD_IN: AtomicU32 = AtomicU32::new(0);
+/// 隧道内层字节数（用于算速率）。u32 会回绕，但速率只看 5 秒增量，回绕也只错一次
+pub static TUN_BYTES_OUT: AtomicU32 = AtomicU32::new(0);
+pub static TUN_BYTES_IN: AtomicU32 = AtomicU32::new(0);
 pub static DROPPED: AtomicU32 = AtomicU32::new(0);
 pub static LOOPBACK: AtomicU32 = AtomicU32::new(0);
 pub static NO_MAC: AtomicU32 = AtomicU32::new(0);
@@ -160,6 +165,14 @@ pub fn enabled() -> bool {
 
 pub fn set_enabled(v: bool) {
     ENABLED.store(v, Ordering::Relaxed);
+}
+
+pub fn wide_band() -> bool {
+    WIDE_BAND.load(Ordering::Relaxed)
+}
+
+pub fn set_wide_band(v: bool) {
+    WIDE_BAND.store(v, Ordering::Relaxed);
 }
 
 pub fn set_last_flow(src: u32, dst: u32) {
