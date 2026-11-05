@@ -166,6 +166,9 @@ fn apply(body: &str) {
     let mut upon = None::<bool>;
     let mut up_target = None::<[u8; 4]>;
     let mut route = None::<u8>;
+    let mut ch = None::<u8>;
+    // checkbox 未勾选时浏览器不提交，所以默认 false = HT20
+    let mut wide = false;
 
     for kv in body.split('&') {
         let mut p = kv.splitn(2, '=');
@@ -190,6 +193,8 @@ fn apply(body: &str) {
                 }
             }
             "route" => route = urldecode(v).parse().ok(),
+            "ch" => ch = urldecode(v).parse().ok(),
+            "wide" => wide = v == "on" || v == "1",
             _ => {}
         }
     }
@@ -214,6 +219,14 @@ fn apply(body: &str) {
         state::set_route_mode(r);
     }
     state::set_enabled(on);
+
+    // 空口参数：保存后直接调驱动，不用重启（双模时信道改动会被驱动忽略）
+    if let Some(c) = ch {
+        if state::set_ap_channel(c) {
+            state::set_wide_band(wide);
+            crate::apply_rf(c, wide);
+        }
+    }
 
     // 上行配置：SSID 留空 = 关掉上行
     if let Some(us) = up_ssid {
@@ -486,6 +499,16 @@ border-bottom:1px solid #21262d}}
 
     // 表单
     let (up_ssid_val, up_pass_val, up_on_ui) = state::uplink_copy();
+    let mut ch_opts = String::<160>::new();
+    for c in [1u8, 6, 11] {
+        let _ = write!(
+            ch_opts,
+            r#"<option value="{}" {}>{}</option>"#,
+            c,
+            if state::ap_channel() == c { "selected" } else { "" },
+            c
+        );
+    }
     let mut route_opts = String::<160>::new();
     for (val, label) in [
         (0u8, "自动（谁通用谁）"),
@@ -506,6 +529,9 @@ border-bottom:1px solid #21262d}}
 <div style="font-size:13px;color:#8b949e">热点</div>
 <label>Wi-Fi 名称<input type="text" name="ssid" value="{}" maxlength="31"></label>
 <label>Wi-Fi 密码（至少 8 位）<input type="text" name="pass" value="{}" maxlength="63"></label>
+<div style="font-size:13px;color:#8b949e;margin-top:18px">空口调优（保存后立即生效，建议 1/6/11 与 20/40MHz 各试一遍）</div>
+<label>2.4G 信道<select name="ch">{}</select></label>
+<label class="chk"><input type="checkbox" name="wide" {}> 40MHz（拥挤环境关掉用 20MHz 通常更快）</label>
 <div style="font-size:13px;color:#8b949e;margin-top:18px">FOU 隧道</div>
 <label>本热点里的手机 IP（AP 模式）<input type="text" name="ip" value="{}"></label>
 <label>上行 Wi-Fi 里的手机 IP（上行模式，留空则沿用上面的）<input type="text" name="uptarget" value="{}" placeholder="例如 192.168.1.50"></label>
@@ -521,6 +547,8 @@ border-bottom:1px solid #21262d}}
 "#,
         ssid.as_str(),
         pass.as_str(),
+        ch_opts,
+        if state::wide_band() { "checked" } else { "" },
         s.client_ip,
         if s.up_target.is_unspecified() {
             alloc::string::String::new()

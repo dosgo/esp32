@@ -20,6 +20,8 @@ static FOU_PORT: AtomicU32 = AtomicU32::new(5555);
 static ENABLED: AtomicBool = AtomicBool::new(true);
 /// 是否用 HT40（40 MHz）。默认开，附近 2.4G 拥挤时关掉反而更快
 static WIDE_BAND: AtomicBool = AtomicBool::new(true);
+/// AP 主信道。2.4G 里只有 1/6/11 互不重叠；双模时必须跟 STA 走，改了不生效
+static AP_CHANNEL: AtomicU8 = AtomicU8::new(6);
 
 /// ARP 表项。除了 IP/MAC 还要记"最后一次听到它的时间"，
 /// 这张表在双出口（AP 内手机 / 上行网段的手机）时是选路依据：
@@ -397,6 +399,19 @@ pub fn set_enabled(v: bool) {
 
 pub fn wide_band() -> bool {
     WIDE_BAND.load(Ordering::Relaxed)
+}
+
+pub fn ap_channel() -> u8 {
+    AP_CHANNEL.load(Ordering::Relaxed)
+}
+
+pub fn set_ap_channel(c: u8) -> bool {
+    if (1..=13).contains(&c) {
+        AP_CHANNEL.store(c, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
 }
 
 pub fn set_wide_band(v: bool) {

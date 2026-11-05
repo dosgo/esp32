@@ -77,7 +77,7 @@ async fn main(spawner: Spawner) -> ! {
         .with_ssid(alloc::string::String::from(ssid.as_str()))
         .with_password(alloc::string::String::from(pass.as_str()))
         // 双模时 AP 必须跟着 STA 的信道走，0 = 自动跟随
-        .with_channel(if up_on { 0 } else { 6 })
+        .with_channel(if up_on { 0 } else { state::ap_channel() })
         .with_auth_method(AuthenticationMethod::Wpa2Personal)
         .with_max_connections(8);
 
@@ -208,6 +208,44 @@ async fn net_task(mut runner: Runner<'static, apdrv::ApDriver<'static>>) {
 #[embassy_executor::task]
 async fn dhcp_task(stack: Stack<'static>) {
     dhcp::run(stack).await
+}
+
+/// 运行时切 2.4G 信道 / 带宽，网页保存后立即生效。
+/// AP+STA 双模时两块接口共用一块射频，信道必须跟 STA 一致，
+/// 所以只改带宽，不动信道。
+pub fn apply_rf(ch: u8, wide: bool) {
+    use esp_wifi_sys_esp32s3::include as wifi;
+
+    if !state::uplink_on() {
+        let second = if wide {
+            wifi::wifi_second_chan_t_WIFI_SECOND_CHAN_ABOVE
+        } else {
+            wifi::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE
+        };
+        let r = unsafe { wifi::esp_wifi_set_channel(ch, second) };
+        if r == 0 {
+            info!("AP channel -> {}", ch);
+        } else {
+            warn!("set channel {} failed: {}", ch, r);
+        }
+    }
+
+    let mut bw = wifi::wifi_bandwidths_t {
+        ghz_2g: if wide {
+            wifi::wifi_bandwidth_t_WIFI_BW_HT40
+        } else {
+            wifi::wifi_bandwidth_t_WIFI_BW_HT20
+        },
+        ghz_5g: 0,
+    };
+    let r = unsafe {
+        wifi::esp_wifi_set_bandwidths(wifi::wifi_interface_t_WIFI_IF_AP, &mut bw)
+    };
+    if r == 0 {
+        info!("AP bandwidth -> {}", if wide { "HT40" } else { "HT20" });
+    } else {
+        warn!("set bandwidth failed: {}", r);
+    }
 }
 
 /// 每 5 秒把状态打到串口，方便不开网页时也能看。
