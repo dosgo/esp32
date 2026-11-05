@@ -11,6 +11,7 @@
 extern crate alloc;
 
 mod apdrv;
+mod config;
 mod dhcp;
 mod display;
 mod http;
@@ -62,6 +63,8 @@ async fn main(spawner: Spawner) -> ! {
     esp_alloc::heap_allocator!(size: 96 * 1024);
 
     let hw = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
+    // Flash 外设先拿出来：配置要在 Wi-Fi 初始化之前恢复
+    let mut flash = hw.FLASH;
     let timg0 = TimerGroup::new(hw.TIMG0);
     let sw_int = SoftwareInterruptControl::new(hw.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
@@ -69,6 +72,7 @@ async fn main(spawner: Spawner) -> ! {
     info!("=== PocketGateway ESP32-S3 FOU gateway booting ===");
 
     state::init();
+    config::load_early(&mut flash);
     let (ssid, pass) = state::net_copy();
     let (up_ssid, up_pass, up_on) = state::uplink_copy();
     let up_on = up_on && !up_ssid.is_empty();
@@ -179,6 +183,7 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(dhcp_task(stack).expect("spawn dhcp"));
     spawner.spawn(http::web_task(stack).expect("spawn http"));
     spawner.spawn(stat_task(stack).expect("spawn stat"));
+    spawner.spawn(config::config_task(flash).expect("spawn config"));
 
     // 板载 1.54" ST7789：SCLK=38 MOSI=39 CS=21 DC=45 RST=40 BL=46
     // 这些脚和 Wi-Fi/USB 都不冲突（USB 是 19/20）

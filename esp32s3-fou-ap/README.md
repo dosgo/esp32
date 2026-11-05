@@ -45,18 +45,30 @@ ESP32-S3 板（和 `esp32s3-voice-assistant` 同一块板），串口走板载 U
 需要 `esp` 工具链（`espup install`）、`espflash`：
 
 ```bash
-# Xtensa 交叉编译器必须进 PATH，否则报 linker not found
-export PATH="$HOME/.rustup/toolchains/esp/xtensa-esp-elf/bin:$PATH"
+# Xtensa 交叉编译器必须进 PATH，否则报 linker not found。
+# 本机实测可用的是 embuild 下载的这套（espup 写进用户环境变量的那条路径
+# 在新的 Bash 会话里常常读不到）：
+export PATH="$HOME/.cargo/bin:/d/.embuild/espressif/tools/xtensa-esp-elf/esp-14.2.0_20241119/xtensa-esp-elf/bin:$PATH"
 
 cargo build --release
 espflash flash --port COM4 --baud 921600 \
   target/xtensa-esp32s3-none-elf/release/esp32s3-fou-ap
 ```
 
-看日志：
+**看日志**：这块板上 `espflash monitor` 连上后不打印任何东西（打开串口时
+DTR/RTS 的状态把输出吞了）。要用 PowerShell 发标准 esptool 复位序列再读：
 
-```bash
-espflash monitor --port COM4
+```powershell
+$sp = New-Object System.IO.Ports.SerialPort("COM4",115200,"None",8,"One")
+$sp.Open(); $sp.DiscardInBuffer()
+$sp.DtrEnable = $false
+$sp.RtsEnable = $true; Start-Sleep -Milliseconds 200
+$sp.RtsEnable = $false
+$deadline = (Get-Date).AddSeconds(8)
+while ((Get-Date) -lt $deadline) {
+  $sp.ReadExisting(); Start-Sleep -Milliseconds 80
+}
+$sp.Close()
 ```
 
 ## 使用
@@ -70,6 +82,29 @@ espflash monitor --port COM4
 > 手机自己要不要能上网是另一回事：它连着这个热点时默认路由指向 `192.168.4.1`，
 > 自己的出站包会被环路保护丢掉。安卓需要在 Wi-Fi 高级设置里打开
 > 「自动切换到移动数据」，让手机自己走蜂窝。
+
+## 配置持久化
+
+网页里所有改动（AP 名称/密码、FOU 目标 IP 与端口、上行 Wi-Fi 名称/密码/开关、
+上行目标 IP、出口策略、隧道开关、2.4G 信道、20/40MHz）保存后自动写入 flash，
+**重启后自动恢复**，不用每次重配。
+
+- 位置：flash 偏移 `0x3F0000` 的一个独立 4KB 扇区，在 factory app 镜像
+  （目前约 630KB）之后，不碰 bootloader、分区表、PHY 校准，也不碰 IDF 的 NVS 分区。
+- 格式：`PGCF` magic + 版本 + payload 长度 + 字段 + FNV-1a 校验和。校验不通过
+  就当没存过，用默认值；首次启动会把默认值写一次盘。
+- 保存由常驻任务合并 400ms 内的改动后串行执行；内容没变化会跳过擦写，省 flash 寿命。
+- 信道和带宽在保存时立即通过驱动生效，重启后由配置恢复。
+
+启动日志判断：
+
+| 日志 | 含义 |
+| --- | --- |
+| `[cfg] restored: ch=6 wide=true up_on=false route=0` | 配置恢复成功 |
+| `[cfg] no valid config, writing defaults` | 首次启动或校验失败 |
+| `[cfg] saved N bytes` / `[cfg] unchanged, skip write` | 网页保存落盘结果 |
+
+想恢复出厂：擦掉 `0x3F0000` 起始的那个扇区，下次启动会重新写默认值。
 
 ## 两种出口（可同时配置）
 
