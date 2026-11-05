@@ -21,8 +21,7 @@ pub async fn web_task(stack: Stack<'static>) {
     let tx = mk_buf2();
     loop {
         let mut sock = TcpSocket::new(stack, rx, tx);
-        // /speed 要发 4MB，慢链路上可能要几十秒
-        sock.set_timeout(Some(Duration::from_secs(60)));
+        sock.set_timeout(Some(Duration::from_secs(15)));
         if sock.accept(80).await.is_ok() {
             let _ = serve(&mut sock).await;
         }
@@ -36,10 +35,8 @@ fn mk_buf() -> &'static mut [u8] {
 }
 
 fn mk_buf2() -> &'static mut [u8] {
-    // 本地测速时这就是 TCP 发送窗口；4KB 会把吞吐限死在窗口/RTT 上，
-    // 测出来的就不是空口能力了
-    static CELL: static_cell::StaticCell<[u8; 16384]> = static_cell::StaticCell::new();
-    CELL.init([0; 16384])
+    static CELL: static_cell::StaticCell<[u8; 4096]> = static_cell::StaticCell::new();
+    CELL.init([0; 4096])
 }
 
 async fn serve(sock: &mut TcpSocket<'_>) -> Result<(), ()> {
@@ -107,13 +104,6 @@ async fn serve(sock: &mut TcpSocket<'_>) -> Result<(), ()> {
         return Ok(());
     }
 
-    // 纯空口下行测速：数据由 ESP32 本地生成，完全不经过 FOU / 手机 / 蜂窝。
-    // 用它把「ESP32+空口慢」和「手机侧慢」一刀切开。
-    if path.starts_with("/speed") {
-        speed_test(sock).await?;
-        return Ok(());
-    }
-
     if path == "/" || path.starts_with("/?") {
         let body = render_index();
         write_resp(sock, "200 OK", "text/html; charset=utf-8", body.as_bytes()).await?;
@@ -121,31 +111,6 @@ async fn serve(sock: &mut TcpSocket<'_>) -> Result<(), ()> {
     }
 
     write_resp(sock, "404 Not Found", "text/plain", b"not found").await?;
-    Ok(())
-}
-
-/// 发 4MB 固定数据。手机浏览器打开 http://192.168.4.1/speed 直接看下载速度。
-async fn speed_test(sock: &mut TcpSocket<'_>) -> Result<(), ()> {
-    const TOTAL: usize = 4 * 1024 * 1024;
-    let mut h = String::<256>::new();
-    let _ = write!(
-        h,
-        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"speed.bin\"\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-        TOTAL
-    );
-    sock.write_all(h.as_bytes()).await.map_err(|_| ())?;
-
-    let mut buf = [0u8; 1024];
-    for (i, b) in buf.iter_mut().enumerate() {
-        *b = (i & 0xff) as u8;
-    }
-    let mut left = TOTAL;
-    while left > 0 {
-        let n = left.min(buf.len());
-        sock.write_all(&buf[..n]).await.map_err(|_| ())?;
-        left -= n;
-    }
-    sock.flush().await.map_err(|_| ())?;
     Ok(())
 }
 
@@ -615,7 +580,6 @@ border-bottom:1px solid #21262d}}
 3. 其它设备连本热点，网关指向 <code>{}</code>，MTU 建议 <code>{}</code><br>
 4. DNS 由 DHCP 下发 <code>223.5.5.5 / 119.29.29.29</code>，不经过本机，查询直接走隧道<br>
 5. 手机要能出网：安卓里给这个 Wi-Fi 打开「自动切换到移动数据」，否则手机会把隧道包又送回这里<br>
-6. 定位瓶颈：<a href="/speed" style="color:#58a6ff">下载 4MB 测速文件</a>（ESP32 本地生成，只走热点空口，<b>不经过隧道/蜂窝</b>）。这个文件能跑多快，就是 ESP32+空口的上限<br>
 <div class="dim" style="margin-top:8px">注：<code>192.168.4.1</code> 是本机自己，只提供 Web 设置页和 DHCP，发往它的包不会进隧道。</div>
 </div>"#,
         crate::POOL_START, GW_IP, INNER_MTU

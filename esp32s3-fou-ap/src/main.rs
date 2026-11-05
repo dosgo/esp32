@@ -139,40 +139,39 @@ async fn main(spawner: Spawner) -> ! {
         );
     }
 
-    match controller.channel() {
-        Ok((ch, _)) => info!("AP channel = {}", ch),
-        Err(e) => warn!("read AP channel failed: {:?}", e),
+    // ---- 空口初始化 ----------------------------------------------------
+    // 之前这里只调了 set_bandwidths(HT40)，从没调
+    // set_channel(ch, SECOND_CHAN_ABOVE)。IDF 里 HT40 的扩展信道位置是由
+    // set_channel 的第二个参数决定的，缺了它驱动只跑主 20MHz —— 日志会显示
+    // HT40，实际速率却还是 HT20。而且 apply_rf() 以前只有网页点保存才调用，
+    // 持久化恢复的信道/带宽配置在重启后完全没作用到驱动。
+    // 这里统一执行一次，让上电即生效。
+    {
+        use esp_wifi_sys_esp32s3::include as wifi;
+
+        // AP 不需要省电。开着会让驱动对 STA 做 TIM/DTIM 缓冲，白白增加延迟。
+        let r = unsafe { wifi::esp_wifi_set_ps(wifi::wifi_ps_type_t_WIFI_PS_NONE) };
+        info!("wifi power save off: {}", r);
+
+        // 20 dBm（参数单位是 0.25 dBm）。AP 发射功率直接决定客户端能用的 MCS。
+        let r = unsafe { wifi::esp_wifi_set_max_tx_power(80) };
+        info!("wifi tx power 20dBm: {}", r);
+
+        // 试过用 esp_wifi_set_protocol 去掉 11b、免掉 ERP protection 开销，
+        // 但 IDF 规定 2.4G 的协议位图必须含 11b（不带就返回 0x102
+        // INVALID_ARG）。好消息是 protection 只在真有 11b-only STA 关联时才
+        // 启用，这里全是 11n 手机，本来就没这笔开销，所以保持默认即可。
+
+        apply_rf(state::ap_channel(), state::wide_band());
     }
 
-    // 2.4G 默认只跑 HT20（72 Mbps PHY）。HT40 能翻倍到 150 Mbps，
-    // 但会占 4~10 两个信道，邻居多的时候反而更慢 —— 所以做成可配，
-    // 默认开 40M，干扰大时用网页关掉。
-    //
-    // esp-radio 0.18 只暴露 `set_bandwidths(Bandwidths)`，但 `Bandwidths` 既没实现
-    // Default 也没有构造函数，外部根本造不出实例（这个开关等于死的），
-    // 这里直接调 blob 的 FFI。
-    {
-        if state::wide_band() {
-            unsafe {
-                let mut bw = esp_wifi_sys_esp32s3::include::wifi_bandwidths_t {
-                    ghz_2g: esp_wifi_sys_esp32s3::include::wifi_bandwidth_t_WIFI_BW_HT40,
-                    ghz_5g: 0,
-                };
-                let r = esp_wifi_sys_esp32s3::include::esp_wifi_set_bandwidths(
-                    esp_wifi_sys_esp32s3::include::wifi_interface_t_WIFI_IF_AP,
-                    &mut bw,
-                );
-                if r == 0 {
-                    info!("AP bandwidth = HT40");
-                } else {
-                    warn!("set HT40 failed: {}", r);
-                }
-            }
-        }
-        match controller.bandwidths() {
-            Ok(bw) => info!("bandwidths = {:?}", bw),
-            Err(e) => warn!("read bandwidth failed: {:?}", e),
-        }
+    match controller.channel() {
+        Ok((ch, second)) => info!("AP channel = {} secondary = {:?}", ch, second),
+        Err(e) => warn!("read AP channel failed: {:?}", e),
+    }
+    match controller.bandwidths() {
+        Ok(bw) => info!("bandwidths = {:?}", bw),
+        Err(e) => warn!("read bandwidth failed: {:?}", e),
     }
 
     // controller 交给 uplink 任务持有（Wi-Fi 停不停取决于它活着）
@@ -260,8 +259,10 @@ pub fn apply_rf(ch: u8, wide: bool) {
 async fn stat_task(stack: Stack<'static>) {
     let mut prev_out: u32 = 0;
     let mut prev_in: u32 = 0;
+    let mut tick: u32 = 0;
     loop {
         Timer::after(Duration::from_secs(5)).await;
+        tick = tick.wrapping_add(1);
         let out = state::TUN_BYTES_OUT.load(core::sync::atomic::Ordering::Relaxed);
         let inp = state::TUN_BYTES_IN.load(core::sync::atomic::Ordering::Relaxed);
         // 回绕安全：u32 减法天然按 2^32 取模
@@ -296,6 +297,35 @@ async fn stat_task(stack: Stack<'static>) {
             s.rx_mac[4],
             s.rx_mac[5],
         );
+        // 空口诊断：确认 HT40 / 11n 是否真的协商上了，以及信号强度。
+        // 串口是同步阻塞写，30 秒打一次，别拖累数据面。
+        if tick % 6 == 0 {
+            use esp_wifi_sys_esp32s3::include as wifi;
+            let mut list: wifi::wifi_sta_list_t = unsafe { core::mem::zeroed() };
+            let r = unsafe { wifi::esp_wifi_ap_get_sta_list(&mut list) };
+            if r == 0 {
+                let n = (list.num.max(0) as usize).min(4);
+                let mut d = alloc::string::String::new();
+                for i in 0..n {
+                    let st = &list.sta[i];
+                    let _ = core::fmt::Write::write_fmt(
+                        &mut d,
+                        format_args!(
+                            " [{}] rssi={}dBm 11n={} 11g={} 11b={}",
+                            i,
+                            st.rssi,
+                            st.phy_11n(),
+                            st.phy_11g(),
+                            st.phy_11b()
+                        ),
+                    );
+                }
+                info!("  air sta={}{}", list.num, d.as_str());
+            } else {
+                info!("  air sta list failed: {}", r);
+            }
+        }
+
         info!(
             "  uplink on={} state={} ip={} ch={} target={} route={} path={}",
             s.up_on,
