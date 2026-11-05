@@ -11,6 +11,8 @@ embassy-futures = "0.1.2"
 embassy-net = { version = "0.9.1", features = [
     "proto-ipv4",
     "medium-ethernet",
+    # 上行 Wi-Fi（STA）要 DHCP 客户端从上游路由器要地址
+    "dhcpv4",
     "tcp",
     "udp",
     # 让 192.168.4.1 能回 ping：这是本机自己的地址，走协议栈本地应答，不进隧道

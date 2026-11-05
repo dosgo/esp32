@@ -5,9 +5,12 @@
 
 use core::cell::RefCell;
 use core::net::Ipv4Addr;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 use critical_section::Mutex;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
+use embassy_sync::signal::Signal;
 use heapless::{String, Vec};
 
 /// FOU 隧道对端（手机）的地址，默认按 DHCP 第一个租约 192.168.4.2
@@ -43,6 +46,17 @@ pub static RX_DHCP: AtomicU32 = AtomicU32::new(0);
 pub static RX_OTHER: AtomicU32 = AtomicU32::new(0);
 /// 最近一个收帧的源 MAC，用来确认到底是谁连上来了（全 0 表示还没收到任何帧）
 pub static RX_LAST_MAC: Mutex<RefCell<[u8; 6]>> = Mutex::new(RefCell::new([0; 6]));
+
+/// AP 自己的 MAC。上行模式下要给客户端组帧，源 MAC 必须是 AP 的
+static AP_MAC: Mutex<RefCell<[u8; 6]>> = Mutex::new(RefCell::new([0; 6]));
+
+pub fn set_ap_mac(m: [u8; 6]) {
+    critical_section::with(|cs| *AP_MAC.borrow_ref_mut(cs) = m);
+}
+
+pub fn ap_mac() -> [u8; 6] {
+    critical_section::with(|cs| *AP_MAC.borrow_ref(cs))
+}
 
 pub fn note_rx(ethertype: u16, is_dhcp: bool, src_mac: &[u8; 6]) {
     RX_FRAMES.fetch_add(1, Ordering::Relaxed);
@@ -137,6 +151,116 @@ pub fn set_net(ssid: &str, pass: &str) -> bool {
         n.pass.clear();
         n.ssid.push_str(ssid).is_ok() && n.pass.push_str(pass).is_ok()
     })
+}
+
+// ---------------- 上行 Wi-Fi（STA）----------------
+//
+// 双模（AP+STA）：ESP32 一边给客户端当 AP，一边连到上游路由器。
+// 此时 FOU 节点不在 AP 网段里，而是在上游 LAN 里 —— 封装后的 UDP 得从
+// station 网卡发出去，回包也由 station 网卡收回来再注入 AP。
+
+/// 上行开关 + 配置
+static UP_ON: AtomicBool = AtomicBool::new(false);
+/// 上行拿到的 IP（0 = 没连上）
+static UP_IP: AtomicU32 = AtomicU32::new(0);
+/// 0=未启用 1=连接中 2=已连接 3=连接失败
+static UP_STATE: AtomicU8 = AtomicU8::new(0);
+/// 上行 AP 实际信道（串口/网页展示用）
+static UP_CH: AtomicU8 = AtomicU8::new(0);
+
+pub struct Uplink {
+    pub ssid: String<32>,
+    pub pass: String<64>,
+    pub on: bool,
+}
+
+static UPLINK: Mutex<RefCell<Uplink>> = Mutex::new(RefCell::new(Uplink {
+    ssid: String::new(),
+    pass: String::new(),
+    on: false,
+}));
+
+/// 网页改了上行配置后通知 uplink 任务重连
+pub static UP_DIRTY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+/// AP → station 方向：封装好的内层 IP 包（交给 uplink 任务发 UDP）
+pub static UP_Q: Channel<CriticalSectionRawMutex, Vec<u8, 1500>, 8> = Channel::new();
+/// station → AP 方向：解封装后的内层 IP 包（由 apdrv 组装成以太网帧发给客户端）
+pub static AP_RX_Q: Channel<CriticalSectionRawMutex, Vec<u8, 1500>, 8> = Channel::new();
+
+pub fn uplink_copy() -> (String<32>, String<64>, bool) {
+    let mut s = String::new();
+    let mut p = String::new();
+    let on = critical_section::with(|cs| {
+        let u = UPLINK.borrow_ref(cs);
+        let _ = s.push_str(u.ssid.as_str());
+        let _ = p.push_str(u.pass.as_str());
+        u.on
+    });
+    (s, p, on)
+}
+
+pub fn set_uplink(ssid: &str, pass: &str, on: bool) -> bool {
+    if ssid.len() > 31 || pass.len() > 63 {
+        return false;
+    }
+    if on && ssid.is_empty() {
+        return false;
+    }
+    // 有密码就必须是合法长度（开放网络允许空密码）
+    if !pass.is_empty() && pass.len() < 8 {
+        return false;
+    }
+    let ok = critical_section::with(|cs| {
+        let mut u = UPLINK.borrow_ref_mut(cs);
+        u.ssid.clear();
+        u.pass.clear();
+        u.on = on;
+        u.ssid.push_str(ssid).is_ok() && u.pass.push_str(pass).is_ok()
+    });
+    if ok {
+        UP_DIRTY.signal(());
+    }
+    ok
+}
+
+pub fn uplink_on() -> bool {
+    UP_ON.load(Ordering::Relaxed)
+}
+
+pub fn set_uplink_on(v: bool) {
+    UP_ON.store(v, Ordering::Relaxed);
+}
+
+/// 上行真的能用来发隧道包了吗（既要连上，也要没被别人改配置）
+pub fn uplink_up() -> bool {
+    UP_ON.load(Ordering::Relaxed) && UP_IP.load(Ordering::Relaxed) != 0
+}
+
+pub fn uplink_ip() -> Ipv4Addr {
+    Ipv4Addr::from(UP_IP.load(Ordering::Relaxed))
+}
+
+pub fn set_uplink_ip(ip: Ipv4Addr) {
+    // 只动地址。UP_ON 是"配置上启用了上行"，由 uplink 任务显式管理 ——
+    // 两者分开，隧道才不会在断线瞬间误把流量发回 AP 里的客户端
+    UP_IP.store(u32::from(ip), Ordering::Relaxed);
+}
+
+pub fn uplink_state() -> u8 {
+    UP_STATE.load(Ordering::Relaxed)
+}
+
+pub fn set_uplink_state(v: u8) {
+    UP_STATE.store(v, Ordering::Relaxed);
+}
+
+pub fn uplink_channel() -> u8 {
+    UP_CH.load(Ordering::Relaxed)
+}
+
+pub fn set_uplink_channel(c: u8) {
+    UP_CH.store(c, Ordering::Relaxed);
 }
 
 pub fn fou_ip() -> Ipv4Addr {
@@ -250,6 +374,10 @@ pub struct Snapshot {
     pub rx_dhcp: u32,
     pub rx_other: u32,
     pub rx_mac: [u8; 6],
+    pub up_on: bool,
+    pub up_ip: Ipv4Addr,
+    pub up_state: u8,
+    pub up_ch: u8,
 }
 
 pub fn snapshot() -> Snapshot {
@@ -270,5 +398,9 @@ pub fn snapshot() -> Snapshot {
         rx_dhcp: RX_DHCP.load(Ordering::Relaxed),
         rx_other: RX_OTHER.load(Ordering::Relaxed),
         rx_mac: rx_last_mac(),
+        up_on: uplink_up(),
+        up_ip: uplink_ip(),
+        up_state: uplink_state(),
+        up_ch: uplink_channel(),
     }
 }
