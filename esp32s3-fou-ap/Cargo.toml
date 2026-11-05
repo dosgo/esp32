@@ -48,5 +48,6 @@ mipidsi = { version = "0.10", default-features = false }
 static_cell = "2.1.1"
 
 [profile.release]
-opt-level = "s"
+# 数据面全是 memcpy / 协议栈解析，速度优先比体积优先更划算（flash 16MB 用不完）
+opt-level = 3
 codegen-units = 1
