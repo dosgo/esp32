@@ -164,6 +164,8 @@ fn apply(body: &str) {
     let mut up_ssid = None::<String<64>>;
     let mut up_pass = None::<String<64>>;
     let mut upon = None::<bool>;
+    let mut up_target = None::<[u8; 4]>;
+    let mut route = None::<u8>;
 
     for kv in body.split('&') {
         let mut p = kv.splitn(2, '=');
@@ -178,6 +180,16 @@ fn apply(body: &str) {
             "upssid" => up_ssid = decode(v),
             "uppass" => up_pass = decode(v),
             "upon" => upon = Some(v == "on" || v == "1"),
+            "uptarget" => {
+                let t = urldecode(v);
+                if t.is_empty() {
+                    // 清空 = 回退到 AP 目标
+                    up_target = Some([0, 0, 0, 0]);
+                } else {
+                    up_target = parse_ip(&t);
+                }
+            }
+            "route" => route = urldecode(v).parse().ok(),
             _ => {}
         }
     }
@@ -194,6 +206,12 @@ fn apply(body: &str) {
         if p >= 1024 {
             state::set_fou_port(p);
         }
+    }
+    if let Some(t) = up_target {
+        state::set_up_target(core::net::Ipv4Addr::from(t));
+    }
+    if let Some(r) = route {
+        state::set_route_mode(r);
     }
     state::set_enabled(on);
 
@@ -290,7 +308,7 @@ h1 span{{font-size:12px;color:#6e7681;font-weight:400;margin-left:8px}}
 .row b{{color:#f0f6fc;font-weight:600}}
 .ok{{color:#3fb950}}.bad{{color:#f85149}}.dim{{color:#8b949e}}
 label{{display:block;margin:12px 0 0;font-size:13px;color:#8b949e}}
-input[type=text],input[type=password],input[type=number]{{width:100%;margin-top:6px;padding:10px 12px;
+input[type=text],input[type=password],input[type=number],select{{width:100%;margin-top:6px;padding:10px 12px;
 background:#0d1117;border:1px solid #30363d;border-radius:8px;color:#f0f6fc;font-size:15px}}
 input:focus{{outline:none;border-color:#238636}}
 .chk{{display:flex;align-items:center;gap:10px;margin-top:16px;color:#c9d1d9;font-size:14px}}
@@ -359,8 +377,12 @@ border-bottom:1px solid #21262d}}
             }
             let _ = write!(
                 p,
-                r#"<div class="row"><span>隧道出口</span><b>{}</b></div>"#,
-                if s.up_on { "上行网卡" } else { "AP 内客户端" }
+                r#"<div class="row"><span>选路</span><b>{}</b></div>"#,
+                match s.route_mode {
+                    1 => "只用本热点",
+                    2 => "只用上行 Wi-Fi",
+                    _ => "自动（谁通用谁）",
+                }
             );
         }
         let _ = write!(p, "</div>");
@@ -374,11 +396,41 @@ border-bottom:1px solid #21262d}}
         if up { "ok" } else { "bad" },
         if up { "运行中" } else { "已关闭" }
     );
+    {
+        let mut pt = String::<64>::new();
+        let cls = if s.path == 0 { "bad" } else { "ok" };
+        match s.path {
+            1 => {
+                let _ = write!(pt, "本热点 · {}", s.client_ip);
+            }
+            2 => {
+                let _ = write!(pt, "上行 Wi-Fi · {}", state::tunnel_target());
+            }
+            _ => {
+                let _ = pt.push_str("未就绪");
+            }
+        }
+        let _ = write!(
+            p,
+            r#"<div class="row"><span>当前出口</span><b class="{}">{}</b></div>"#,
+            cls,
+            pt.as_str()
+        );
+    }
     let _ = write!(
         p,
-        r#"<div class="row"><span>FOU 目标</span><b>{}:{}</b></div>"#,
+        r#"<div class="row"><span>AP 侧手机</span><b>{}:{}</b></div>"#,
         s.client_ip,
         state::fou_port()
+    );
+    let _ = write!(
+        p,
+        r#"<div class="row"><span>上行侧手机</span><b>{}</b></div>"#,
+        if s.up_target.is_unspecified() {
+            alloc::string::String::from("未填写")
+        } else {
+            alloc::format!("{}:{}", s.up_target, state::fou_port())
+        }
     );
     let _ = write!(
         p,
@@ -422,7 +474,7 @@ border-bottom:1px solid #21262d}}
     if s.client_mac.is_none() && !s.up_on {
         let _ = write!(
             p,
-            r#"<div class="card"><span class="bad">还没找到手机</span><span class="dim"> · 让手机连上本热点，并把它的 IP 填到下面（默认 192.168.4.2）；或启用上行 Wi-Fi，把手机的 upstream IP 填进去</span></div>"#
+            r#"<div class="card"><span class="bad">还没找到手机</span><span class="dim"> · 两条路都不通：让手机连上本热点（ARP 里能看到它），或者启用上行 Wi-Fi 并填上手机在上游 LAN 的 IP</span></div>"#
         );
     }
     if s.no_mac > 0 && s.fwd_out == 0 && s.client_mac.is_none() && !s.up_on {
@@ -434,6 +486,20 @@ border-bottom:1px solid #21262d}}
 
     // 表单
     let (up_ssid_val, up_pass_val, up_on_ui) = state::uplink_copy();
+    let mut route_opts = String::<160>::new();
+    for (val, label) in [
+        (0u8, "自动（谁通用谁）"),
+        (1, "只用本热点里的手机"),
+        (2, "只用上行 Wi-Fi"),
+    ] {
+        let _ = write!(
+            route_opts,
+            r#"<option value="{}" {}>{}</option>"#,
+            val,
+            if s.route_mode == val { "selected" } else { "" },
+            label
+        );
+    }
     let _ = write!(
         p,
         r#"<form class="card" method="post" action="/set">
@@ -441,8 +507,10 @@ border-bottom:1px solid #21262d}}
 <label>Wi-Fi 名称<input type="text" name="ssid" value="{}" maxlength="31"></label>
 <label>Wi-Fi 密码（至少 8 位）<input type="text" name="pass" value="{}" maxlength="63"></label>
 <div style="font-size:13px;color:#8b949e;margin-top:18px">FOU 隧道</div>
-<label>手机 IP<input type="text" name="ip" value="{}"></label>
+<label>本热点里的手机 IP（AP 模式）<input type="text" name="ip" value="{}"></label>
+<label>上行 Wi-Fi 里的手机 IP（上行模式，留空则沿用上面的）<input type="text" name="uptarget" value="{}" placeholder="例如 192.168.1.50"></label>
 <label>端口<input type="number" name="port" value="{}" min="1024" max="65535"></label>
+<label>出口策略<select name="route">{}</select></label>
 <label class="chk"><input type="checkbox" name="on" {}> 启用转发</label>
 <div style="font-size:13px;color:#8b949e;margin-top:18px">上行 Wi-Fi（连到路由器，隧道走上游网段）</div>
 <label>上游 Wi-Fi 名称<input type="text" name="upssid" value="{}" maxlength="31" placeholder="留空则不启用"></label>
@@ -454,7 +522,13 @@ border-bottom:1px solid #21262d}}
         ssid.as_str(),
         pass.as_str(),
         s.client_ip,
+        if s.up_target.is_unspecified() {
+            alloc::string::String::new()
+        } else {
+            alloc::format!("{}", s.up_target)
+        },
         state::fou_port(),
+        route_opts,
         if up { "checked" } else { "" },
         up_ssid_val.as_str(),
         up_pass_val.as_str(),
@@ -464,10 +538,14 @@ border-bottom:1px solid #21262d}}
     let _ = write!(
         p,
         r#"<div class="card" style="font-size:13px;line-height:1.8">
-<div class="dim">用法</div>
-1. 手机连本热点，在 PocketGateway 里开网关，把「FOU 端口」保持 5555<br>
-2. 上面填手机在本热点里的 IP（<code>{}</code> 起分配），保存即生效<br>
-3. 其它设备连本热点，把网关指向 <code>{}</code>，MTU 建议 <code>{}</code><br>
+<div class="dim">两种出口，可以同时配好，默认自动选</div>
+<b>AP 模式</b>：手机连本热点（<code>{}</code> 起分配），封装帧直发，路径最短<br>
+<b>上行模式</b>：ESP32 自己连上游路由器，手机也在那个 LAN 里，填上它的上游 IP<br>
+自动策略：ARP 表里能看到「本热点里的手机」就用 AP，否则用上行；手机换网不用改配置<br>
+<div class="dim" style="margin-top:10px">用法</div>
+1. 手机连本热点，在 PocketGateway 里开网关，「FOU 端口」保持 5555 → AP 模式即可用<br>
+2. 想让手机走上游 Wi-Fi：填上游 SSID / 密码，并在「上行 Wi-Fi 里的手机 IP」填它的上游地址<br>
+3. 其它设备连本热点，网关指向 <code>{}</code>，MTU 建议 <code>{}</code><br>
 4. DNS 由 DHCP 下发 <code>223.5.5.5 / 119.29.29.29</code>，不经过本机，查询直接走隧道<br>
 5. 手机要能出网：安卓里给这个 Wi-Fi 打开「自动切换到移动数据」，否则手机会把隧道包又送回这里<br>
 <div class="dim" style="margin-top:8px">注：<code>192.168.4.1</code> 是本机自己，只提供 Web 设置页和 DHCP，发往它的包不会进隧道。</div>
@@ -502,14 +580,18 @@ fn status_json() -> &'static str {
     j.clear();
     let _ = write!(
         j,
-        r#"{{"up":{},"fou_ip":"{}","fou_port":{},"fwd_out":{},"fwd_in":{},"dropped":{},"client_mac":"{}"}}"#,
+        r#"{{"up":{},"fou_ip":"{}","fou_port":{},"fwd_out":{},"fwd_in":{},"dropped":{},"client_mac":"{}","path":{},"route":{},"up_target":"{}","up_ip":"{}"}}"#,
         s.up,
         s.client_ip,
         state::fou_port(),
         s.fwd_out,
         s.fwd_in,
         s.dropped,
-        FmtMac(s.client_mac.unwrap_or([0; 6]))
+        FmtMac(s.client_mac.unwrap_or([0; 6])),
+        s.path,
+        s.route_mode,
+        s.up_target,
+        s.up_ip
     );
     j.as_str()
 }

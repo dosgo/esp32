@@ -364,7 +364,8 @@ fn plan(f: &mut [u8], mac: [u8; 6], out: &mut [u8], ip_id: &mut u16, last_arp: &
     // 手机连在本热点上时没有别的出口，它自己的出站包会经默认路由回到这里；
     // 不拦就是「手机解封装 → 出站 → 回到 ESP32 → 再封装」的无限乒乓，
     // 隧道上流量一直在涨，却一个包都没上过网。
-    if src == u32::from(state::fou_ip()) {
+    // 两个出口的目标都要拦（上行模式下目标在上游网段）
+    if src == u32::from(state::fou_ip()) || src == u32::from(state::tunnel_target()) {
         state::LOOPBACK.fetch_add(1, Ordering::Relaxed);
         return Plan::Drop;
     }
@@ -451,17 +452,42 @@ fn encap(
 
     let peer = state::fou_ip();
 
-    // 上行模式：FOU 节点在上游 Wi-Fi 里，封装后的 UDP 从 station 网卡发，
-    // 这里只需要把内层 IP 包交给 uplink 任务
-    if state::uplink_up() {
+    // 两个出口都支持，选哪个：
+    //   - 手机在本热点里（ARP 能查到）→ 封成以太网帧直发，少一跳、不占上行空口；
+    //   - 否则手机上在上游 Wi-Fi 里 → 交给 uplink 任务从 station 网卡发 UDP。
+    // 默认自动，手机换到哪边都能自己切；网页里也能强制指定。
+    let up_ready = state::uplink_up();
+    let ap_ready = is_local(u32::from(peer)) && state::arp_lookup(peer).is_some();
+    let use_ap = match state::route_mode() {
+        1 => true,
+        2 => false,
+        _ => ap_ready || !up_ready,
+    };
+
+    if !use_ap {
+        if !up_ready {
+            // 指定的出口还没就绪，宁可丢也不偷偷换到另一条路上
+            bump_drop();
+            return Plan::Drop;
+        }
+        // 自动模式下手机可能刚切回本热点，ARP 表已经老化掉了。
+        // 每秒探一次（代价是丢一个包），探到就立刻切回 AP 路径。
+        if state::route_mode() == 0 && is_local(u32::from(peer)) && !ap_ready {
+            let now = Instant::now().as_millis();
+            if now.saturating_sub(*last_arp) >= 1000 {
+                *last_arp = now;
+                return Plan::Send(arp_request(u32::from(peer), mac, GW_IP.octets(), out));
+            }
+        }
         let n = ip.len().min(out.len());
         out[..n].copy_from_slice(&ip[..n]);
         state::set_last_flow(src, dst);
         state::FWD_OUT.fetch_add(1, Ordering::Relaxed);
         return Plan::Uplink(n);
     }
-    // 上行开着但还没拿到地址：别去 ARP 一个根本不存在的邻居
-    if state::uplink_on() {
+
+    // AP 模式下目标必须在本网段，否则 ARP 永远等不到
+    if !is_local(u32::from(peer)) {
         bump_drop();
         return Plan::Drop;
     }
