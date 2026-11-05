@@ -254,11 +254,14 @@ async fn stat_task(stack: Stack<'static>) {
             s.rx_mac[5],
         );
         info!(
-            "  uplink on={} state={} ip={} ch={}",
+            "  uplink on={} state={} ip={} ch={} target={} route={} path={}",
             s.up_on,
             s.up_state,
             if s.up_ip.is_unspecified() { 0 } else { u32::from(s.up_ip) },
-            s.up_ch
+            s.up_ch,
+            s.up_target,
+            s.route_mode,
+            s.path
         );
         info!("  dhcp_rx: {}", state::last_dhcp(true).as_str());
         info!("  dhcp_tx: {}", state::last_dhcp(false).as_str());

@@ -148,6 +148,9 @@ struct StatusSig {
     up_on: bool,
     up_ip: u32,
     up_state: u8,
+    /// 当前出口：0 无 / 1 本热点里的手机 / 2 上行 Wi-Fi
+    path: u8,
+    up_target: u32,
 }
 
 impl StatusSig {
@@ -156,12 +159,8 @@ impl StatusSig {
         let (ssid, pass) = state::net_copy();
         Self {
             enabled: s.up,
-            // 上行模式下"连上"指的是上游拿到地址；否则看 AP 侧 ARP 表
-            linked: if s.up_on {
-                !s.up_ip.is_unspecified()
-            } else {
-                s.client_mac.is_some()
-            },
+            // 两条路任意一条通就算连上（AP 侧看 ARP，上行侧看有没有拿到地址）
+            linked: s.path != 0,
             tx: s.fwd_out,
             rx: s.fwd_in,
             client: u32::from(s.client_ip),
@@ -172,6 +171,8 @@ impl StatusSig {
             up_on: s.up_on,
             up_ip: u32::from(s.up_ip),
             up_state: s.up_state,
+            path: s.path,
+            up_target: u32::from(s.up_target),
         }
     }
 }
@@ -304,27 +305,37 @@ where
 
     // 客户端信息：连着哪台手机
     let mut cli = heapless::String::<48>::new();
-    if sig.up_on {
-        if sig.up_ip == 0 {
-            let _ = cli.push_str(match sig.up_state {
-                3 => "up: connect failed",
-                _ => "up: connecting...",
-            });
-        } else {
-            let o = sig.up_ip.to_be_bytes();
+    match sig.path {
+        // 手机就在本热点里
+        1 => {
+            let o = sig.client.to_be_bytes();
             let _ = core::fmt::Write::write_fmt(
                 &mut cli,
-                format_args!("up: {}.{}.{}.{}", o[0], o[1], o[2], o[3]),
+                format_args!("ap: {}.{}.{}.{}", o[0], o[1], o[2], o[3]),
             );
         }
-    } else if sig.client == 0 {
-        let _ = cli.push_str("client: none");
-    } else {
-        let o = sig.client.to_be_bytes();
-        let _ = core::fmt::Write::write_fmt(
-            &mut cli,
-            format_args!("client: {}.{}.{}.{}", o[0], o[1], o[2], o[3]),
-        );
+        // 手机在上游 Wi-Fi 里
+        2 => {
+            let o = sig.up_target.to_be_bytes();
+            if sig.up_target == 0 {
+                let _ = cli.push_str("up: (no target)");
+            } else {
+                let _ = core::fmt::Write::write_fmt(
+                    &mut cli,
+                    format_args!("up: {}.{}.{}.{}", o[0], o[1], o[2], o[3]),
+                );
+            }
+        }
+        _ => {
+            if sig.up_on {
+                let _ = cli.push_str(match sig.up_state {
+                    3 => "up: connect failed",
+                    _ => "up: connecting...",
+                });
+            } else {
+                let _ = cli.push_str("peer: none");
+            }
+        }
     }
     Text::with_baseline(
         cli.as_str(),
@@ -338,8 +349,10 @@ where
     // ---------------- 底部提示 ----------------
     let hint = if !sig.enabled {
         "FOU tunnel is OFF"
-    } else if sig.up_on && sig.up_ip == 0 {
+    } else if sig.up_on && sig.up_ip == 0 && sig.path == 0 {
         "Uplink Wi-Fi not connected"
+    } else if sig.path == 0 {
+        "Waiting for phone (AP or uplink)"
     } else if sig.tx > 0 && sig.rx == 0 {
         "No reply from phone - check tunnel"
     } else if sig.linked {

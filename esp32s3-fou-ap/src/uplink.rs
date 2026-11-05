@@ -215,7 +215,14 @@ async fn bridge(stack: Stack<'static>) -> bool {
         warn!("uplink: bind {} failed", port);
         return false;
     }
-    info!("uplink: bridge ready on 0.0.0.0:{}", port);
+    info!(
+        "uplink: bridge ready on 0.0.0.0:{} -> {}",
+        port,
+        state::tunnel_target()
+    );
+    if state::tunnel_target().is_unspecified() {
+        warn!("uplink: no FOU target set, packets will be dropped");
+    }
 
     let mut pkt = [0u8; 1500];
     loop {
@@ -249,7 +256,8 @@ async fn bridge(stack: Stack<'static>) -> bool {
             Either3::First(Err(_)) => return false,
             // ESP32 → 手机：客户端流量封装好后从这里发出
             Either3::Second(pkt) => {
-                let ip = state::fou_ip();
+                // 上行目标优先；没填就沿用 AP 目标（老用法：直接填上游地址）
+                let ip = state::tunnel_target();
                 let o = ip.octets();
                 let ep = IpEndpoint::new(IpAddress::v4(o[0], o[1], o[2], o[3]), state::fou_port());
                 if sock.send_to(&pkt, ep).await.is_err() {
