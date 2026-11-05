@@ -204,9 +204,9 @@ static UPLINK: Mutex<RefCell<Uplink>> = Mutex::new(RefCell::new(Uplink {
 pub static UP_DIRTY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// AP → station 方向：封装好的内层 IP 包（交给 uplink 任务发 UDP）
-pub static UP_Q: Channel<CriticalSectionRawMutex, Vec<u8, 1500>, 8> = Channel::new();
+pub static UP_Q: Channel<CriticalSectionRawMutex, Vec<u8, 1500>, 16> = Channel::new();
 /// station → AP 方向：解封装后的内层 IP 包（由 apdrv 组装成以太网帧发给客户端）
-pub static AP_RX_Q: Channel<CriticalSectionRawMutex, Vec<u8, 1500>, 8> = Channel::new();
+pub static AP_RX_Q: Channel<CriticalSectionRawMutex, Vec<u8, 1500>, 16> = Channel::new();
 
 pub fn uplink_copy() -> (String<32>, String<64>, bool) {
     let mut s = String::new();
