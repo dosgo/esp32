@@ -101,10 +101,10 @@ async fn main(spawner: Spawner) -> ! {
     // esp-radio 默认值是给低吞吐场景的：tx_queue_size=3 / rx_queue_size=5。
     // AP 转发每包都要 RX+TX，而 rx_token() 只有在 tx_token() 拿到额度时才返回，
     // 3 个在途帧会把整条数据面（连收包一起）锁死；RX 队列满 5 帧还会直接丢包。
-    // 16 帧已跑出 1.4MB/s，小步加到 24（不要再翻倍，避免 bufferbloat）。
-    // dynamic_tx_buf_num 默认 32，24 帧在途仍在驱动 TX buffer 上限内。
+    // 16 帧实测 1.4MB/s；试过 24 帧反而更差（bufferbloat），已回退到 16。
+    // 不要再往上加队列，这里就是本板的实测最优点。
     let radio_cfg = ControllerConfig::default()
-        .with_tx_queue_size(24)
+        .with_tx_queue_size(16)
         .with_rx_queue_size(24)
         .with_static_rx_buf_num(16)
         .with_rx_ba_win(12)
