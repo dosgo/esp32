@@ -8,7 +8,7 @@ use embassy_time::Duration;
 use embedded_io_async::{Read, Write};
 use heapless::String;
 
-use crate::state;
+use crate::{config, state};
 use crate::{GW_IP, INNER_MTU, PUBLIC_DNS1, PUBLIC_DNS2};
 
 type Page = String<8192>;
@@ -160,7 +160,8 @@ fn apply(body: &str) {
     let mut pass = None::<String<64>>;
     let mut ip = None::<[u8; 4]>;
     let mut port = None::<u16>;
-    let mut on = true;
+    // checkbox 未勾选时浏览器根本不提交这个字段，所以默认必须是 false
+    let mut on = false;
     let mut up_ssid = None::<String<64>>;
     let mut up_pass = None::<String<64>>;
     let mut upon = None::<bool>;
@@ -235,6 +236,9 @@ fn apply(body: &str) {
         // 密码非空却太短会被 set_uplink 拒掉，此时保留原配置
         let _ = state::set_uplink(us.as_str(), up_p.as_str(), want);
     }
+
+    // 所有 setter 都跑完了才通知落盘；config_task 会合并短时间内的多次改动
+    config::SAVE.signal(());
 }
 
 fn decode(s: &str) -> Option<String<64>> {
