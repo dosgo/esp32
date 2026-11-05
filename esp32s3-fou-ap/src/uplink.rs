@@ -23,10 +23,10 @@ use log::{info, warn};
 
 use crate::state;
 
-const STA_RX_META: usize = 8;
-const STA_TX_META: usize = 8;
-const STA_RX_BUF: usize = 4096;
-const STA_TX_BUF: usize = 4096;
+const STA_RX_META: usize = 16;
+const STA_TX_META: usize = 16;
+const STA_RX_BUF: usize = 8192;
+const STA_TX_BUF: usize = 8192;
 
 /// 上行连不上时的重试间隔
 const RETRY: Duration = Duration::from_secs(8);
