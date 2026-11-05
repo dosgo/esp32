@@ -17,7 +17,7 @@ use embassy_time::{Duration, Instant};
 use esp_hal_dhcp_server::simple_leaser::SimpleDhcpLeaser;
 use esp_hal_dhcp_server::structs::DhcpLeaser;
 
-use crate::{GW_IP, POOL_END, POOL_START, PUBLIC_DNS1, PUBLIC_DNS2};
+use crate::{GW_IP, INNER_MTU, POOL_END, POOL_START, PUBLIC_DNS1, PUBLIC_DNS2};
 
 const SERVER_PORT: u16 = 67;
 const CLIENT_PORT: u16 = 68;
@@ -235,6 +235,8 @@ fn build_reply(buf: &mut [u8], packet: &Packet<'_>, mt: MessageType, ip: Option<
         dns[4..8].copy_from_slice(&PUBLIC_DNS2.octets());
         opt(buf, &mut o, 6, &dns);
         opt(buf, &mut o, 28, &[192, 168, 4, 255]);
+        // 接口 MTU：外层 FOU 要 28 字节头，客户端用 1400 就不会触发 IP 分片
+        opt(buf, &mut o, 26, &INNER_MTU.to_be_bytes());
     }
 
     buf[o] = 255; // end

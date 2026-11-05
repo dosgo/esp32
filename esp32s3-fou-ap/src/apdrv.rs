@@ -441,6 +441,7 @@ fn encap(
 
     state::set_last_flow(src, dst);
     state::FWD_OUT.fetch_add(1, Ordering::Relaxed);
+    state::TUN_BYTES_OUT.fetch_add(ip.len() as u32, Ordering::Relaxed);
 
     // 以太网头
     out[0..6].copy_from_slice(&peer_mac);
@@ -555,6 +556,7 @@ fn decap(ip: &[u8], ihl: usize, mac: [u8; 6], out: &mut [u8]) -> Plan {
     out[14..total].copy_from_slice(inner);
 
     state::FWD_IN.fetch_add(1, Ordering::Relaxed);
+    state::TUN_BYTES_IN.fetch_add(inner.len() as u32, Ordering::Relaxed);
     Plan::Send(total)
 }
 

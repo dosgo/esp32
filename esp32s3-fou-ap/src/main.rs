@@ -119,6 +119,37 @@ async fn main(spawner: Spawner) -> ! {
         Err(e) => warn!("read AP channel failed: {:?}", e),
     }
 
+    // 2.4G 默认只跑 HT20（72 Mbps PHY）。HT40 能翻倍到 150 Mbps，
+    // 但会占 4~10 两个信道，邻居多的时候反而更慢 —— 所以做成可配，
+    // 默认开 40M，干扰大时用网页关掉。
+    //
+    // esp-radio 0.18 只暴露 `set_bandwidths(Bandwidths)`，但 `Bandwidths` 既没实现
+    // Default 也没有构造函数，外部根本造不出实例（这个开关等于死的），
+    // 这里直接调 blob 的 FFI。
+    {
+        if state::wide_band() {
+            unsafe {
+                let mut bw = esp_wifi_sys_esp32s3::include::wifi_bandwidths_t {
+                    ghz_2g: esp_wifi_sys_esp32s3::include::wifi_bandwidth_t_WIFI_BW_HT40,
+                    ghz_5g: 0,
+                };
+                let r = esp_wifi_sys_esp32s3::include::esp_wifi_set_bandwidths(
+                    esp_wifi_sys_esp32s3::include::wifi_interface_t_WIFI_IF_AP,
+                    &mut bw,
+                );
+                if r == 0 {
+                    info!("AP bandwidth = HT40");
+                } else {
+                    warn!("set HT40 failed: {}", r);
+                }
+            }
+        }
+        match controller.bandwidths() {
+            Ok(bw) => info!("bandwidths = {:?}", bw),
+            Err(e) => warn!("read bandwidth failed: {:?}", e),
+        }
+    }
+
     spawner.spawn(wifi_keeper(controller).expect("spawn wifi_keeper"));
     spawner.spawn(net_task(runner).expect("spawn net_task"));
     spawner.spawn(dhcp_task(stack).expect("spawn dhcp"));
@@ -181,14 +212,26 @@ async fn dhcp_task(stack: Stack<'static>) {
     dhcp::run(stack).await
 }
 
-/// 每 5 秒把状态打到串口，方便不开网页时也能看
+/// 每 5 秒把状态打到串口，方便不开网页时也能看。
+/// 附带 5 秒窗口的隧道速率 —— 判断瓶颈全靠这两个数：
+/// out 就是"手机 → ESP32 → 客户端"方向实际搬了多少字节。
 #[embassy_executor::task]
 async fn stat_task(stack: Stack<'static>) {
+    let mut prev_out: u32 = 0;
+    let mut prev_in: u32 = 0;
     loop {
         Timer::after(Duration::from_secs(5)).await;
+        let out = state::TUN_BYTES_OUT.load(core::sync::atomic::Ordering::Relaxed);
+        let inp = state::TUN_BYTES_IN.load(core::sync::atomic::Ordering::Relaxed);
+        // 回绕安全：u32 减法天然按 2^32 取模
+        let kbps_out = out.wrapping_sub(prev_out) / 5 / 1024;
+        let kbps_in = inp.wrapping_sub(prev_in) / 5 / 1024;
+        prev_out = out;
+        prev_in = inp;
+
         let s = state::snapshot();
         info!(
-            "gw={} fou={}:{} up={} client={} tx={} rx={} drop={} loop={} | air f={} arp={} ip={} dhcp={} oth={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            "gw={} fou={}:{} up={} client={} tx={} rx={} drop={} loop={} spd out={}KB/s in={}KB/s | air f={} arp={} ip={} dhcp={} oth={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             stack.config_v4().map(|c| c.address).unwrap_or(embassy_net::Ipv4Cidr::new(Ipv4Addr::UNSPECIFIED, 0)),
             state::fou_ip(),
             state::fou_port(),
@@ -198,6 +241,8 @@ async fn stat_task(stack: Stack<'static>) {
             s.fwd_in,
             s.dropped,
             s.loopback,
+            kbps_out,
+            kbps_in,
             s.rx_frames,
             s.rx_arp,
             s.rx_ip,
