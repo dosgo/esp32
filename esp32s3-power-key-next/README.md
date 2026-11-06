@@ -706,3 +706,50 @@ LCD 背光 + PSRAM 10~15mA，剩下分散在 BLE 广播和 Flash 访问。
 
 > 想压到 100mA 以下只能砍功能：关热点、或者允许深度睡眠（Deep Sleep 会断 USB HID 和 BLE，
 > 唤醒靠 GPIO —— 那是另一套架构了）。
+
+---
+
+## 十二、固件升级（OTA，0.3.0 起）
+
+**不用拔板子**：浏览器打开设置页 → 「固件升级（OTA）」卡片 → 选 `.bin` → 上传。
+新固件写进备用分区，**失败不影响正在跑的系统**（otadata 没切换前旧固件照常引导；
+就算切换了，bootloader 校验失败也会自动回退）。
+
+### 一次性切换：换用 OTA 分区表
+
+OTA 需要 `ota_0 / ota_1 / otadata` 三个分区（见 `partitions.csv`），只需**换表重烧一次**：
+
+```bash
+espflash flash -T partitions.csv --after watchdog-reset target\xtensa-esp32s3-none-elf\release\esp32s3-power-key
+```
+
+- `--after watchdog-reset` 是这块无 RESET 键板子的老要求（见第四节）。
+- 换表不影响配置区（WiFi / Blinker / bond 在 0x9000~0xD000，分区表没动这块）。
+- 烧完之后 app 固定跑在 ota_0（0x10000）/ ota_1（0x200000）两个 2MB 槽里来回切换，
+  每次 OTA 写的是**另一个**槽。
+
+### 以后升级：两步
+
+1. 编译并导出 app 镜像（导出的才是网页要传的东西，**不是** elf）：
+   ```bash
+   cargo build --release
+   espflash save-image --chip esp32s3 target\xtensa-esp32s3-none-elf\release\esp32s3-power-key ota-firmware-x.y.z.bin
+   ```
+2. 连热点或局域网打开设置页 → 上传这个 `.bin`。页面上会显示进度，
+   写入 + 校验约 10~60 秒（慢 Wi-Fi 更久），完成后设备自动重启。
+
+升级文件也可以用 `espflash write-bin 0x10000 ota-firmware.bin` 走 USB 灌进 ota_0（应急用）。
+
+### 实现要点（改代码前先看）
+
+| 事项 | 说明 |
+|---|---|
+| 上传协议 | `POST /ota`，body 就是 `.bin` 本体（无 multipart），按 Content-Length 流式收 |
+| 擦写策略 | **逐扇区擦**（4KB/次，~40ms），两个扇区之间网络是通的；整分区先擦完再收会把 Wi-Fi 断流十几秒、连接直接掉 |
+| 对齐 | flash 写入要求 4 字节对齐，最后一块不足 4 字节补 0xFF（NOR 擦除态，不影响镜像） |
+| 校验 | 收的时候算一遍 SHA1，写完整个镜像回读再算一遍对比；不过就报错，otadata 不动 |
+| 切换 | `OtaUpdater::activate_next_partition()` 写 otadata，之后重启即引导新固件 |
+| 防回滚 | 开机 `ota::boot_confirm()` 把当前镜像标成 Valid —— 防"回滚型 bootloader 把升级退回旧分区"（症状：升级成功一次、重启又变回老版本） |
+| 传错文件 | 首字节不是 0xE9（ESP 应用镜像 magic）直接拒收 —— elf / 全量 flash 镜像都过不了这关 |
+| 分区表缓冲 | OTA 读分区表的 0xC00 缓冲放 PSRAM，不放内部 .bss（主栈寸土寸金） |
+| 升级期间 | flash 擦写会周期性停 cache，HID/MQTT 可能顿一下；**别在电脑睡眠/唤醒操作进行到一半时升级** |

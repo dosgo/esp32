@@ -12,6 +12,7 @@
 //!   GET /wake | /sleep            -> 电源控制（不用开 WebSocket 的快捷入口）
 //!   GET /clear-bond               -> 只清蓝牙配对（WiFi/Blinker 保留）+ 重启
 //!   GET /factory-reset            -> 恢复出厂设置（清配置区 + 重启）
+//!   POST /ota                     -> 固件升级：body 直接是应用镜像 .bin（流式写备用分区）
 //!
 //! WebSocket 这块是从 esp32s3-hid-kvm 搬过来的（sha1 握手 + 帧解析），
 //! 因为电源键原来只有 HTTP，不带 WS。
@@ -293,6 +294,21 @@ fn urldecode(src: &[u8], out: &mut [u8]) -> usize {
     n
 }
 
+/// 解析十进制数字节串（Content-Length 用）。带字母 / 负号 / 溢出都算 None。
+fn atoi_usize(b: &[u8]) -> Option<usize> {
+    if b.is_empty() {
+        return None;
+    }
+    let mut v = 0usize;
+    for &c in b {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        v = v.checked_mul(10)?.checked_add((c - b'0') as usize)?;
+    }
+    Some(v)
+}
+
 pub fn hex_val(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),
@@ -516,6 +532,51 @@ pub async fn serve_once(socket: &mut TcpSocket<'_>) -> Served {
     // ---- 诊断日志（USB 唤醒排查用）----
     if find_seq(path, b"/log").is_some() {
         let _ = write_log(socket).await;
+        return Served::Page;
+    }
+
+    // ---- OTA 固件升级（POST /ota，body = 应用镜像 .bin）----
+    // /ota 是唯一子串，不怕跟别的路由撞；放在兜底设置页之前就行。
+    // 上传 1MB 固件在省电模式的 Wi-Fi 上可能要几十秒，超时必须先拉长。
+    if find_seq(path, b"/ota").is_some() {
+        socket.set_timeout(Some(embassy_time::Duration::from_secs(120)));
+
+        // 要用的信息必须先从 req 里全部取干净：req 借着 buf，
+        // 待会儿 buf 要整个交给 ota::handle_ota 当流式收发缓冲复用。
+        let (content_len, prefix) = {
+            let hdr_end = match find_seq(req, b"\r\n\r\n") {
+                Some(i) => i + 4,
+                None => return Served::Page,
+            };
+            let cl = header_value(req, b"Content-Length").and_then(atoi_usize);
+            (cl, (hdr_end, req.len()))
+        };
+
+        let result = match content_len {
+            Some(cl) => crate::ota::handle_ota(socket, cl, prefix, &mut buf).await,
+            None => Err("请求缺少 Content-Length。请用设置页的「固件升级」上传 .bin 文件"),
+        };
+
+        match result {
+            // 纯文本响应：设置页的 JS 直接把返回内容显示出来
+            Ok(_) => {
+                let _ = write_text(socket, "固件升级成功，设备正在重启…\n\
+                    约 15 秒后重新连上热点，刷新本页即可。\n\
+                    如果几分钟后连不上：拔插一次 USB，旧固件还在另一个分区，不会丢。")
+                    .await;
+                // 先把响应发完整再重启（跟 /save-blinker 同款套路）
+                embassy_time::Timer::after(embassy_time::Duration::from_millis(700)).await;
+                esp_hal::system::software_reset();
+            }
+            Err(msg) => {
+                log::warn!("[web/ota] 升级失败: {msg}");
+                let mut body: String<256> = String::new();
+                let _ = body.push_str("固件升级失败：\n");
+                let _ = body.push_str(msg);
+                let _ = body.push_str("\n\n原固件未受影响，板子仍在正常运行，可以直接重试。");
+                let _ = write_text(socket, &body).await;
+            }
+        }
         return Served::Page;
     }
 
@@ -880,6 +941,39 @@ async fn write_log(socket: &mut TcpSocket<'_>) -> Result<(), ()> {
     }
     drop(g);
 
+    let _ = socket.flush().await;
+    Ok(())
+}
+
+/// 返回一段纯文本（OTA 结果给设置页的 JS 直接显示用）。
+async fn write_text(socket: &mut TcpSocket<'_>, text: &str) -> Result<(), ()> {
+    let mut head = [0u8; 128];
+    let hdr = {
+        let mut w = Cursor {
+            buf: &mut head,
+            pos: 0,
+        };
+        w.push(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ");
+        let mut num = [0u8; 12];
+        let s = itoa(text.len(), &mut num);
+        w.push(s);
+        w.push(b"\r\nConnection: close\r\n\r\n");
+        w.done().len()
+    };
+    socket.write_all(&mut head[..hdr]).await.map_err(|_| ())?;
+    write_chunked(socket, text.as_bytes()).await
+}
+
+/// 分块把字节写出（每块 512B，避免一次占太多栈）
+async fn write_chunked(socket: &mut TcpSocket<'_>, b: &[u8]) -> Result<(), ()> {
+    let mut off = 0usize;
+    let mut chunk = [0u8; 512];
+    while off < b.len() {
+        let n = if b.len() - off < 512 { b.len() - off } else { 512 };
+        chunk[..n].copy_from_slice(&b[off..off + n]);
+        socket.write_all(&mut chunk[..n]).await.map_err(|_| ())?;
+        off += n;
+    }
     let _ = socket.flush().await;
     Ok(())
 }

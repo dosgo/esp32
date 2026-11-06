@@ -21,6 +21,7 @@ mod dns;
 mod hid;
 mod lcd;
 mod mqtt;
+mod ota;
 // 注意：msc.rs（USB U 盘）和 sdcard.rs（TF 卡）目前**未启用**，见下方说明。
 // 文件保留在仓库里，想恢复时把这两行 mod 打开、按 git 历史 1ef6b7c 的集成方式接回即可。
 // mod msc;
@@ -1354,6 +1355,10 @@ async fn main(spawner: Spawner) -> ! {
 
     // ---------------- 读上次存的 WiFi 账号密码 ----------------
     let mut flash = FlashStorage::new(peripherals.FLASH).multicore_auto_park();
+    // OTA：开机确认当前镜像状态为 Valid（防回滚型 bootloader 把升级退回旧分区），
+    // 顺便把启动分区记进 /log（排查"到底跑的是哪个分区"时一眼可见）。
+    // 旧分区表（无 OTA 双分区）会静默跳过，不影响老固件。
+    ota::boot_confirm(&mut flash);
     // 热点自己的名字/密码（网页里改过的）
     let apcfg = store::load_ap(&mut flash).unwrap_or_default();
     let creds = match store::load(&mut flash) {
@@ -1780,7 +1785,9 @@ static AP_WEB_BUF: static_cell::StaticCell<&'static mut [u8]> = static_cell::Sta
 static STA_WEB_BUF: static_cell::StaticCell<&'static mut [u8]> = static_cell::StaticCell::new();
 
 /// 从 PSRAM 分配一块普通数据缓冲，PSRAM 不可用时退回内部堆。
-fn alloc_psram_buf(len: usize) -> &'static mut [u8] {
+///
+/// `pub`：ota.rs 也要用（OTA 的分区表缓冲 0xC00 从这里出，不能挤内部 .bss 的主栈）。
+pub fn alloc_psram_buf(len: usize) -> &'static mut [u8] {
     unsafe {
         let layout = core::alloc::Layout::from_size_align_unchecked(len, 4);
         let mut p =
