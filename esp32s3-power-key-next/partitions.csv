@@ -1,0 +1,18 @@
+﻿# ESP32-S3 16MB flash 分区表（OTA 双分区版）
+#
+# 用法：espflash flash -T partitions.csv ...（见 README「固件升级（OTA）」）
+#
+# 设计要点（改之前先读）：
+# · 配置区 0x9000~0xD000 是固件 store.rs 裸写的（WiFi / Blinker / bond / 热点），
+#   必须保持在 app 分区之前且不被任何会写入的分区覆盖 —— nvs 声明在 0x9000 只是为了
+#   和默认布局对齐，固件从不使用 NVS，两者互不影响。
+# · ota_0 固定在 0x10000：现有固件就烧在这里，换分区表后旧固件仍能被引导。
+# · otadata 为空（刚烧完）时 bootloader 没有 factory 可选，自动落在 ota_0。
+# · 每个 app 分区 2MB（固件目前 ~1MB，余量充足）；尾部留了 coredump，
+#   0x400000 之后 12MB 暂时空着，将来想加文件系统从那里切。
+# Name,     Type, SubType,  Offset,   Size,      Flags
+nvs,        data, nvs,      0x9000,   0x5000,
+otadata,    data, ota,      0xe000,   0x2000,
+ota_0,      app,  ota_0,    0x10000,  0x1F0000,
+ota_1,      app,  ota_1,    0x200000, 0x1F0000,
+coredump,   data, coredump, 0x3F0000, 0x10000,

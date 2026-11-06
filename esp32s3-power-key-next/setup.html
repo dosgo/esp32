@@ -141,6 +141,19 @@
     </form>
   </div>
 
+  <div class="card">
+    <div style="font-size:14px;font-weight:500;margin-bottom:6px">固件升级（OTA）</div>
+    <div class="tip" style="margin-top:0;margin-bottom:12px">
+      不用拔板子、不用数据线：选择固件 <b>.bin</b> 文件直接上传。<br>
+      新固件写在备用分区，<b>升级失败不影响现在正在跑的系统</b>，可以放心重试。
+    </div>
+    <input type="file" id="ota-file" accept=".bin"
+           style="width:100%;padding:10px;border-radius:9px;border:1px solid var(--line);
+                  background:#0d131b;color:var(--fg);font-size:13px">
+    <button type="button" onclick="otaUpload()">上传并升级（会自动重启）</button>
+    <div id="ota-msg" class="tip" style="margin-top:10px;min-height:20px;white-space:pre-line"></div>
+  </div>
+
   <div class="tip">
     · 热点 <b id="t-apname">ESP32-POWER</b> 一直开着，任何时候都能连回来改设置<br>
     · 保存后约 10~20 秒出结果，上面「联网」会变成 已连接<br>
@@ -302,6 +315,48 @@ function act(a){
     if (a === 'wake') { m.textContent = '唤醒指令已发出'; m.className = 'tip ok'; }
     else { m.textContent = '发送失败，板子可能已被挂起或重启'; m.className = 'tip bad'; }
   });
+}
+
+// OTA 固件升级：XHR 而不是 fetch，因为要 upload.onprogress 显示进度。
+// body 直接就是文件本体（POST /ota），固件那边按 Content-Length 流式接收。
+function otaUpload(){
+  var inp = document.getElementById('ota-file');
+  var f = inp.files[0];
+  var m = document.getElementById('ota-msg');
+  if (!f) { alert('先选择固件 .bin 文件'); return; }
+  if (!confirm('上传固件并升级？\n\n' +
+      '文件：' + f.name + '（' + Math.round(f.size/1024) + ' KB）\n\n' +
+      '· 升级期间电源控制 / 键鼠可能短暂无响应\n' +
+      '· 上传 + 写入约需 10~60 秒，期间不要断电、不要离开本页\n' +
+      '· 写完会自动重启；失败也不会影响现有系统，可直接重试')) {
+    return;
+  }
+  m.textContent = '准备上传…';
+  m.className = 'tip';
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/ota', true);
+  xhr.timeout = 300000; // 慢 Wi-Fi + 大固件的余量
+  xhr.upload.onprogress = function(e){
+    if (e.lengthComputable) {
+      var p = Math.round(e.loaded * 100 / e.total);
+      m.textContent = '上传 + 写入中 ' + p + '%（最后一段是校验，进度条到 100% 后还要再等几秒）';
+    }
+  };
+  xhr.onload = function(){
+    var t = xhr.responseText || ('HTTP ' + xhr.status);
+    var ok = xhr.status === 200 && t.indexOf('成功') >= 0;
+    m.textContent = t;
+    m.className = ok ? 'tip ok' : 'tip bad';
+  };
+  xhr.onerror = function(){
+    m.textContent = '上传失败（连接中断）。板子没受影响，可以重试。';
+    m.className = 'tip bad';
+  };
+  xhr.ontimeout = function(){
+    m.textContent = '上传超时。板子没受影响，可以重试。';
+    m.className = 'tip bad';
+  };
+  xhr.send(f);
 }
 </script>
 </body>
