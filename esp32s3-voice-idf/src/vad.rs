@@ -1,13 +1,12 @@
-//! Safe wrapper over the official esp-sr VAD (WebRTC) C API.
+//! 官方 esp-sr VAD（WebRTC）C API 的安全封装。
 //!
-//! The VAD only accepts 10/20/30 ms frames, while the I2S block is 32 ms
-//! (512 samples). Feeding it the first 480 samples of every block drops 6% of
-//! the signal and makes the detector drift, so the samples are buffered here
-//! and consumed as a continuous 30 ms stream.
+//! VAD 只接受 10/20/30 毫秒的帧，而 I2S 块是 32 毫秒（512 样本）。
+//! 每块只取前 480 个样本会丢掉 6% 的信号并让检测器漂移，
+//! 所以在这里把样本攒起来，按连续的 30 毫秒流喂给 VAD。
 
 use esp_idf_sys as sys;
 
-const FRAME: usize = 480; // 30 ms at 16 kHz
+const FRAME: usize = 480; // 16 kHz 下 30 毫秒
 
 pub struct Vad {
     handle: sys::vad_handle_t,
@@ -15,7 +14,7 @@ pub struct Vad {
 }
 
 impl Vad {
-    /// `VAD_MODE_2` with 96 ms speech onset and 450 ms silence hangover.
+    /// `VAD_MODE_2`，96 毫秒语音起始确认、450 毫秒静音拖尾。
     pub fn new() -> Result<Self, String> {
         let handle =
             unsafe { sys::vad_create_with_param(sys::vad_mode_t_VAD_MODE_2, 16000, 30, 96, 450) };
@@ -29,8 +28,8 @@ impl Vad {
         }
     }
 
-    /// Feed one I2S chunk (512 samples). Returns true if any 30 ms sub-frame in
-    /// it was classified as speech.
+    /// 送入一个 I2S 块（512 样本）。其中任何 30 毫秒子帧被判为
+    /// 语音时返回 true。
     pub fn speech(&mut self, pcm: &[i16]) -> bool {
         self.pending.extend_from_slice(pcm);
         let mut voiced = false;
@@ -46,7 +45,7 @@ impl Vad {
         voiced
     }
 
-    /// Reset the internal trigger so the next utterance starts from silence.
+    /// 复位内部触发器，让下一句话从静音状态开始判。
     pub fn reset(&mut self) {
         self.pending.clear();
         unsafe { sys::vad_reset_trigger(self.handle) };

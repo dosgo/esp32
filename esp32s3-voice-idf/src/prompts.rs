@@ -1,5 +1,5 @@
-//! Pre-recorded local prompts (piper, 16 kHz mono s16le) compiled into the
-//! firmware so the device can still talk when the network is down.
+//! 预录的本地提示音（piper，16 kHz 单声道 s16le），编译进固件，
+//! 断网时设备也能开口说话。
 
 pub const HERE: &[u8] = include_bytes!("../assets/p_here.raw");
 pub const AGAIN: &[u8] = include_bytes!("../assets/p_again.raw");

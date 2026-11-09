@@ -1,10 +1,10 @@
-//! Streaming ASR over the DashScope realtime WebSocket:
+//! 通过 DashScope 实时 WebSocket 做流式识别：
 //! `wss://{workspace}.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference`
 //!
-//! One connection is kept open for the whole session. Each utterance starts a
-//! task (run-task), streams 16 kHz mono PCM frames, then finishes the task
-//! (finish-task) and reads the transcript from `result-generated` events.
-//! This avoids the ~10 s HTTP upload of a whole utterance.
+//! 整个会话保持一条连接。每句话开一个任务（run-task），流式发送
+//! 16 kHz 单声道 PCM 帧，然后结束任务（finish-task），从
+//! `result-generated` 事件里读识别文本。
+//! 这样避免了整段语音约 10 秒的 HTTP 上传。
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -16,18 +16,15 @@ use esp_idf_svc::ws::client::{
 
 use crate::cloud::{DASHSCOPE_KEY, DASHSCOPE_WS_URL};
 
-/// Server-side end-of-speech signal, published without locks so the audio
-/// thread can consult it on every 32 ms frame.
+/// 服务端的"说完"信号，无锁发布，音频线程可以每 32 毫秒帧查询一次。
 ///
-/// The local silence timer can only guess where a sentence ends. The
-/// recogniser already knows: it returns partial text while the user is still
-/// talking and stops updating once the sentence is complete. The audio thread
-/// combines both (see `main.rs`), which is what makes segmentation stop
-/// guessing.
+/// 本地静音定时器只能猜句子在哪结束。识别端自己知道：用户还在说时
+/// 它就返回中间文本，句子说完就停止更新。音频线程把两者结合
+///（见 `main.rs`），断句从此不再靠猜。
 pub static PARTIAL_LEN: AtomicU32 = AtomicU32::new(0);
-/// `now_ms()` when the last partial result arrived.
+/// 最后一次收到中间结果时的 `now_ms()`。
 pub static PARTIAL_AT: AtomicU32 = AtomicU32::new(0);
-/// Binary frames accepted by the socket for the current task.
+/// 当前任务已被 socket 接收的二进制帧数。
 pub static FRAMES_SENT: AtomicU32 = AtomicU32::new(0);
 
 fn boot_instant() -> Instant {
@@ -35,19 +32,19 @@ fn boot_instant() -> Instant {
 }
 static BOOT: OnceLock<Instant> = OnceLock::new();
 
-/// Milliseconds since the first use of this module.
+/// 自模块首次使用起经过的毫秒数。
 pub fn now_ms() -> u32 {
     boot_instant().elapsed().as_millis() as u32
 }
 
-/// How long ago the recogniser last produced new text (ms).
+/// 识别端上次产出新文本是多久以前（毫秒）。
 pub fn partial_age_ms() -> u64 {
     let at = PARTIAL_AT.load(Ordering::Relaxed);
     if at == 0 {
         return u64::MAX;
     }
-    // Xtensa has no 64-bit atomics; a 32-bit millisecond stamp wraps after 49
-    // days and wrapping_sub still yields the correct small difference.
+    // Xtensa 没有 64 位原子量；32 位毫秒时间戳 49 天回绕一次，
+    // wrapping_sub 仍能得到正确的小差值。
     now_ms().wrapping_sub(at) as u64
 }
 
@@ -70,9 +67,8 @@ struct Inner {
     partial: String,
     dropped: u32,
     task_id: String,
-    /// Audio that arrives while run-task is still being acknowledged (the
-    /// first 0.3-1 s after the wake word — exactly the user's opening words).
-    /// Held here and flushed as soon as the task starts.
+    /// run-task 还在被确认期间到达的音频（唤醒后最初 0.3-1 秒——
+    /// 恰好是用户开口的前几个字）。先存在这里，任务一启动立刻补发。
     prebuf: Vec<u8>,
 }
 
@@ -141,14 +137,13 @@ impl AsrStream {
                 format!("Authorization: Bearer {DASHSCOPE_KEY}\r\n").into_boxed_str(),
             )),
             crt_bundle_attach: Some(esp_idf_sys::esp_crt_bundle_attach),
-            // Recognition events are large JSON payloads; the 1 KB default
-            // truncates them and the text never parses.
-            // 8 KB so long recognition events are never truncated; with the
-            // SPIRAM threshold at 2 KB this buffer lives in PSRAM.
+            // 识别事件是很大的 JSON；默认 1 KB 会截断导致文本解析失败。
+            // 8 KB 保证长识别事件不被截断；SPIRAM 阈值 2 KB，
+            // 这个缓冲会落在 PSRAM 里。
             buffer_size: 8192,
             reconnect_timeout_ms: Duration::from_secs(5),
-            // This link delays pongs; the defaults (10 s ping / 20 s timeout)
-            // made the client tear down healthy connections.
+            // 这条链路的 pong 有延迟，默认值（10 秒 ping / 20 秒超时）
+            // 会把健康连接拆掉。
             ping_interval_sec: Duration::from_secs(30),
             pingpong_timeout_sec: Duration::from_secs(90),
             disable_pingpong_discon: true,
@@ -208,9 +203,8 @@ impl AsrStream {
                                         } else {
                                             g.partial = t.clone();
                                         }
-                                        // Publish progress so the audio thread
-                                        // can tell "still talking" from
-                                        // "sentence finished".
+                                        // 发布进度，音频线程借此区分
+                                        // "还在说话"和"句子说完了"。
                                         let total = g.transcript.chars().count()
                                             + g.partial.chars().count();
                                         PARTIAL_LEN.store(total as u32, Ordering::Relaxed);
@@ -240,7 +234,7 @@ impl AsrStream {
             inner,
             task_id: String::new(),
         };
-        // Wait for the handshake, then open the first task.
+        // 等握手完成，然后开第一个任务。
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
             if s.inner.lock().map(|g| g.connected).unwrap_or(false) {
@@ -254,10 +248,9 @@ impl AsrStream {
     fn send_text(&mut self, text: &str) {
         if let Some(c) = self.client.as_mut() {
             if let Err(e) = c.send(FrameType::Text(false), text.as_bytes()) {
-                // The esp websocket client can die without ever emitting a
-                // Disconnected event (e.g. after a DNS failure), leaving our
-                // `connected` flag stale. Mark it dead so the net-thread
-                // watchdog rebuilds the socket.
+                // esp websocket 客户端可能一声不吭地死掉、永远不发
+                // Disconnected 事件（比如一次 DNS 失败之后），导致
+                // `connected` 标记失效。这里标死，让 net 线程看门狗重建。
                 println!("[asr-ws] send_text failed: {e:?}");
                 if let Ok(mut g) = self.inner.lock() {
                     g.connected = false;
@@ -267,10 +260,9 @@ impl AsrStream {
     }
 
     pub fn start_task(&mut self) {
-        // Idempotent: Idle -> Speaking -> FollowUp -> Listening can call this
-        // again while the first task is still running. But a stale `started`
-        // flag from a socket that has since died must NOT suppress a new
-        // run-task: that silently dropped every frame of the next utterance.
+        // 幂等：Idle -> Greeting -> Listening 的流转可能在本任务仍在
+        // 运行时再次调用。但绝不能让已死 socket 留下的陈旧 `started`
+        // 标记拦住新的 run-task：那会悄悄丢掉下一句的每一帧音频。
         if let Ok(g) = self.inner.lock() {
             if g.connected && (g.started || g.pending) {
                 println!("[asr-ws] task already active, skip run-task");
@@ -308,9 +300,8 @@ impl AsrStream {
     }
 
     pub fn push(&mut self, pcm: &[u8]) {
-        // Not started yet: hold the audio instead of dropping it. run-task
-        // acknowledgement can take a few hundred ms and that window contains
-        // the user's first words.
+        // 还没启动：先攒住而不是丢弃。run-task 的确认可能要几百毫秒，
+        // 这段窗口里正是用户开口的前几个字。
         let flush: Option<Vec<u8>> = match self.inner.lock() {
             Ok(mut g) => {
                 if !g.started {
@@ -363,9 +354,9 @@ impl AsrStream {
         }
     }
 
-    /// Finish the current task and return the transcript (best effort).
+    /// 结束当前任务并返回识别文本（尽力而为）。
     pub fn finish(&mut self) -> String {
-        // The task may still be starting (run-task was just sent at wake).
+        // 任务可能还在启动中（唤醒时刚发出 run-task）。
         let wait_started = Instant::now() + Duration::from_millis(1500);
         while Instant::now() < wait_started {
             if self.inner.lock().map(|g| g.started).unwrap_or(false) {
@@ -382,11 +373,10 @@ impl AsrStream {
             self.send_text(&body);
         }
         let deadline = Instant::now() + Duration::from_secs(8);
-        // Do NOT stop at task-finished: on this service the final text can
-        // arrive *after* it, and returning then yields an empty transcript —
-        // the device then either says "没听清" or falls back to a 10 s HTTP
-        // upload of the whole utterance. Wait for actual text instead, and
-        // stop once it has been stable for 300 ms.
+        // 绝不能见到 task-finished 就返回：这个服务的最终文本可能
+        // 比它晚到，那时返回就是空文本——设备要么说"没听清"，
+        // 要么走 10 秒的整段 HTTP 上传兜底。改为等真正的文本出现，
+        // 稳定 300 毫秒后停止等待。
         let mut stable_since: Option<Instant> = None;
         let mut last_len: usize = 0;
         let mut finished_at: Option<Instant> = None;
@@ -408,8 +398,8 @@ impl AsrStream {
                     stable_since = Some(Instant::now());
                 }
             } else if finished {
-                // Finished but no text yet: give the result a short grace
-                // period, then give up (genuine silence).
+                // 已结束但还没有文本：给结果一小段宽限期，
+                // 到期放弃（确实没人说话）。
                 let t = *finished_at.get_or_insert_with(Instant::now);
                 if t.elapsed() >= Duration::from_millis(900) {
                     println!("[asr-ws] finished without any text");
@@ -431,7 +421,7 @@ impl AsrStream {
         text
     }
 
-    /// Close an abandoned recognition task and discard all partial state.
+    /// 关闭被放弃的识别任务并清空所有中间状态。
     pub fn cancel(&mut self) {
         let active = self
             .inner
@@ -459,7 +449,7 @@ impl AsrStream {
 }
 
 impl AsrStream {
-    /// Make sure a task is open (the socket may connect after `connect()`).
+    /// 确保任务已开启（socket 可能在 `connect()` 之后才连上）。
     pub fn ensure_task(&mut self) {
         let need = self
             .inner
@@ -473,7 +463,7 @@ impl AsrStream {
 }
 
 impl AsrStream {
-    /// Block until the server acknowledges the task (or the timeout expires).
+    /// 阻塞等待服务端确认任务启动（或超时）。
     pub fn wait_started(&mut self, ms: u64) -> bool {
         let deadline = Instant::now() + Duration::from_millis(ms);
         while Instant::now() < deadline {
@@ -492,9 +482,9 @@ impl AsrStream {
         self.inner.lock().map(|g| g.connected).unwrap_or(false)
     }
 
-    /// Frames actually pushed into the current task. Zero means the audio
-    /// never left the board (dead socket), so the caller must fall back to
-    /// whole-utterance HTTP recognition instead of trusting the empty result.
+    /// 当前任务实际送出的音频帧数。为零说明音频根本没离开板子
+    ///（socket 已死），调用方必须改走整段 HTTP 识别，
+    /// 而不是相信那个空结果。
     pub fn frames_sent(&self) -> u32 {
         self.inner.lock().map(|g| g.frames).unwrap_or(0)
     }

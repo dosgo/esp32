@@ -1,9 +1,9 @@
-//! ESP32-S3 voice assistant.
+//! ESP32-S3 语音助手。
 //!
-//! The audio thread owns I2S / mic / VAD / the state machine and never blocks;
-//! `net.rs` owns the ASR WebSocket and all HTTPS calls.
+//! 音频线程独占 I2S / 麦克风 / VAD / 状态机，绝不阻塞；
+//! `net.rs` 独占 ASR WebSocket 和所有 HTTPS 请求。
 //!
-//! Turn: wake -> greeting -> listen -> think -> speak -> follow-up.
+//! 一轮对话：唤醒 -> 应答 -> 收音 -> 思考 -> 播报 -> 结束。
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -33,51 +33,48 @@ mod prompts;
 mod vad;
 mod wakenet;
 
-/// Frames of local silence that end an utterance when the server has not
-/// confirmed the sentence yet (~0.64 s).
+/// 服务端尚未确认句子结束时的本地静音帧数（约 0.64 秒）。
 const SILENCE_FRAMES: u32 = 20;
 
-/// Same, once the recogniser has produced text and then stopped updating for
-/// `SERVER_SETTLE_MS`: the server already decided the sentence is over, so the
-/// local timer only has to confirm the mic went quiet (~0.19 s).
+/// 同上，但前提是识别端已产出文本且停止更新超过 `SERVER_SETTLE_MS`：
+/// 服务端已经判定句子说完了，本地只需确认麦克风确实安静（约 0.19 秒）。
 const SILENCE_FRAMES_SERVER: u32 = 6;
 
-/// How long the recogniser must stay quiet before we trust its silence.
+/// 识别端保持安静多久，我们才采信它的"沉默"。
 const SERVER_SETTLE_MS: u64 = 500;
 
-/// Absolute cap on one utterance (~15 s). The old 3.2 s cap cut long questions
-/// in half and made the device answer only the first clause.
+/// 单句时长硬上限（约 15 秒）。旧的 3.2 秒上限会把长问题拦腰砍断，
+/// 设备只回答前半句。
 const MAX_SPEECH_FRAMES: u32 = 300;
 
-/// Frames without speech after the wake word before giving up (~4.8 s).
+/// 唤醒词之后无语音持续多久就放弃（约 4.8 秒）。
 const NO_SPEECH_FRAMES: u32 = 150;
 
-/// Minimum speech frames for a valid utterance (~0.5 s).
+/// 判定一句话成立所需的最少语音帧数（约 0.5 秒）。
 const MIN_SPEECH_FRAMES: u32 = 15;
 
-/// Consecutive empty playback frames that count as "the speaker is done".
-/// Sending zeros keeps the I2S DMA moving, so this also flushes the last
-/// chunk out of the hardware buffer (~190 ms).
+/// 播放队列连续为空多少帧才算"喇叭说完了"。
+/// 这期间持续送零帧让 I2S DMA 保持运转，同时把最后一块音频
+/// 从硬件缓冲里冲出去（约 190 毫秒）。
 const DRAIN_FRAMES: u32 = 6;
 
-/// Speech / noise gate on the 32 ms frame RMS. Kept low on purpose: this mic
-/// delivers a normal speaking voice at rms 150-400, and the old 250 floor
-/// swallowed whole questions (observed: 4 attempts, zero frames above gate).
+/// 32 毫秒帧 RMS 的语音/噪声门限。刻意设得很低：这只麦克风的正常人声
+/// 在 rms 150-400，旧的 250 下限把整句话都吞掉了（实测连续 4 次、
+/// 没有一帧过线）。
 const SPEECH_RMS: f64 = 150.0;
 
-/// Digital make-up gain applied to the PCM that goes to ASR. The raw signal is
-/// quiet enough that the recogniser often returns an empty transcript, which
-/// the user experiences as "没听清".
+/// 送给 ASR 的 PCM 上的数字增益。原始信号太小，识别服务经常返回空文本，
+/// 用户看到的就是"没听清"。
 const ASR_GAIN: f32 = 3.0;
 
-/// At most four seconds of 16 kHz mono PCM may wait in the application queue.
-/// The bounded event channel then back-pressures the TTS downloader.
+/// 应用层队列最多缓存 4 秒的 16 kHz 单声道 PCM，
+/// 有界事件通道借此对 TTS 下载端形成背压。
 const MAX_TTS_QUEUE_BYTES: usize = 16_000 * 2 * 4;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum State {
     Idle,
-    /// Playing the short "在呢" acknowledgement; the ASR task starts meanwhile.
+    /// 播放本地"在呢"应答；同时 ASR 任务在后台启动。
     Greeting,
     Listening,
     Thinking,
@@ -118,14 +115,12 @@ fn main() {
     });
     wifi.set_configuration(&wifi_cfg).unwrap();
     wifi.start().unwrap();
-    // Let the RF stage settle. Calling connect() a few ms after start()
-    // reliably got us kicked right after association (run -> init) and cost
-    // 35 s per boot in the field.
+    // 让射频先稳定。start() 后几毫秒就 connect() 的话，
+    // 关联成功后立刻被踢（run -> init），实测每次开机多花 35 秒。
     thread::sleep(Duration::from_millis(1200));
-    // Wait for an actual DHCP lease, not just association: any request made
-    // before the lease exists fails with `getaddrinfo 202`, and that burned
-    // the first ~38 s after boot — the device looked deaf while it was really
-    // just offline.
+    // 等真正的 DHCP 租约，而不是只等到关联：没有租约时任何请求都会
+    // 报 `getaddrinfo 202`，之前每次开机前 38 秒设备看起来"不理人"，
+    // 其实只是没网。
     let mut ip: [u8; 4] = [0, 0, 0, 0];
     for attempt in 1..=4 {
         let _ = wifi.wifi_mut().connect();
@@ -153,14 +148,14 @@ fn main() {
         ip[2],
         ip[3]
     );
-    // The CPE's resolver intermittently answers 202 for the Alibaba hosts, so
-    // pin public resolvers before the first TLS handshake.
+    // CPE 路由器的 DNS 会对阿里云域名间歇性返回 202，
+    // 所以在首次 TLS 握手前固定使用公共 DNS。
     set_public_dns();
 
-    // ---- network worker ----
+    // ---- 网络线程 ----
     let (net_cmd, net_ev) = net::start();
 
-    // ---- I2C: ES8311 (DAC) + ES7210 (ADC) ----
+    // ---- I2C：ES8311（DAC）+ ES7210（ADC）----
     let i2c_cfg = I2cConfig::new().baudrate(100.kHz().into());
     let i2c = I2cDriver::new(
         peripherals.i2c0,
@@ -192,11 +187,11 @@ fn main() {
         thread::sleep(Duration::from_millis(300));
     }
 
-    // NS4150B PA enable.
+    // NS4150B 功放使能。
     let mut pa = PinDriver::output(peripherals.pins.gpio7).expect("PA pin");
     pa.set_high().expect("PA high");
 
-    // ---- I2S0 full duplex: BCLK=9, DIN=11, DOUT=12, MCLK=8, WS=10 ----
+    // ---- I2S0 全双工：BCLK=9, DIN=11, DOUT=12, MCLK=8, WS=10 ----
     let std_cfg = StdConfig::philips(16_000, DataBitWidth::Bits16);
     let mut i2s = I2sDriver::<I2sBiDir>::new_std_bidir(
         peripherals.i2s0,
@@ -253,36 +248,33 @@ fn main() {
     let mut current_turn: Option<net::TurnId> = None;
     let mut ui_voice = false;
     let mut ui_voice_until: Option<Instant> = None;
-    // Consecutive frames the playback queue has been empty. Only when this
-    // reaches DRAIN_FRAMES is the speaker really finished (see the constant).
+    // 播放队列连续为空的帧数计数。只有达到 DRAIN_FRAMES 才算
+    // 喇叭真正说完（见常量注释）。
     let mut drain_frames = 0u32;
     let mut last_state_log = Instant::now();
     let mut peak_rms: f64 = 0.0;
-    // WakeNet's wn9 quantized model has no working clean(); once it reports
-    // DETECTED it never fires again unless the instance is recreated. Rebuild
-    // it after every completed turn.
+    // WakeNet 的 wn9 量化模型 clean() 已损坏：一旦报出 DETECTED，
+    // 实例不重建就再也不触发。每轮对话结束后重建一次。
     let mut rebuild_wake = false;
-    // Ambient level, tracked only while idle. Used for the LCD hint and to
-    // keep the "no speech" timeout sane — never as a speech gate: on this mic
-    // the noise floor and a normal voice overlap almost completely.
+    // 环境音量，只在待机时跟踪。用于 LCD 提示和"无语音"超时的合理性，
+    // 绝不当作语音门限：这只麦克风的底噪和人声几乎完全重叠。
     let mut noise_floor = 150.0f64;
     let mut wake_dets = 0u32;
     let mut listen_dbg = 0u32;
-    // Wi-Fi holds a DHCP lease, i.e. the cloud is reachable.
+    // Wi-Fi 已拿到 DHCP 租约，即云端可达。
     let mut online = ip != [0, 0, 0, 0];
-    // The current Greeting only announces something and must return to Idle
-    // instead of opening the mic (used while offline).
+    // 当前 Greeting 只是播报通知，播完要回 Idle 而不是开麦（离线时用）。
     let mut announce_only = false;
 
     let _ = lcd.send("READY");
     println!("[boot] ready");
 
     loop {
-        // ---- WiFi watchdog ----
+        // ---- WiFi 看门狗 ----
         if last_wifi_check.elapsed() > Duration::from_secs(5) {
             last_wifi_check = Instant::now();
-            // Associated AND leased: an association without an IP is useless
-            // and reconnecting on it just interrupted a healthy DHCP exchange.
+            // 必须关联且有租约：只有关联没有 IP 毫无用处，
+            // 在那种状态下重连只会打断正常的 DHCP 交换。
             let has_ip = wifi
                 .wifi()
                 .sta_netif()
@@ -305,7 +297,7 @@ fn main() {
             }
         }
 
-        // Safety valve for a network turn that never reports back.
+        // 网络一轮迟迟不回报时的保险丝。
         if net_pending && net_since.elapsed() > Duration::from_secs(30) {
             println!("[net] turn timeout, resetting");
             if let Some(turn) = current_turn.take() {
@@ -318,7 +310,7 @@ fn main() {
             let _ = lcd.send("READY");
         }
 
-        // ---- events from the network thread ----
+        // ---- 来自网络线程的事件 ----
         while tts_queue.len() < MAX_TTS_QUEUE_BYTES {
             let Ok(ev) = net_ev.try_recv() else {
                 break;
@@ -350,41 +342,37 @@ fn main() {
             }
         }
 
-        // ---- playback bookkeeping ----
+        // ---- 播放记账 ----
         if tts_queue.is_empty() {
             drain_frames += 1;
         } else {
             drain_frames = 0;
         }
-        // "Queue empty" alone does NOT mean "finished speaking": a streaming
-        // TTS hiccups for hundreds of ms between chunks, and the I2S DMA still
-        // holds a few blocks after the last sample is queued. The speaker is
-        // done only when the queue has stayed empty for DRAIN_FRAMES *and* the
-        // network thread has reported the end of the stream.
+        // "队列空了"不等于"说完了"：流式 TTS 在块与块之间会卡顿几百毫秒，
+        // 且最后一段样本入队后 I2S DMA 里还压着几块数据。只有队列连续空
+        // DRAIN_FRAMES 帧、且网络线程明确报告流结束，才算真正播完。
         let drained = drain_frames >= DRAIN_FRAMES;
         let audio_busy = !drained;
 
         match state {
             State::Greeting if drained => {
                 if announce_only {
-                    // Offline announcement ("没有网络"): say it, then go idle.
+                    // 离线播报（"没有网络"）：说完回待机。
                     announce_only = false;
                     state = State::Idle;
                     let _ = lcd.send("READY");
                 } else {
-                    // The acknowledgement is over: open the mic. The ASR task
-                    // was started at wake time, so this prompt is exactly the
-                    // window that covers its 0.3-1 s start-up latency —
-                    // nothing the user says now is lost, and the reply is
-                    // never played over it.
+                    // 应答播完：开麦。ASR 任务在唤醒时就已启动，这段提示音
+                    // 恰好覆盖它 0.3~1 秒的启动延迟——用户此刻说的话不会丢，
+                    // 回复也不会盖在用户话上。
                     speech_frames = 0;
                     speech_started = false;
                     no_speech_frames = 0;
                     silence_frames = 0;
                     utt.clear();
                     listen_dbg = 0;
-                    // Let the speaker settle before trusting the mic: the DMA
-                    // tail is flushed but the room still rings for ~200 ms.
+                    // 开麦前让喇叭先沉住：DMA 尾部已冲掉，但房间里的余响
+                    // 还要持续约 200 毫秒。
                     listen_grace_until = Some(Instant::now() + Duration::from_millis(200));
                     if let Some(v) = vad.as_mut() {
                         v.reset();
@@ -395,10 +383,9 @@ fn main() {
                 }
             }
             State::Speaking if drained && turn_done => {
-                // The answer is fully played and the TTS stream is over.
-                // Close the turn — no implicit follow-up window: with no
-                // acoustic echo canceller it only ever caught the device's
-                // own voice and produced the self-talking loop.
+                // 回答已完整播放、TTS 流已结束，关闭本轮——不开隐式追问
+                // 窗口：没有回声消除时它只会收到设备自己的声音，
+                // 造成自问自答死循环。
                 turn_done = false;
                 net_pending = false;
                 current_turn = None;
@@ -407,7 +394,7 @@ fn main() {
                 let _ = lcd.send("READY");
             }
             State::Thinking if turn_done => {
-                // Turn produced no audio (echo dropped, empty transcript).
+                // 本轮没有产出音频（回声被丢弃、识别结果为空）。
                 state = State::Idle;
                 turn_done = false;
                 current_turn = None;
@@ -432,13 +419,13 @@ fn main() {
             }
         }
 
-        // ---- audio in ----
+        // ---- 音频输入 ----
         match i2s_rx.read(&mut raw, BLOCK) {
             Ok(n) if n >= chunk * 4 => {}
             _ => continue,
         }
 
-        // ---- audio out ----
+        // ---- 音频输出 ----
         if !tts_queue.is_empty() {
             for pair in tx_buf.chunks_exact_mut(4) {
                 let s = if tts_queue.len() >= 2 {
@@ -461,7 +448,7 @@ fn main() {
             println!("[i2s] tx error");
         }
 
-        // ---- mic ----
+        // ---- 麦克风 ----
         let mut rms = 0u64;
         for i in 0..chunk {
             let l = i16::from_le_bytes([raw[i * 4], raw[i * 4 + 1]]);
@@ -488,14 +475,14 @@ fn main() {
         }
 
         let mut frame_pcm = Vec::with_capacity(chunk * 2);
-        // Make-up gain for the recogniser only; VAD and the voiced gate keep
-        // working on the raw level so the thresholds stay meaningful.
+        // 只给识别端加增益；VAD 和语音判定继续用原始电平，
+        // 保证阈值的意义不变。
         for s in &mono {
             let v = (*s as f32 * ASR_GAIN).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
             frame_pcm.extend_from_slice(&v.to_le_bytes());
         }
 
-        // LCD hint while idle.
+        // 待机时的 LCD 提示。
         if state == State::Idle {
             if frame_rms > 300.0 {
                 if !ui_voice {
@@ -513,13 +500,12 @@ fn main() {
 
         match state {
             State::Idle => {
-                // Slow ambient tracker (EMA): speech is too sparse here to
-                // bias it much, and loud wake-word shouts average out.
-                // MUST skip while the speaker is playing — the device's own
-                // TTS hits the mic at rms ~20000 (no AEC) and would pump the
-                // floor until the voice gate blocked real speech entirely.
-                // Outlier rejection: knocks/pops (rms far above the floor)
-                // are single frames and must not drag the floor up.
+                // 慢速环境噪声跟踪（EMA）：待机时语音太稀疏，不宜让它
+                // 带偏跟踪值，响亮的唤醒喊声也会被平均掉。
+                // 喇叭播放时必须跳过——没有 AEC，设备自己的 TTS 打进
+                // 麦克风 rms 约 20000，会把底噪一路顶到语音判定失效。
+                // 离群值剔除：敲击/爆音（rms 远高于底噪）只有单帧，
+                // 不能让它们把底噪抬起来。
                 if !audio_busy && frame_rms < noise_floor * 4.0 {
                     noise_floor = noise_floor * 0.97 + frame_rms * 0.03;
                 }
@@ -546,18 +532,16 @@ fn main() {
                         listen_dbg = 0;
                         let _ = lcd.send("LISTENING");
                         if online {
-                            // Open the recognition task first: the short "在呢"
-                            // prompt played below is exactly the window its
-                            // run-task handshake needs, so the mic is live the
-                            // moment the prompt ends.
+                            // 先启动识别任务：下面播放的"在呢"提示音恰好
+                            // 覆盖 run-task 握手需要的窗口，提示音一结束
+                            // 麦克风即可用。
                             announce_only = false;
                             turn_seq = turn_seq.wrapping_add(1);
                             current_turn = Some(turn_seq);
                             let _ = net_cmd.send(net::Cmd::Wake(turn_seq));
                             tts_queue.extend(prompts::HERE.iter().copied());
                         } else {
-                            // Say it out loud. Staying silent while offline is
-                            // indistinguishable from a broken device.
+                            // 说出来。离线时装死和设备坏了没区别。
                             announce_only = true;
                             let _ = lcd.send("NO WIFI");
                             tts_queue.extend(prompts::NO_WIFI.iter().copied());
@@ -567,28 +551,26 @@ fn main() {
             }
             State::Greeting | State::Thinking | State::Speaking => {}
             State::Listening => {
-                // Cap the HTTP-fallback buffer (~6 s): anything longer would be
-                // re-uploaded whole and take forever on this link.
+                // 限制 HTTP 兜底缓冲大小（约 6 秒）：再长就得整段重传，
+                // 在这条链路上要等很久。
                 if utt.len() < 200 * 1024 {
                     utt.extend_from_slice(&frame_pcm);
                 }
                 if let Some(turn) = current_turn {
                     let _ = net_cmd.send(net::Cmd::Audio(turn, frame_pcm));
                 }
-                // WebRTC VAD is a spectral classifier and the only trustworthy
-                // judge on this hardware: the mic's noise floor sits at rms
-                // 100-200 and a normal voice at 150-400, so *any* absolute
-                // threshold either blocks real speech (the "没听清" reports) or
-                // opens on the fan. RMS is kept only as a floor against
-                // digital silence; loud clipping also counts as speech because
-                // clipping destroys the features VAD looks at.
+                // WebRTC VAD 是频谱分类器，在这块硬件上是唯一可信的
+                // 人声判据：麦克风的底噪在 rms 100-200，正常人声在
+                // 150-400，任何绝对阈值要么挡掉真人说话（"没听清"的
+                // 由来），要么被风扇打开。RMS 只留作数字静音的下限；
+                // 削波也算语音，因为削波会破坏 VAD 依赖的频谱特征。
                 let clipping = frame_rms > 8000.0;
                 let vad_hit = match vad.as_mut() {
                     Some(v) => v.speech(&mono) || clipping,
                     None => frame_rms > SPEECH_RMS,
                 };
                 let voiced = vad_hit && frame_rms > 120.0;
-                // Diagnostic: trajectory of rms / VAD while listening.
+                // 调试用：观察收音期间的 rms / VAD 轨迹。
                 listen_dbg += 1;
                 if listen_dbg % 16 == 0 || (listen_dbg <= 64 && listen_dbg % 4 == 0) {
                     println!(
@@ -621,14 +603,12 @@ fn main() {
                     } else {
                         silence_frames += 1;
                     }
-                    // ---- where does the sentence end? ----
-                    // The recogniser answers that question itself: it emits
-                    // partial text while the user is still speaking and then
-                    // stops. Once its output has been quiet for
-                    // SERVER_SETTLE_MS we only need to confirm the mic went
-                    // quiet too, which is a much shorter local wait than the
-                    // blind SILENCE_FRAMES timer. Falls back to the timer when
-                    // the socket never produced text.
+                    // ---- 句子在哪里结束？----
+                    // 这个问题由识别端自己回答：用户还在说话时它就输出
+                    // 中间文本，说完后停止更新。它的输出静默超过
+                    // SERVER_SETTLE_MS 后，本地只需再确认麦克风也安静了，
+                    // 比盲等 SILENCE_FRAMES 定时器短得多。socket 一直没
+                    // 出文本时回退到定时器。
                     let srv_len = asr_ws::PARTIAL_LEN.load(std::sync::atomic::Ordering::Relaxed);
                     let srv_quiet = asr_ws::partial_age_ms();
                     let server_done = srv_len > 0 && srv_quiet >= SERVER_SETTLE_MS;
@@ -670,8 +650,7 @@ fn main() {
     }
 }
 
-/// Public DNS fallback: resolvers handed out by some hotspots cannot see the
-/// Alibaba endpoints.
+/// 公共 DNS 兜底：某些热点的 DNS 解析不到阿里云的域名。
 pub(crate) fn set_public_dns() {
     unsafe {
         let netif =
@@ -697,7 +676,7 @@ pub(crate) fn set_public_dns() {
     }
 }
 
-/// Called from the network thread before connecting.
+/// 网络线程建连前调用。
 pub(crate) fn ensure_dns() {
     use std::net::ToSocketAddrs;
     let host = "ws-ebekoepr6y8ojg9x.cn-beijing.maas.aliyuncs.com:443";

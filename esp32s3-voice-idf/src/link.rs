@@ -1,13 +1,12 @@
-//! Transport layer: either talk to the local gateway over WebSocket, or go
-//! straight to the cloud (DashScope ASR/TTS + DeepSeek).
+//! 传输层：要么通过 WebSocket 连本地网关，要么直连云端
+//!（DashScope ASR/TTS + DeepSeek）。
 //!
-//! Both variants expose the same channel pair:
-//!   * `utter` - `Msg::Wake` when the wake word fires, `Msg::Utter(pcm)` when a
-//!               complete utterance (16 kHz mono s16le) is ready
-//!   * `tts`   - chunks of PCM to play on the speaker
+//! 两种模式暴露同一对通道：
+//!   * `utter` - 唤醒词触发时发 `Msg::Wake`，一句完整的话（16 kHz
+//!               单声道 s16le）就绪时发 `Msg::Utter(pcm)`
+//!   * `tts`   - 待播放的 PCM 块
 //!
-//! The gateway variant additionally handles hello/heartbeat and appends the
-//! trailing silence the gateway uses for end-pointing.
+//! 网关模式额外处理 hello/心跳，并补上网关断句所需的尾部静音。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -44,9 +43,8 @@ pub fn start(transport: Transport) -> Link {
 
     match transport {
         Transport::Cloud => {
-            // NOTE: the cloud pipeline runs inline in the main loop (see
-            // `run_cloud_pipeline`) because HTTPS from a secondary thread kept
-            // failing with ESP_ERR_HTTP_CONNECT on this build.
+            // 注意：云端管线直接跑在主循环里（见 `run_cloud_pipeline`），
+            // 因为这版固件上从子线程走 HTTPS 一直报 ESP_ERR_HTTP_CONNECT。
             let _ = (utter_rx, tts_tx);
             Link {
                 utter: utter_tx,
@@ -116,8 +114,7 @@ pub fn start(transport: Transport) -> Link {
                         }
                         Msg::Utter(pcm) => {
                             let _ = ws.send(FrameType::Binary(false), &pcm);
-                            // 25 frames of 32 ms silence = the 800 ms the
-                            // gateway needs to close the utterance.
+                            // 25 帧 32 毫秒静音 = 网关断句需要的 800 毫秒。
                             let silence = [0u8; 1024];
                             for _ in 0..25 {
                                 let _ = ws.send(FrameType::Binary(false), &silence);

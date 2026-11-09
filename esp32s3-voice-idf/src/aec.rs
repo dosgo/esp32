@@ -1,8 +1,7 @@
-//! Safe wrapper over the official esp-sr AEC C API (`esp_aec.h`).
+//! 官方 esp-sr AEC C API（`esp_aec.h`）的安全封装。
 //!
-//! Everything here is Rust: the handle and the aligned buffers are allocated
-//! through `heap_caps_aligned_alloc()` because `aec_process()` requires 16-byte
-//! aligned 16-bit buffers.
+//! 这里全部是 Rust：句柄和对齐缓冲通过 `heap_caps_aligned_alloc()` 分配，
+//! 因为 `aec_process()` 要求 16 字节对齐的 16 位缓冲。
 
 use core::ffi::c_void;
 
@@ -17,13 +16,12 @@ pub struct Aec {
 }
 
 impl Aec {
-    /// Create an AEC instance whose frame size matches the I2S chunk.
-    /// Tries the same (filter_length, mode) candidates as the old C shim.
+    /// 创建帧长与 I2S 块一致的 AEC 实例。
+    /// 依次尝试与旧 C 垫片相同的（filter_length, mode）组合。
     pub fn new(frame_size: usize) -> Option<Self> {
         unsafe {
-            // 2.6.x: prefer the config-based constructor; the legacy
-            // aec_create() path made esp_aec3_hps16fft_process() spin forever
-            // on this build.
+            // 2.6.x：优先用基于 config 的构造器；旧版 aec_create() 路径
+            // 在这版固件上会让 esp_aec3_hps16fft_process() 死循环。
             let mut config = sys::aec_config_t {
                 mic_num: 1,
                 ref_num: 1,
@@ -60,8 +58,8 @@ impl Aec {
             Some(Self { handle, frame: frame_size, input, reference, output })
         }
     }
-    /// Cancel the echo of `reference` (what the speaker is playing) in `mic`
-    /// and write the near-end signal to `out`.
+    /// 在 `mic` 中消除 `reference`（喇叭正在播放的内容）的回声，
+    /// 把近端信号写入 `out`。
     pub fn process(&mut self, mic: &[i16], reference: &[i16], out: &mut [i16]) {
         if mic.len() < self.frame || reference.len() < self.frame || out.len() < self.frame {
             return;

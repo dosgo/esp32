@@ -25,3 +25,9 @@ server/chat.log
 .DS_Store
 Thumbs.db
 .workbuddy/
+
+# 本地构建缓存 / 临时日志 / 测试录音
+.embuild/
+components_esp32s3.lock
+build_log.txt
+test_audio/*.wav

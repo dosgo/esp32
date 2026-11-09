@@ -1,11 +1,11 @@
-//! Direct cloud access (no gateway):
-//!   * ASR  : DashScope qwen-audio-3.1-asr-flash (base64 wav in the request body)
+//! 直连云端（不经网关）：
+//!   * ASR  : DashScope qwen-audio-3.1-asr-flash（base64 wav 放在请求体里）
 //!   * LLM  : DeepSeek chat/completions
-//!   * TTS  : DashScope qwen3-tts-flash -> audio URL -> wav download
+//!   * TTS  : DashScope qwen3-tts-flash -> 音频 URL -> wav 下载
 //!
-//! Connections are kept alive and reused: a TLS handshake costs several seconds
-//! on this board, so paying it once per host instead of once per request is the
-//! difference between ~20 s and ~8 s per turn.
+//! 连接保持活跃并复用：这块板上一次 TLS 握手要好几秒，
+//! 每台主机只付一次而不是每个请求付一次，
+//! 就是一轮对话 20 秒和 8 秒的差别。
 
 use std::time::Duration;
 
@@ -13,8 +13,8 @@ use esp_idf_svc::http::client::{Configuration, EspHttpConnection};
 use esp_idf_svc::http::Method;
 
 pub const DASHSCOPE_BASE: &str = "https://ws-ebekoepr6y8ojg9x.cn-beijing.maas.aliyuncs.com";
-/// The real key lives in `src/config.rs` (gitignored — see config.example.rs).
-/// Never hardcode it here: this file is tracked in git.
+/// 真正的秘钥放在 `src/config.rs`（已 gitignore，见 config.example.rs）。
+/// 绝不要硬编码在这里：本文件是被 git 跟踪的。
 pub const DASHSCOPE_KEY: &str = crate::config::DASHSCOPE_KEY;
 pub const DEEPSEEK_URL: &str = "https://api.deepseek.com/chat/completions";
 pub const DASHSCOPE_WS_URL: &str =
@@ -24,7 +24,7 @@ pub const DASHSCOPE_WS_URL: &str =
 enum Host {
     Dash,
     Deep,
-    /// Audio files live on OSS: a different host, never reused with Dash.
+    /// 音频文件在 OSS 上：另一台主机，绝不与 Dash 混用连接。
     Oss,
 }
 
@@ -76,8 +76,8 @@ impl Cloud {
             let conn = self.slot(host).as_mut().unwrap();
             f(conn)
         };
-        // Keep the socket on success so a turn can reuse it (LLM + TTS go to
-        // the same host). On error drop it so the next attempt reconnects.
+        // 成功时保留 socket，让一轮对话能复用它（LLM 和 TTS 走同一台
+        // 主机）。出错就丢弃，下次重连。
         if res.is_err() {
             *self.slot(host) = None;
         }
@@ -86,8 +86,8 @@ impl Cloud {
     }
 
     fn post(&mut self, host: Host, url: &str, token: &str, body: &[u8]) -> Result<String, String> {
-        // A kept-alive socket can be closed by the server while we were idle;
-        // in that case drop it and reconnect once.
+        // keep-alive 的 socket 可能在我们空闲时被服务端关掉；
+        // 那就丢弃它并重连一次。
         for attempt in 1..=2 {
             let auth = format!("Bearer {token}");
             let t0 = std::time::Instant::now();
@@ -115,8 +115,8 @@ impl Cloud {
                 Ok(v) => return Ok(v),
                 Err(e) => {
                     println!("[cloud] post attempt {attempt} failed: {e}");
-                    // A well-formed HTTP error (4xx/5xx) is not a transport
-                    // problem; retrying would resend the whole body for nothing.
+                    // 结构完整的 HTTP 错误（4xx/5xx）不是传输问题；
+                    // 重试只会白白发一遍整个请求体。
                     let retriable = !e.starts_with("HTTP ");
                     if !retriable || attempt == 2 {
                         return Err(e);
@@ -184,7 +184,7 @@ impl Cloud {
         Ok(wav[44..].to_vec())
     }
 
-    /// Prime DNS only (fast). TLS handshakes happen on the first real turn.
+    /// 只预热 DNS（很快）。TLS 握手留到第一轮真实对话。
     pub fn dns_warmup(&self) {
         dns_prime();
         use std::net::ToSocketAddrs;
@@ -197,7 +197,7 @@ impl Cloud {
         }
     }
 
-    /// Prime DNS and one TLS handshake per host so the first turn is not slow.
+    /// 预热 DNS 和每台主机一次 TLS 握手，让第一轮对话不慢。
     pub fn warmup(&mut self) {
         dns_prime();
         let url = format!("{DASHSCOPE_BASE}/compatible-mode/v1/models");
@@ -207,7 +207,7 @@ impl Cloud {
                     .map_err(|e| format!("{e:?}"))?;
                 conn.initiate_response().map_err(|e| format!("{e:?}"))?;
                 let status = conn.status().to_string();
-                // Must not leave the body unread on a kept-alive connection.
+                // keep-alive 连接上绝不能留着没读完的响应体。
                 drain(conn, 64 * 1024);
                 Ok(status)
             });
@@ -243,8 +243,8 @@ fn read_response(conn: &mut EspHttpConnection, _timeout_s: u64) -> Result<String
     let status = conn.status();
     let mut out: Vec<u8> = Vec::new();
     let mut buf = [0u8; 2048];
-    // Read to EOF — no hard deadline: returning early would leave unread body
-    // bytes on the kept-alive connection and crash the next request.
+    // 一路读到 EOF——不设硬超时：提前返回会把没读完的响应体
+    // 留在 keep-alive 连接上，让下一个请求崩溃。
     loop {
         match conn.read(&mut buf) {
             Ok(0) => break,
@@ -268,10 +268,10 @@ fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-/// Discard any unread response body. A keep-alive connection that still has
-/// body bytes left when the next request is initiated corrupts the esp_http
-/// client state and crashes (LoadProhibited, memcpy(NULL)) inside
-/// esp_http_client_read — so every request must end with a fully drained body.
+/// 丢弃所有未读完的响应体。keep-alive 连接上如果还残留响应体字节，
+/// 下一次发起请求时 esp_http 客户端状态就会错乱，
+/// 在 esp_http_client_read 内部崩溃（LoadProhibited，memcpy(NULL)）——
+/// 所以每个请求结束时响应体必须完全排干。
 fn drain(conn: &mut EspHttpConnection, max_bytes: usize) {
     let mut buf = [0u8; 1024];
     let mut total = 0usize;
@@ -284,8 +284,8 @@ fn drain(conn: &mut EspHttpConnection, max_bytes: usize) {
     }
 }
 
-/// Priming the resolver avoids the first HTTPS attempts failing right after boot.
-/// Log the current AP RSSI (diagnostics: explains slow uploads).
+/// 预热解析器，避免开机后最初的几次 HTTPS 尝试失败。
+/// 打印当前 AP 的 RSSI（诊断用：解释上传为什么慢）。
 fn log_rssi() {
     unsafe {
         let mut ap: esp_idf_sys::wifi_ap_record_t = core::mem::zeroed();
@@ -308,8 +308,7 @@ pub fn dns_prime() {
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    // The TTS audio lives on OSS; resolve it too, otherwise the first download
-    // spends seconds in DNS.
+    // TTS 音频在 OSS 上；也要预热解析，否则第一次下载会卡在 DNS 几秒。
     for attempt in 1..=10 {
         let ok = "dashscope-result-bj.oss-cn-beijing.aliyuncs.com:80"
             .to_socket_addrs()
@@ -324,7 +323,7 @@ pub fn dns_prime() {
     println!("[cloud] dns still failing after 10 tries");
 }
 
-/// Base64 (standard alphabet with padding).
+/// Base64（标准字母表，带填充）。
 pub fn base64(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
@@ -349,7 +348,7 @@ pub fn base64(data: &[u8]) -> String {
     out
 }
 
-/// Wrap 16-bit mono PCM in a 44-byte WAV header.
+/// 给 16 位单声道 PCM 套上 44 字节的 WAV 头。
 pub fn wav_header(pcm_len: usize, sample_rate: u32) -> [u8; 44] {
     let mut h = [0u8; 44];
     let byte_rate = sample_rate * 2;
@@ -359,11 +358,11 @@ pub fn wav_header(pcm_len: usize, sample_rate: u32) -> [u8; 44] {
     h[12..16].copy_from_slice(b"fmt ");
     h[16..20].copy_from_slice(&16u32.to_le_bytes());
     h[20..22].copy_from_slice(&1u16.to_le_bytes()); // PCM
-    h[22..24].copy_from_slice(&1u16.to_le_bytes()); // mono
+    h[22..24].copy_from_slice(&1u16.to_le_bytes()); // 单声道
     h[24..28].copy_from_slice(&sample_rate.to_le_bytes());
     h[28..32].copy_from_slice(&byte_rate.to_le_bytes());
-    h[32..34].copy_from_slice(&2u16.to_le_bytes()); // block align
-    h[34..36].copy_from_slice(&16u16.to_le_bytes()); // bits
+    h[32..34].copy_from_slice(&2u16.to_le_bytes()); // 块对齐
+    h[34..36].copy_from_slice(&16u16.to_le_bytes()); // 位深
     h[36..40].copy_from_slice(b"data");
     h[40..44].copy_from_slice(&(pcm_len as u32).to_le_bytes());
     h
@@ -384,7 +383,7 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-/// Extract the first string value of `"key":"..."` (byte-safe UTF-8).
+/// 提取 `"key":"..."` 的第一个字符串值（按字节安全处理 UTF-8）。
 fn string_field(json: &str, key: &str) -> Option<String> {
     let pat = format!("\"{key}\":\"");
     let start = json.find(&pat)? + pat.len();
@@ -428,7 +427,7 @@ fn string_field(json: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Decode standard base64 (with padding) into bytes.
+/// 解码标准 base64（带填充）为字节。
 pub fn base64_decode(s: &str) -> Vec<u8> {
     let mut rev = [255u8; 256];
     let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -454,7 +453,7 @@ pub fn base64_decode(s: &str) -> Vec<u8> {
 }
 
 impl Cloud {
-    /// Streaming TTS: feeds PCM chunks to `sink` as they arrive (SSE).
+    /// 流式 TTS：PCM 块一到达就喂给 `sink`（SSE）。
     pub fn tts_stream<F>(
         &mut self,
         text: &str,
@@ -498,8 +497,8 @@ impl Cloud {
                 let n = match conn.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => n,
-                    // Once the audio is finished the socket may already be
-                    // closing; an error then is not a failure of the stream.
+                    // 音频已结束时 socket 可能正在关闭；
+                    // 此时报错不代表流失败。
                     Err(e) => {
                         if done {
                             break;
@@ -508,8 +507,8 @@ impl Cloud {
                     }
                 };
                 if done {
-                    // Drain remaining bytes to EOF so the keep-alive
-                    // connection is clean for the next request.
+                    // 把剩余字节读到 EOF，保证 keep-alive 连接
+                    // 干净地留给下一个请求。
                     continue;
                 }
                 for &b in &buf[..n] {
@@ -535,8 +534,8 @@ impl Cloud {
                                 || payload.contains("finish_reason\":\"stop")
                             {
                                 println!("[cloud] tts stream done, {total} bytes");
-                                // Do NOT return here: keep reading to EOF so the
-                                // connection is fully drained before reuse.
+                                // 绝不能在这里返回：继续读到 EOF，
+                                // 连接完全排干后才能复用。
                                 done = true;
                             }
                         }
@@ -556,8 +555,8 @@ impl Cloud {
 }
 
 impl Cloud {
-    /// TTS with progressive download: the wav is read as it arrives and every
-    /// PCM chunk goes straight to `sink` (the 44-byte header is skipped).
+    /// 渐进式下载的 TTS：wav 边到边读，每块 PCM 直接交给 `sink`
+    ///（跳过 44 字节的头）。
     pub fn tts_progressive<F>(
         &mut self,
         text: &str,
@@ -618,7 +617,7 @@ impl Cloud {
     }
 }
 
-/// TEMP throughput probe: GET a URL, return (bytes, milliseconds).
+/// 临时吞吐量探测：GET 一个 URL，返回（字节数, 毫秒）。
 pub fn speed_test(url: &str) -> Result<(usize, u128), String> {
     let cfg = Configuration {
         buffer_size: Some(8192),
@@ -646,8 +645,8 @@ pub fn speed_test(url: &str) -> Result<(usize, u128), String> {
     Ok((total, tls))
 }
 
-/// TEMP: same probe but without certificate verification, to measure how much
-/// of the TLS handshake is spent in chain validation against the CA bundle.
+/// 临时：同样的探测但跳过证书校验，用来测量 TLS 握手里
+/// 有多少时间花在对照 CA 列表验证证书链上。
 pub fn speed_test_noverify(url: &str) -> Result<(usize, u128), String> {
     let cfg = Configuration {
         buffer_size: Some(8192),

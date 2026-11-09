@@ -1,4 +1,4 @@
-//! Minimal ST7789 status screen for the ESP-IDF port.
+//! ESP-IDF 移植版的最小 ST7789 状态屏。
 
 use std::sync::mpsc;
 use std::thread;
