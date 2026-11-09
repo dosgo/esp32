@@ -33,32 +33,51 @@ mod prompts;
 mod vad;
 mod wakenet;
 
-/// Frames of silence that end an utterance (~0.64 s).
+/// Frames of local silence that end an utterance when the server has not
+/// confirmed the sentence yet (~0.64 s).
 const SILENCE_FRAMES: u32 = 20;
+
+/// Same, once the recogniser has produced text and then stopped updating for
+/// `SERVER_SETTLE_MS`: the server already decided the sentence is over, so the
+/// local timer only has to confirm the mic went quiet (~0.19 s).
+const SILENCE_FRAMES_SERVER: u32 = 6;
+
+/// How long the recogniser must stay quiet before we trust its silence.
+const SERVER_SETTLE_MS: u64 = 500;
+
+/// Absolute cap on one utterance (~15 s). The old 3.2 s cap cut long questions
+/// in half and made the device answer only the first clause.
+const MAX_SPEECH_FRAMES: u32 = 300;
 
 /// Frames without speech after the wake word before giving up (~4.8 s).
 const NO_SPEECH_FRAMES: u32 = 150;
 
-/// Hard cap on one utterance (~3.2 s).
-const MAX_SPEECH_FRAMES: u32 = 100;
-
 /// Minimum speech frames for a valid utterance (~0.5 s).
 const MIN_SPEECH_FRAMES: u32 = 15;
 
-/// Speech / noise gate on the 32 ms frame RMS.
-const SPEECH_RMS: f64 = 250.0;
+/// Consecutive empty playback frames that count as "the speaker is done".
+/// Sending zeros keeps the I2S DMA moving, so this also flushes the last
+/// chunk out of the hardware buffer (~190 ms).
+const DRAIN_FRAMES: u32 = 6;
 
-/// Frames of quiet after the greeting before the mic is trusted (~0.3 s).
-const GREETING_QUIET_FRAMES: u32 = 10;
+/// Speech / noise gate on the 32 ms frame RMS. Kept low on purpose: this mic
+/// delivers a normal speaking voice at rms 150-400, and the old 250 floor
+/// swallowed whole questions (observed: 4 attempts, zero frames above gate).
+const SPEECH_RMS: f64 = 150.0;
+
+/// Digital make-up gain applied to the PCM that goes to ASR. The raw signal is
+/// quiet enough that the recogniser often returns an empty transcript, which
+/// the user experiences as "没听清".
+const ASR_GAIN: f32 = 3.0;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum State {
     Idle,
+    /// Playing the short "在呢" acknowledgement; the ASR task starts meanwhile.
     Greeting,
     Listening,
     Thinking,
     Speaking,
-    FollowUp,
 }
 
 fn main() {
@@ -95,13 +114,44 @@ fn main() {
     });
     wifi.set_configuration(&wifi_cfg).unwrap();
     wifi.start().unwrap();
-    let _ = wifi.wifi_mut().connect();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline && !wifi.is_connected().unwrap_or(false) {
-        thread::sleep(Duration::from_millis(150));
+    // Let the RF stage settle. Calling connect() a few ms after start()
+    // reliably got us kicked right after association (run -> init) and cost
+    // 35 s per boot in the field.
+    thread::sleep(Duration::from_millis(1200));
+    // Wait for an actual DHCP lease, not just association: any request made
+    // before the lease exists fails with `getaddrinfo 202`, and that burned
+    // the first ~38 s after boot — the device looked deaf while it was really
+    // just offline.
+    let mut ip: [u8; 4] = [0, 0, 0, 0];
+    for attempt in 1..=4 {
+        let _ = wifi.wifi_mut().connect();
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while Instant::now() < deadline {
+            if let Ok(info) = wifi.wifi().sta_netif().get_ip_info() {
+                ip = info.ip.octets();
+                if ip != [0, 0, 0, 0] {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+        if ip != [0, 0, 0, 0] {
+            break;
+        }
+        println!("[wifi] no lease yet (attempt {attempt})");
     }
     unsafe { esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE) };
-    println!("[wifi] connected={}", wifi.is_connected().unwrap_or(false));
+    println!(
+        "[wifi] connected={} ip={}.{}.{}.{}",
+        wifi.is_connected().unwrap_or(false),
+        ip[0],
+        ip[1],
+        ip[2],
+        ip[3]
+    );
+    // The CPE's resolver intermittently answers 202 for the Alibaba hosts, so
+    // pin public resolvers before the first TLS handshake.
+    set_public_dns();
 
     // ---- network worker ----
     let (net_cmd, net_ev) = net::start();
@@ -190,21 +240,33 @@ fn main() {
     let mut speech_started = false;
     let mut no_speech_frames = 0u32;
     let mut silence_frames = 0u32;
-    let mut onset_frames = 0u32;
-    let mut greeting_quiet = 0u32;
     let mut listen_grace_until: Option<Instant> = None;
-    let mut followup_until: Option<Instant> = None;
-    let mut followup_mute_until: Option<Instant> = None;
     let mut thinking_until: Option<Instant> = None;
     let mut turn_done = false;
     let mut net_pending = false;
     let mut net_since = Instant::now();
     let mut ui_voice = false;
     let mut ui_voice_until: Option<Instant> = None;
-    let mut tts_playing = false;
-    let mut speaking_idle = 0u32;
+    // Consecutive frames the playback queue has been empty. Only when this
+    // reaches DRAIN_FRAMES is the speaker really finished (see the constant).
+    let mut drain_frames = 0u32;
     let mut last_state_log = Instant::now();
     let mut peak_rms: f64 = 0.0;
+    // WakeNet's wn9 quantized model has no working clean(); once it reports
+    // DETECTED it never fires again unless the instance is recreated. Rebuild
+    // it after every completed turn.
+    let mut rebuild_wake = false;
+    // Ambient level, tracked only while idle. Used for the LCD hint and to
+    // keep the "no speech" timeout sane — never as a speech gate: on this mic
+    // the noise floor and a normal voice overlap almost completely.
+    let mut noise_floor = 150.0f64;
+    let mut wake_dets = 0u32;
+    let mut listen_dbg = 0u32;
+    // Wi-Fi holds a DHCP lease, i.e. the cloud is reachable.
+    let mut online = ip != [0, 0, 0, 0];
+    // The current Greeting only announces something and must return to Idle
+    // instead of opening the mic (used while offline).
+    let mut announce_only = false;
 
     let _ = lcd.send("READY");
     println!("[boot] ready");
@@ -213,9 +275,19 @@ fn main() {
         // ---- WiFi watchdog ----
         if last_wifi_check.elapsed() > Duration::from_secs(5) {
             last_wifi_check = Instant::now();
-            if wifi.is_up().unwrap_or(false) {
+            // Associated AND leased: an association without an IP is useless
+            // and reconnecting on it just interrupted a healthy DHCP exchange.
+            let has_ip = wifi
+                .wifi()
+                .sta_netif()
+                .get_ip_info()
+                .map(|i| i.ip.octets() != [0, 0, 0, 0])
+                .unwrap_or(false);
+            if has_ip {
                 no_ip_checks = 0;
+                online = true;
             } else {
+                online = false;
                 no_ip_checks += 1;
                 println!("[wifi] down, attempt {no_ip_checks}");
                 if no_ip_checks % 4 == 0 {
@@ -259,59 +331,73 @@ fn main() {
         }
 
         // ---- playback bookkeeping ----
-        let tts_active = !tts_queue.is_empty() || tts_playing;
-        if !tts_queue.is_empty() && !tts_playing {
-            tts_playing = true;
-            speaking_idle = 0;
-        } else if tts_queue.is_empty() && tts_playing {
-            speaking_idle += 1;
-            if speaking_idle > 30 {
-                tts_playing = false;
-            }
+        if tts_queue.is_empty() {
+            drain_frames += 1;
+        } else {
+            drain_frames = 0;
         }
+        // "Queue empty" alone does NOT mean "finished speaking": a streaming
+        // TTS hiccups for hundreds of ms between chunks, and the I2S DMA still
+        // holds a few blocks after the last sample is queued. The speaker is
+        // done only when the queue has stayed empty for DRAIN_FRAMES *and* the
+        // network thread has reported the end of the stream.
+        let drained = drain_frames >= DRAIN_FRAMES;
+        let audio_busy = !drained;
 
-        if !tts_active {
-            match state {
-                State::Greeting => {
-                    greeting_quiet += 1;
-                    if greeting_quiet >= GREETING_QUIET_FRAMES {
-                        greeting_quiet = 0;
-                        state = State::Listening;
-                        speech_frames = 0;
-                        speech_started = false;
-                        no_speech_frames = 0;
-                        silence_frames = 0;
-                        utt.clear();
-                        listen_grace_until = Some(Instant::now() + Duration::from_millis(500));
-                        if let Some(v) = vad.as_mut() {
-                            v.reset();
-                        }
-                        let _ = lcd.send("LISTENING");
-                    }
-                }
-                State::Speaking => {
-                    state = State::FollowUp;
-                    followup_until = Some(Instant::now() + Duration::from_secs(3));
-                    followup_mute_until = Some(Instant::now() + Duration::from_millis(400));
-                    onset_frames = 0;
+        match state {
+            State::Greeting if drained => {
+                if announce_only {
+                    // Offline announcement ("没有网络"): say it, then go idle.
+                    announce_only = false;
+                    state = State::Idle;
+                    let _ = lcd.send("READY");
+                } else {
+                    // The acknowledgement is over: open the mic. The ASR task
+                    // was started at wake time, so this prompt is exactly the
+                    // window that covers its 0.3-1 s start-up latency —
+                    // nothing the user says now is lost, and the reply is
+                    // never played over it.
+                    speech_frames = 0;
+                    speech_started = false;
+                    no_speech_frames = 0;
+                    silence_frames = 0;
+                    utt.clear();
+                    listen_dbg = 0;
+                    // Let the speaker settle before trusting the mic: the DMA
+                    // tail is flushed but the room still rings for ~200 ms.
+                    listen_grace_until = Some(Instant::now() + Duration::from_millis(200));
                     if let Some(v) = vad.as_mut() {
                         v.reset();
                     }
-                    let _ = lcd.send("READY");
+                    state = State::Listening;
+                    let _ = lcd.send("LISTENING");
+                    println!("[state] listening (mic open)");
                 }
-                State::Thinking if turn_done => {
-                    state = State::Idle;
-                    turn_done = false;
-                    thinking_until = None;
-                    let _ = lcd.send("READY");
-                }
-                _ => {}
             }
+            State::Speaking if drained && turn_done => {
+                // The answer is fully played and the TTS stream is over.
+                // Close the turn — no implicit follow-up window: with no
+                // acoustic echo canceller it only ever caught the device's
+                // own voice and produced the self-talking loop.
+                turn_done = false;
+                net_pending = false;
+                thinking_until = None;
+                state = State::Idle;
+                let _ = lcd.send("READY");
+            }
+            State::Thinking if turn_done => {
+                // Turn produced no audio (echo dropped, empty transcript).
+                state = State::Idle;
+                turn_done = false;
+                thinking_until = None;
+                let _ = lcd.send("READY");
+            }
+            _ => {}
         }
 
         if state == State::Thinking {
             if let Some(until) = thinking_until {
-                if Instant::now() >= until && !tts_active {
+                if Instant::now() >= until && !audio_busy {
                     println!("[state] thinking timeout");
                     state = State::Idle;
                     turn_done = false;
@@ -365,18 +451,23 @@ fn main() {
         if last_state_log.elapsed() > Duration::from_secs(5) {
             last_state_log = Instant::now();
             println!(
-                "[state] {:?} q={} rms={:.0} peak={:.0}",
+                "[state] {:?} q={} rms={:.0} peak={:.0} det={}",
                 state,
                 tts_queue.len(),
                 frame_rms,
-                peak_rms
+                peak_rms,
+                wake_dets
             );
             peak_rms = 0.0;
+            wake_dets = 0;
         }
 
         let mut frame_pcm = Vec::with_capacity(chunk * 2);
+        // Make-up gain for the recogniser only; VAD and the voiced gate keep
+        // working on the raw level so the thresholds stay meaningful.
         for s in &mono {
-            frame_pcm.extend_from_slice(&s.to_le_bytes());
+            let v = (*s as f32 * ASR_GAIN).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+            frame_pcm.extend_from_slice(&v.to_le_bytes());
         }
 
         // LCD hint while idle.
@@ -401,64 +492,95 @@ fn main() {
 
         match state {
             State::Idle => {
-                if !tts_active && !net_pending && wake.detect(&mono) {
-                    println!("[kws] wake");
-                    let _ = net_cmd.send(net::Cmd::Wake);
-                    tts_queue.clear();
-                    tts_queue.extend(prompts::HERE.iter().copied());
-                    state = State::Greeting;
-                    greeting_quiet = 0;
-                    let _ = lcd.send("LISTENING");
+                // Slow ambient tracker (EMA): speech is too sparse here to
+                // bias it much, and loud wake-word shouts average out.
+                // MUST skip while the speaker is playing — the device's own
+                // TTS hits the mic at rms ~20000 (no AEC) and would pump the
+                // floor until the voice gate blocked real speech entirely.
+                // Outlier rejection: knocks/pops (rms far above the floor)
+                // are single frames and must not drag the floor up.
+                if !audio_busy && frame_rms < noise_floor * 4.0 {
+                    noise_floor = noise_floor * 0.97 + frame_rms * 0.03;
                 }
-            }
-            State::Greeting => {}
-            State::FollowUp => {
-                let expired = followup_until.map(|t| Instant::now() >= t).unwrap_or(true);
-                if expired {
-                    state = State::Idle;
-                    let _ = lcd.send("READY");
-                } else if followup_mute_until
-                    .map(|t| Instant::now() < t)
-                    .unwrap_or(false)
-                {
-                    onset_frames = 0;
-                } else if match vad.as_mut() {
-                    Some(v) => v.speech(&mono) && frame_rms > SPEECH_RMS,
-                    None => frame_rms > SPEECH_RMS,
-                } {
-                    onset_frames += 1;
-                    if onset_frames >= 1 {
-                        let _ = net_cmd.send(net::Cmd::Wake);
-                        state = State::Listening;
+                if rebuild_wake && !audio_busy && !net_pending {
+                    rebuild_wake = false;
+                    println!("[kws] rebuilding wakenet");
+                    if !wake.reset() {
+                        println!("[kws] wakenet reset failed");
+                    }
+                }
+                if !audio_busy && !net_pending {
+                    wake_dets += 1;
+                    if wake.detect(&mono) {
+                        println!("[kws] wake online={online}");
+                        rebuild_wake = true;
+                        tts_queue.clear();
+                        drain_frames = 0;
+                        state = State::Greeting;
                         speech_frames = 0;
                         speech_started = false;
                         no_speech_frames = 0;
                         silence_frames = 0;
                         utt.clear();
-                        listen_grace_until = Some(Instant::now() + Duration::from_millis(400));
-                        if let Some(v) = vad.as_mut() {
-                            v.reset();
-                        }
+                        listen_dbg = 0;
                         let _ = lcd.send("LISTENING");
+                        if online {
+                            // Open the recognition task first: the short "在呢"
+                            // prompt played below is exactly the window its
+                            // run-task handshake needs, so the mic is live the
+                            // moment the prompt ends.
+                            announce_only = false;
+                            let _ = net_cmd.send(net::Cmd::Wake);
+                            tts_queue.extend(prompts::HERE.iter().copied());
+                        } else {
+                            // Say it out loud. Staying silent while offline is
+                            // indistinguishable from a broken device.
+                            announce_only = true;
+                            let _ = lcd.send("NO WIFI");
+                            tts_queue.extend(prompts::NO_WIFI.iter().copied());
+                        }
                     }
-                } else {
-                    onset_frames = 0;
                 }
             }
+            State::Greeting | State::Thinking | State::Speaking => {}
             State::Listening => {
-                utt.extend_from_slice(&frame_pcm);
+                // Cap the HTTP-fallback buffer (~6 s): anything longer would be
+                // re-uploaded whole and take forever on this link.
+                if utt.len() < 200 * 1024 {
+                    utt.extend_from_slice(&frame_pcm);
+                }
                 let _ = net_cmd.send(net::Cmd::Audio(frame_pcm));
-                let voiced = match vad.as_mut() {
-                    Some(v) => v.speech(&mono) && frame_rms > SPEECH_RMS,
+                // WebRTC VAD is a spectral classifier and the only trustworthy
+                // judge on this hardware: the mic's noise floor sits at rms
+                // 100-200 and a normal voice at 150-400, so *any* absolute
+                // threshold either blocks real speech (the "没听清" reports) or
+                // opens on the fan. RMS is kept only as a floor against
+                // digital silence; loud clipping also counts as speech because
+                // clipping destroys the features VAD looks at.
+                let clipping = frame_rms > 8000.0;
+                let vad_hit = match vad.as_mut() {
+                    Some(v) => v.speech(&mono) || clipping,
                     None => frame_rms > SPEECH_RMS,
                 };
+                let voiced = vad_hit && frame_rms > 120.0;
+                // Diagnostic: trajectory of rms / VAD while listening.
+                listen_dbg += 1;
+                if listen_dbg % 16 == 0 || (listen_dbg <= 64 && listen_dbg % 4 == 0) {
+                    println!(
+                        "[listen] f={} rms={:.0} floor={:.0} vad={} clip={}",
+                        listen_dbg, frame_rms, noise_floor, voiced, clipping
+                    );
+                }
                 if !speech_started && !voiced {
                     no_speech_frames += 1;
                     if no_speech_frames >= NO_SPEECH_FRAMES {
-                        println!("[state] no speech");
+                        println!("[state] no speech, back to idle");
                         state = State::Idle;
                         utt.clear();
+                        drain_frames = 0;
+                        tts_queue.clear();
                         tts_queue.extend(prompts::AGAIN.iter().copied());
+                        let _ = lcd.send("READY");
                     }
                 } else {
                     if !speech_started {
@@ -471,16 +593,36 @@ fn main() {
                     } else {
                         silence_frames += 1;
                     }
+                    // ---- where does the sentence end? ----
+                    // The recogniser answers that question itself: it emits
+                    // partial text while the user is still speaking and then
+                    // stops. Once its output has been quiet for
+                    // SERVER_SETTLE_MS we only need to confirm the mic went
+                    // quiet too, which is a much shorter local wait than the
+                    // blind SILENCE_FRAMES timer. Falls back to the timer when
+                    // the socket never produced text.
+                    let srv_len =
+                        asr_ws::PARTIAL_LEN.load(std::sync::atomic::Ordering::Relaxed);
+                    let srv_quiet = asr_ws::partial_age_ms();
+                    let server_done = srv_len > 0 && srv_quiet >= SERVER_SETTLE_MS;
+                    let need_sil = if server_done {
+                        SILENCE_FRAMES_SERVER
+                    } else {
+                        SILENCE_FRAMES
+                    };
                     let grace_done = listen_grace_until
                         .map(|t| Instant::now() >= t)
                         .unwrap_or(true);
                     if (grace_done
                         && speech_frames >= MIN_SPEECH_FRAMES
-                        && silence_frames >= SILENCE_FRAMES)
+                        && silence_frames >= need_sil)
                         || speech_frames >= MAX_SPEECH_FRAMES
                     {
-                        println!("[vad] end speech={speech_frames} sil={silence_frames}");
-                        let _ = net_cmd.send(net::Cmd::End);
+                        println!(
+                            "[vad] end speech={speech_frames} sil={silence_frames} srv={srv_len}/{}ms",
+                            if srv_len > 0 { srv_quiet.min(99999) } else { 0 }
+                        );
+                        let _ = net_cmd.send(net::Cmd::End(std::mem::take(&mut utt)));
                         net_pending = true;
                         net_since = Instant::now();
                         utt.clear();
@@ -491,7 +633,7 @@ fn main() {
                     }
                 }
             }
-            State::Thinking | State::Speaking => {}
+            State::Thinking | State::Speaking | State::Idle => {}
         }
     }
 }

@@ -13,7 +13,9 @@ use esp_idf_svc::http::client::{Configuration, EspHttpConnection};
 use esp_idf_svc::http::Method;
 
 pub const DASHSCOPE_BASE: &str = "https://ws-ebekoepr6y8ojg9x.cn-beijing.maas.aliyuncs.com";
-pub const DASHSCOPE_KEY: &str = "***REMOVED***";
+/// The real key lives in `src/config.rs` (gitignored — see config.example.rs).
+/// Never hardcode it here: this file is tracked in git.
+pub const DASHSCOPE_KEY: &str = crate::config::DASHSCOPE_KEY;
 pub const DEEPSEEK_URL: &str = "https://api.deepseek.com/chat/completions";
 pub const DASHSCOPE_CHAT_URL: &str = "https://ws-ebekoepr6y8ojg9x.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions";
 pub const DASHSCOPE_WS_URL: &str = "wss://ws-ebekoepr6y8ojg9x.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference";
@@ -115,7 +117,10 @@ impl Cloud {
                 Ok(v) => return Ok(v),
                 Err(e) => {
                     println!("[cloud] post attempt {attempt} failed: {e}");
-                    if attempt == 2 {
+                    // A well-formed HTTP error (4xx/5xx) is not a transport
+                    // problem; retrying would resend the whole body for nothing.
+                    let retriable = !e.starts_with("HTTP ");
+                    if !retriable || attempt == 2 {
                         return Err(e);
                     }
                 }
@@ -220,7 +225,10 @@ impl Cloud {
             let r = self.with_conn(Host::Dash, |conn| {
                 conn.initiate_request(Method::Get, &url, &[]).map_err(|e| format!("{e:?}"))?;
                 conn.initiate_response().map_err(|e| format!("{e:?}"))?;
-                Ok(conn.status().to_string())
+                let status = conn.status().to_string();
+                // Must not leave the body unread on a kept-alive connection.
+                drain(conn, 64 * 1024);
+                Ok(status)
             });
             match r {
                 Ok(status) => {
@@ -235,7 +243,9 @@ impl Cloud {
                 conn.initiate_request(Method::Get, "https://api.deepseek.com/", &[])
                     .map_err(|e| format!("{e:?}"))?;
                 conn.initiate_response().map_err(|e| format!("{e:?}"))?;
-                Ok(conn.status().to_string())
+                let status = conn.status().to_string();
+                drain(conn, 64 * 1024);
+                Ok(status)
             });
             match r {
                 Ok(status) => {
@@ -248,18 +258,21 @@ impl Cloud {
     }
 }
 
-fn read_response(conn: &mut EspHttpConnection, timeout_s: u64) -> Result<String, String> {
+fn read_response(conn: &mut EspHttpConnection, _timeout_s: u64) -> Result<String, String> {
     let status = conn.status();
     let mut out: Vec<u8> = Vec::new();
     let mut buf = [0u8; 2048];
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_s);
+    // Read to EOF — no hard deadline: returning early would leave unread body
+    // bytes on the kept-alive connection and crash the next request.
     loop {
-        if std::time::Instant::now() > deadline {
-            break;
-        }
         match conn.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Ok(n) => {
+                out.extend_from_slice(&buf[..n]);
+                if out.len() > 128 * 1024 {
+                    break;
+                }
+            }
             Err(_) => break,
         }
     }
@@ -272,6 +285,22 @@ fn read_response(conn: &mut EspHttpConnection, timeout_s: u64) -> Result<String,
 
 fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
+}
+
+/// Discard any unread response body. A keep-alive connection that still has
+/// body bytes left when the next request is initiated corrupts the esp_http
+/// client state and crashes (LoadProhibited, memcpy(NULL)) inside
+/// esp_http_client_read — so every request must end with a fully drained body.
+fn drain(conn: &mut EspHttpConnection, max_bytes: usize) {
+    let mut buf = [0u8; 1024];
+    let mut total = 0usize;
+    while total < max_bytes {
+        match conn.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(_) => break,
+        }
+    }
 }
 
 /// Priming the resolver avoids the first HTTPS attempts failing right after boot.
@@ -447,12 +476,12 @@ pub fn base64_decode(s: &str) -> Vec<u8> {
 
 impl Cloud {
     /// Streaming TTS: feeds PCM chunks to `sink` as they arrive (SSE).
-    pub fn tts_stream<F>(&mut self, text: &str, sink: &mut F) -> Result<(), String>
+    pub fn tts_stream<F>(&mut self, text: &str, sample_rate: u32, sink: &mut F) -> Result<(), String>
     where
         F: FnMut(&[u8]),
     {
         let body = format!(
-            "{{\"model\":\"qwen3-tts-flash\",\"input\":{{\"text\":\"{}\",\"voice\":\"Cherry\",\"format\":\"pcm\",\"sample_rate\":16000}}}}",
+            "{{\"model\":\"qwen3-tts-flash\",\"input\":{{\"text\":\"{}\",\"voice\":\"Cherry\",\"format\":\"pcm\",\"sample_rate\":{sample_rate}}}}}",
             json_escape(text)
         );
         let url = format!("{DASHSCOPE_BASE}/api/v1/services/aigc/multimodal-generation/generation");
@@ -480,12 +509,25 @@ impl Cloud {
                 return Err(format!("tts HTTP {status}"));
             }
             let mut buf = [0u8; 1024];
+            let mut done = false;
             loop {
                 let n = match conn.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => n,
-                    Err(e) => return Err(format!("tts read: {e:?}")),
+                    // Once the audio is finished the socket may already be
+                    // closing; an error then is not a failure of the stream.
+                    Err(e) => {
+                        if done {
+                            break;
+                        }
+                        return Err(format!("tts read: {e:?}"));
+                    }
                 };
+                if done {
+                    // Drain remaining bytes to EOF so the keep-alive
+                    // connection is clean for the next request.
+                    continue;
+                }
                 for &b in &buf[..n] {
                     if b == b'\n' {
                         let l = String::from_utf8_lossy(&line).trim().to_string();
@@ -507,7 +549,9 @@ impl Cloud {
                             }
                             if payload.contains("\"finish_reason\":\"stop\"") || payload.contains("finish_reason\":\"stop") {
                                 println!("[cloud] tts stream done, {total} bytes");
-                                return Ok(String::new());
+                                // Do NOT return here: keep reading to EOF so the
+                                // connection is fully drained before reuse.
+                                done = true;
                             }
                         }
                     } else if b != b'\r' {
@@ -516,6 +560,9 @@ impl Cloud {
                 }
             }
             println!("[cloud] tts stream eof, {total} bytes");
+            if total == 0 {
+                return Err("tts stream: no audio".into());
+            }
             Ok(String::new())
         })?;
         Ok(())

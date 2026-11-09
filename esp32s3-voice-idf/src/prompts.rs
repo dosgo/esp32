@@ -6,3 +6,5 @@ pub const AGAIN: &[u8] = include_bytes!("../assets/p_again.raw");
 pub const THINKING: &[u8] = include_bytes!("../assets/p_thinking.raw");
 pub const OK: &[u8] = include_bytes!("../assets/p_ok.raw");
 pub const NET: &[u8] = include_bytes!("../assets/p_net.raw");
+pub const NO_WIFI: &[u8] = include_bytes!("../assets/no_wifi.raw");
+pub const NO_GATEWAY: &[u8] = include_bytes!("../assets/no_gateway.raw");

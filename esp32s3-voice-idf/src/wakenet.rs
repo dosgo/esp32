@@ -11,6 +11,10 @@ use esp_idf_sys as sys;
 pub struct WakeNet {
     models: *mut sys::srmodel_list_t,
     iface: *const sys::esp_wn_iface_t,
+    /// Name returned by `esp_srmodel_filter` — lives inside `models` and is
+    /// required by `create()`; kept so `reset()` can re-create the detector
+    /// without touching the model list again.
+    name: *const c_char,
     model: *mut sys::model_iface_data_t,
     chunk: usize,
 }
@@ -78,6 +82,7 @@ impl WakeNet {
             Ok(Self {
                 models,
                 iface,
+                name,
                 model,
                 chunk: chunk as usize,
             })
@@ -90,6 +95,9 @@ impl WakeNet {
 
     /// Feed one chunk of 16 kHz mono samples. Returns true on wake word.
     pub fn detect(&mut self, pcm: &[i16]) -> bool {
+        if self.model.is_null() {
+            return false;
+        }
         debug_assert_eq!(pcm.len(), self.chunk);
         unsafe {
             let Some(detect) = (*self.iface).detect else {
@@ -99,11 +107,42 @@ impl WakeNet {
         }
     }
 
-    // NOTE: deliberately no `reset()` here.
-    // esp-sr 2.6.1's `esp_wn_iface_t::clean` (model_clean -> dl_convq_queue_bzero)
+    // NOTE: deliberately no `reset()` via `esp_wn_iface_t::clean`.
+    // esp-sr 2.6.1's `clean` (model_clean -> dl_convq_queue_bzero)
     // dereferences a NULL queue for the quantized wn9 model on our build and
-    // panics with LoadProhibited, so we only ever create / detect / destroy.
-    // To clear the detector state, drop the whole `WakeNet` and create it again.
+    // panics with LoadProhibited.
+
+    /// Clear the detector state by destroying and re-creating the model
+    /// instance on the *existing* interface. This never re-runs
+    /// `esp_srmodel_init`/`deinit`: those share global state inside esp-sr,
+    /// and a deinit after a second init munmaps stale pointers and panics
+    /// with LoadProhibited (observed in the field).
+    pub fn reset(&mut self) -> bool {
+        unsafe {
+            if let Some(destroy) = (*self.iface).destroy {
+                destroy(self.model);
+            }
+            let Some(create) = (*self.iface).create else {
+                self.model = core::ptr::null_mut();
+                return false;
+            };
+            let model = create(self.name as *const c_void, sys::det_mode_t_DET_MODE_95);
+            if model.is_null() {
+                self.model = core::ptr::null_mut();
+                return false;
+            }
+            self.model = model;
+            self.chunk = (*self.iface)
+                .get_samp_chunksize
+                .map(|f| f(model))
+                .unwrap_or(0) as usize;
+            true
+        }
+    }
+
+    pub fn is_alive(&self) -> bool {
+        !self.model.is_null()
+    }
 }
 
 impl Drop for WakeNet {
@@ -114,9 +153,10 @@ impl Drop for WakeNet {
                     destroy(self.model);
                 }
             }
-            if !self.models.is_null() {
-                sys::esp_srmodel_deinit(self.models);
-            }
+            // Intentionally NOT calling esp_srmodel_deinit: the srmodel list
+            // and its flash mmap are global/shared inside esp-sr; deinit-ing
+            // after any second init crashes. The mapping lives until power
+            // off, which is exactly what the model partition is for.
         }
     }
 }
