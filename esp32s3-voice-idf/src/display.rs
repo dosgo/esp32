@@ -42,8 +42,14 @@ pub fn start(
 
         let drv_cfg = DriverConfig::new();
         let dev_cfg = Config::new().baudrate(40.MHz().into());
-        let spi = SpiDriver::new(spi, sclk, mosi, None::<esp_idf_hal::gpio::AnyInputPin>, &drv_cfg)
-            .expect("LCD SPI");
+        let spi = SpiDriver::new(
+            spi,
+            sclk,
+            mosi,
+            None::<esp_idf_hal::gpio::AnyInputPin>,
+            &drv_cfg,
+        )
+        .expect("LCD SPI");
         let cs = PinDriver::output(cs).expect("LCD CS");
         let mut dc = PinDriver::output(dc).expect("LCD DC");
         dc.set_low().ok();
@@ -85,8 +91,8 @@ where
     let _ = Text::new("ESP32-S3", Point::new(20, 50), title).draw(display);
     let _ = Text::new("VOICE", Point::new(20, 78), title).draw(display);
 
-    let accent = Circle::new(Point::new(20, 120), 20)
-        .into_styled(PrimitiveStyle::with_fill(ACCENT));
+    let accent =
+        Circle::new(Point::new(20, 120), 20).into_styled(PrimitiveStyle::with_fill(ACCENT));
     let _ = accent.draw(display);
 
     let _ = Text::new(status, Point::new(55, 137), title).draw(display);

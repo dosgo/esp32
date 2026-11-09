@@ -35,19 +35,22 @@ impl WakeNet {
                 );
             }
 
-            let name = sys::esp_srmodel_filter(models, c"wn".as_ptr(), keyword_z.as_ptr() as *const c_char);
+            let name = sys::esp_srmodel_filter(
+                models,
+                c"wn".as_ptr(),
+                keyword_z.as_ptr() as *const c_char,
+            );
             if name.is_null() {
                 sys::esp_srmodel_deinit(models);
-                return Err(format!("no WakeNet model containing \"{keyword}\" in model partition"));
+                return Err(format!(
+                    "no WakeNet model containing \"{keyword}\" in model partition"
+                ));
             }
 
             let iface = sys::esp_wn_handle_from_name(name);
             if iface.is_null() {
                 sys::esp_srmodel_deinit(models);
-                return Err(format!(
-                    "esp_wn_handle_from_name({}) failed",
-                    c_str(name)
-                ));
+                return Err(format!("esp_wn_handle_from_name({}) failed", c_str(name)));
             }
 
             let Some(create) = (*iface).create else {
@@ -60,10 +63,7 @@ impl WakeNet {
                 return Err(format!("wakenet create({}) failed", c_str(name)));
             }
 
-            let chunk = (*iface)
-                .get_samp_chunksize
-                .map(|f| f(model))
-                .unwrap_or(0);
+            let chunk = (*iface).get_samp_chunksize.map(|f| f(model)).unwrap_or(0);
             if chunk <= 0 {
                 if let Some(destroy) = (*iface).destroy {
                     destroy(model);
@@ -165,5 +165,7 @@ unsafe fn c_str(ptr: *const c_char) -> String {
     if ptr.is_null() {
         return "<null>".into();
     }
-    core::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
+    core::ffi::CStr::from_ptr(ptr)
+        .to_string_lossy()
+        .into_owned()
 }

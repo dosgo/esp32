@@ -69,10 +69,18 @@ struct Inner {
     frames: u32,
     partial: String,
     dropped: u32,
+    task_id: String,
     /// Audio that arrives while run-task is still being acknowledged (the
     /// first 0.3-1 s after the wake word — exactly the user's opening words).
     /// Held here and flushed as soon as the task starts.
     prebuf: Vec<u8>,
+}
+
+fn event_task_id(json: &str) -> Option<&str> {
+    let marker = "\"task_id\":\"";
+    let start = json.find(marker)? + marker.len();
+    let tail = &json[start..];
+    Some(&tail[..tail.find('"')?])
 }
 
 pub struct AsrStream {
@@ -129,7 +137,9 @@ impl AsrStream {
         let inner = Arc::new(Mutex::new(Inner::default()));
         let inner_cb = inner.clone();
         let cfg = EspWebSocketClientConfig {
-            headers: Some(Box::leak(format!("Authorization: Bearer {DASHSCOPE_KEY}\r\n").into_boxed_str())),
+            headers: Some(Box::leak(
+                format!("Authorization: Bearer {DASHSCOPE_KEY}\r\n").into_boxed_str(),
+            )),
             crt_bundle_attach: Some(esp_idf_sys::esp_crt_bundle_attach),
             // Recognition events are large JSON payloads; the 1 KB default
             // truncates them and the text never parses.
@@ -174,6 +184,12 @@ impl AsrStream {
                                 Ok(g) => g,
                                 Err(_) => return,
                             };
+                            if let Some(event_id) = event_task_id(text) {
+                                if !g.task_id.is_empty() && event_id != g.task_id {
+                                    println!("[asr-ws] ignore stale event for {event_id}");
+                                    return;
+                                }
+                            }
                             if text.contains("task-started") {
                                 g.started = true;
                                 g.pending = false;
@@ -195,8 +211,8 @@ impl AsrStream {
                                         // Publish progress so the audio thread
                                         // can tell "still talking" from
                                         // "sentence finished".
-                                        let total =
-                                            g.transcript.chars().count() + g.partial.chars().count();
+                                        let total = g.transcript.chars().count()
+                                            + g.partial.chars().count();
                                         PARTIAL_LEN.store(total as u32, Ordering::Relaxed);
                                         PARTIAL_AT.store(now_ms(), Ordering::Relaxed);
                                         if g.transcript.is_empty() {
@@ -208,10 +224,7 @@ impl AsrStream {
                                     }
                                 }
                             } else {
-                                println!(
-                                    "[asr-ws] event: {}",
-                                    &text[..text.len().min(160)]
-                                );
+                                println!("[asr-ws] event: {}", &text[..text.len().min(160)]);
                             }
                         }
                         _ => {}
@@ -278,6 +291,7 @@ impl AsrStream {
                 g.pending = true;
                 g.seq += 1;
                 id = format!("dsh-{:08x}", g.seq);
+                g.task_id = id.clone();
             }
         }
         if id.is_empty() {
@@ -408,9 +422,39 @@ impl AsrStream {
         let text = self
             .inner
             .lock()
-            .map(|g| { let mut t = g.transcript.clone(); t.push_str(&g.partial); t })
+            .map(|g| {
+                let mut t = g.transcript.clone();
+                t.push_str(&g.partial);
+                t
+            })
             .unwrap_or_default();
         text
+    }
+
+    /// Close an abandoned recognition task and discard all partial state.
+    pub fn cancel(&mut self) {
+        let active = self
+            .inner
+            .lock()
+            .map(|g| g.started || g.pending)
+            .unwrap_or(false);
+        if active && !self.task_id.is_empty() {
+            let body = format!(
+                "{{\"header\":{{\"action\":\"finish-task\",\"task_id\":\"{}\",\"streaming\":\"duplex\"}},\"payload\":{{\"input\":{{}}}}}}",
+                self.task_id
+            );
+            self.send_text(&body);
+        }
+        if let Ok(mut g) = self.inner.lock() {
+            g.started = false;
+            g.pending = false;
+            g.finished = false;
+            g.transcript.clear();
+            g.partial.clear();
+            g.prebuf.clear();
+            g.frames = 0;
+        }
+        reset_publish();
     }
 }
 

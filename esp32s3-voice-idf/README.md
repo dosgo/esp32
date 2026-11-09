@@ -27,7 +27,7 @@
 | 能力 | 服务 | 说明 |
 |---|---|---|
 | ASR | 阿里云百炼 `qwen-audio-3.1-asr-flash-streaming` | WebSocket 流式，边说边传 |
-| LLM | `qwen3.8-flash`（DeepSeek 不通时兜底） | 回复限制 15 字 |
+| LLM | DeepSeek `deepseek-chat` | 回复限制 15 字；失败时不切换其他 LLM |
 | TTS | 百炼 `qwen3-tts-flash` | 请求 8 kHz，播放时补点回 16 kHz |
 
 业务空间域名与 API Key 在 `src/cloud.rs` 顶部；WiFi 与 DeepSeek Key 在 `src/config.rs`（已 gitignore，从 `config.example.rs` 复制）。

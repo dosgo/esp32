@@ -12,28 +12,34 @@ use crate::{asr_ws::AsrStream, cloud::Cloud, config, prompts};
 /// Only transcribe; skip the LLM and TTS steps.
 pub const TEXT_ONLY: bool = false;
 
+pub type TurnId = u32;
+
 pub enum Cmd {
     /// Wake word fired: open a recognition task.
-    Wake,
+    Wake(TurnId),
     /// One 32 ms frame of 16 kHz mono PCM.
-    Audio(Vec<u8>),
+    Audio(TurnId, Vec<u8>),
     /// Utterance finished: transcribe, ask the LLM, synthesise the answer.
     /// Carries the raw utterance PCM for the HTTP ASR fallback.
-    End(Vec<u8>),
+    End(TurnId, Vec<u8>),
+    /// Abandon a listening turn without running LLM/TTS.
+    Cancel(TurnId),
 }
 
 pub enum Ev {
     /// Recognised text (for the LCD / logs).
-    Text(String),
+    Text(TurnId, String),
     /// PCM to append to the playback queue.
-    Pcm(Vec<u8>),
+    Pcm(TurnId, Vec<u8>),
     /// Turn finished.
-    Done,
+    Done(TurnId),
 }
 
 pub fn start() -> (mpsc::Sender<Cmd>, mpsc::Receiver<Ev>) {
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
-    let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+    // A fast TTS download must not buffer an entire answer in scarce RAM.
+    // Once this fills, the network worker waits for the audio loop to drain it.
+    let (ev_tx, ev_rx) = mpsc::sync_channel::<Ev>(8);
 
     thread::Builder::new()
         .name("net".into())
@@ -64,6 +70,7 @@ pub fn start() -> (mpsc::Sender<Cmd>, mpsc::Receiver<Ev>) {
             // Last spoken answer: used to detect the mic picking up our own
             // speaker (no AEC on this board) and to refuse to answer ourselves.
             let mut last_reply = String::new();
+            let mut active_turn: Option<TurnId> = None;
 
             loop {
                 let cmd = match cmd_rx.recv_timeout(Duration::from_secs(1)) {
@@ -81,16 +88,20 @@ pub fn start() -> (mpsc::Sender<Cmd>, mpsc::Receiver<Ev>) {
                             println!("[net] asr socket dead, rebuilding");
                             last_ok = Instant::now();
                             asr = AsrStream::connect();
-                            if let Some(a) = asr.as_mut() {
-                                a.start_task();
-                            }
                         }
                         continue;
                     }
                     Err(_) => break,
                 };
                 match cmd {
-                    Cmd::Wake => {
+                    Cmd::Wake(turn) => {
+                        if active_turn != Some(turn) {
+                            if let (Some(old), Some(a)) = (active_turn, asr.as_mut()) {
+                                println!("[net] cancel stale turn {old} before {turn}");
+                                a.cancel();
+                            }
+                            active_turn = Some(turn);
+                        }
                         // Reconnect when the socket died (the client's own
                         // auto-reconnect does not always recover).
                         let need = match asr.as_ref() {
@@ -119,26 +130,40 @@ pub fn start() -> (mpsc::Sender<Cmd>, mpsc::Receiver<Ev>) {
                             }
                         }
                     }
-                    Cmd::Audio(pcm) => {
+                    Cmd::Audio(turn, pcm) => {
+                        if active_turn != Some(turn) {
+                            continue;
+                        }
                         if let Some(a) = asr.as_mut() {
                             if a.is_connected() {
                                 a.push(&pcm);
                             }
                         }
                     }
-                    Cmd::End(utt) => {
+                    Cmd::Cancel(turn) => {
+                        if active_turn == Some(turn) {
+                            if let Some(a) = asr.as_mut() {
+                                a.cancel();
+                            }
+                            active_turn = None;
+                            println!("[net] turn {turn} cancelled");
+                        }
+                    }
+                    Cmd::End(turn, utt) => {
+                        if active_turn != Some(turn) {
+                            println!("[net] ignore stale end for turn {turn}");
+                            continue;
+                        }
                         let t_asr = Instant::now();
                         let (text, sent) = match asr.as_mut() {
                             Some(a) => {
                                 let sent = a.frames_sent();
                                 let t = a.finish();
-                                // Open the next task right away so a follow-up
-                                // question has no start-up delay.
-                                a.start_task();
                                 (t, sent)
                             }
                             None => (String::new(), 0),
                         };
+                        active_turn = None;
                         let mut text = text.trim().to_string();
                         println!(
                             "[net] asr: '{text}' (frames sent: {sent}, {} ms)",
@@ -169,19 +194,19 @@ pub fn start() -> (mpsc::Sender<Cmd>, mpsc::Receiver<Ev>) {
                         // being answered again (that loop never ends).
                         if is_echo(&text, &last_reply) {
                             println!("[net] echo of own reply ignored: '{text}'");
-                            let _ = ev_tx.send(Ev::Text(String::new()));
-                            let _ = ev_tx.send(Ev::Done);
+                            let _ = ev_tx.send(Ev::Text(turn, String::new()));
+                            let _ = ev_tx.send(Ev::Done(turn));
                             continue;
                         }
-                        let _ = ev_tx.send(Ev::Text(text.clone()));
+                        let _ = ev_tx.send(Ev::Text(turn, text.clone()));
                         if TEXT_ONLY {
-                            let _ = ev_tx.send(Ev::Done);
+                            let _ = ev_tx.send(Ev::Done(turn));
                             continue;
                         }
 
                         if text.chars().count() < 2 {
-                            let _ = ev_tx.send(Ev::Pcm(prompts::AGAIN.to_vec()));
-                            let _ = ev_tx.send(Ev::Done);
+                            let _ = ev_tx.send(Ev::Pcm(turn, prompts::AGAIN.to_vec()));
+                            let _ = ev_tx.send(Ev::Done(turn));
                             continue;
                         }
 
@@ -190,15 +215,15 @@ pub fn start() -> (mpsc::Sender<Cmd>, mpsc::Receiver<Ev>) {
                             Ok(r) => r.trim().to_string(),
                             Err(e) => {
                                 println!("[net] chat failed: {e}");
-                                let _ = ev_tx.send(Ev::Pcm(prompts::NET.to_vec()));
-                                let _ = ev_tx.send(Ev::Done);
+                                let _ = ev_tx.send(Ev::Pcm(turn, prompts::NET.to_vec()));
+                                let _ = ev_tx.send(Ev::Done(turn));
                                 continue;
                             }
                         };
                         println!("[net] llm: {reply}");
                         if reply.is_empty() {
-                            let _ = ev_tx.send(Ev::Pcm(prompts::AGAIN.to_vec()));
-                            let _ = ev_tx.send(Ev::Done);
+                            let _ = ev_tx.send(Ev::Pcm(turn, prompts::AGAIN.to_vec()));
+                            let _ = ev_tx.send(Ev::Done(turn));
                             continue;
                         }
                         last_reply = reply.clone();
@@ -210,7 +235,7 @@ pub fn start() -> (mpsc::Sender<Cmd>, mpsc::Receiver<Ev>) {
                             for s in chunk.chunks_exact(2) {
                                 out.extend_from_slice(&[s[0], s[1], s[0], s[1]]);
                             }
-                            let _ = tx.send(Ev::Pcm(out));
+                            let _ = tx.send(Ev::Pcm(turn, out));
                         };
                         // Streaming TTS first: reuses the warm Dash connection
                         // and starts playing on the first chunk, instead of
@@ -219,10 +244,10 @@ pub fn start() -> (mpsc::Sender<Cmd>, mpsc::Receiver<Ev>) {
                             println!("[net] tts stream failed ({e}); falling back");
                             if let Err(e) = cloud.tts_progressive(&reply, 8000, &mut sink) {
                                 println!("[net] tts failed: {e}");
-                                let _ = ev_tx.send(Ev::Pcm(prompts::NET.to_vec()));
+                                let _ = ev_tx.send(Ev::Pcm(turn, prompts::NET.to_vec()));
                             }
                         }
-                        let _ = ev_tx.send(Ev::Done);
+                        let _ = ev_tx.send(Ev::Done(turn));
                     }
                 }
             }

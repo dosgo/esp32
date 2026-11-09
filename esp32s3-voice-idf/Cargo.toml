@@ -25,7 +25,7 @@ opt-level = "s"
 esp_idf_sdkconfig_defaults = ["sdkconfig.defaults"]
 
 [[package.metadata.esp-idf-sys.extra_components]]
-bindings_header = "D:\\idf\\src\\esp_sr_bindings.h"
+bindings_header = "src/esp_sr_bindings.h"
 
 [[package.metadata.esp-idf-sys.extra_components]]
 remote_component = { name = "espressif/esp-sr", version = "2.6.1" }

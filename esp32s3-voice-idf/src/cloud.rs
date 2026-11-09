@@ -17,8 +17,8 @@ pub const DASHSCOPE_BASE: &str = "https://ws-ebekoepr6y8ojg9x.cn-beijing.maas.al
 /// Never hardcode it here: this file is tracked in git.
 pub const DASHSCOPE_KEY: &str = crate::config::DASHSCOPE_KEY;
 pub const DEEPSEEK_URL: &str = "https://api.deepseek.com/chat/completions";
-pub const DASHSCOPE_CHAT_URL: &str = "https://ws-ebekoepr6y8ojg9x.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions";
-pub const DASHSCOPE_WS_URL: &str = "wss://ws-ebekoepr6y8ojg9x.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference";
+pub const DASHSCOPE_WS_URL: &str =
+    "wss://ws-ebekoepr6y8ojg9x.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference";
 
 #[derive(Clone, Copy)]
 enum Host {
@@ -47,7 +47,6 @@ pub struct Cloud {
     dash: Option<EspHttpConnection>,
     deep: Option<EspHttpConnection>,
     oss: Option<EspHttpConnection>,
-    deep_ok: bool,
 }
 
 impl Cloud {
@@ -56,7 +55,6 @@ impl Cloud {
             dash: None,
             deep: None,
             oss: None,
-            deep_ok: true,
         }
     }
     fn slot(&mut self, host: Host) -> &mut Option<EspHttpConnection> {
@@ -149,26 +147,9 @@ impl Cloud {
             json_escape(system),
             json_escape(user)
         );
-        if self.deep_ok {
-            match self.post(Host::Deep, DEEPSEEK_URL, api_key, ds_body.as_bytes()) {
-                Ok(resp) => {
-                    if let Some(v) = string_field(&resp, "content") {
-                        return Ok(v);
-                    }
-                    println!("[cloud] deepseek: no content, falling back to qwen");
-                }
-                Err(e) => println!("[cloud] deepseek failed ({e}); using qwen"),
-            }
-            self.deep_ok = false;
-        }
-        let q_body = format!(
-            "{{\"model\":\"qwen3.8-flash\",\"messages\":[{{\"role\":\"system\",\"content\":\"{}\"}},{{\"role\":\"user\",\"content\":\"{}\"}}],\"stream\":false,\"enable_thinking\":false}}",
-            json_escape(system),
-            json_escape(user)
-        );
-        let resp = self.post(Host::Dash, DASHSCOPE_CHAT_URL, DASHSCOPE_KEY, q_body.as_bytes())?;
+        let resp = self.post(Host::Deep, DEEPSEEK_URL, api_key, ds_body.as_bytes())?;
         string_field(&resp, "content")
-            .ok_or_else(|| format!("chat: no content in {}", truncate(&resp, 200)))
+            .ok_or_else(|| format!("deepseek: no content in {}", truncate(&resp, 200)))
     }
 
     pub fn tts(&mut self, text: &str) -> Result<Vec<u8>, String> {
@@ -211,7 +192,6 @@ impl Cloud {
             Ok(it) => {
                 let ips: Vec<String> = it.take(3).map(|a| a.ip().to_string()).collect();
                 println!("[cloud] dns ips: {:?}", ips);
-
             }
             Err(e) => println!("[cloud] dns resolve err: {e}"),
         }
@@ -223,7 +203,8 @@ impl Cloud {
         let url = format!("{DASHSCOPE_BASE}/compatible-mode/v1/models");
         for attempt in 1..=4 {
             let r = self.with_conn(Host::Dash, |conn| {
-                conn.initiate_request(Method::Get, &url, &[]).map_err(|e| format!("{e:?}"))?;
+                conn.initiate_request(Method::Get, &url, &[])
+                    .map_err(|e| format!("{e:?}"))?;
                 conn.initiate_response().map_err(|e| format!("{e:?}"))?;
                 let status = conn.status().to_string();
                 // Must not leave the body unread on a kept-alive connection.
@@ -309,10 +290,7 @@ fn log_rssi() {
     unsafe {
         let mut ap: esp_idf_sys::wifi_ap_record_t = core::mem::zeroed();
         if esp_idf_sys::esp_wifi_sta_get_ap_info(&mut ap) == 0 {
-            println!(
-                "[wifi] rssi={}dBm ch={}",
-                ap.rssi, ap.primary
-            );
+            println!("[wifi] rssi={}dBm ch={}", ap.rssi, ap.primary);
         }
     }
 }
@@ -342,7 +320,8 @@ pub fn dns_prime() {
             return;
         }
         std::thread::sleep(Duration::from_millis(500));
-    }    println!("[cloud] dns still failing after 10 tries");
+    }
+    println!("[cloud] dns still failing after 10 tries");
 }
 
 /// Base64 (standard alphabet with padding).
@@ -476,7 +455,12 @@ pub fn base64_decode(s: &str) -> Vec<u8> {
 
 impl Cloud {
     /// Streaming TTS: feeds PCM chunks to `sink` as they arrive (SSE).
-    pub fn tts_stream<F>(&mut self, text: &str, sample_rate: u32, sink: &mut F) -> Result<(), String>
+    pub fn tts_stream<F>(
+        &mut self,
+        text: &str,
+        sample_rate: u32,
+        sink: &mut F,
+    ) -> Result<(), String>
     where
         F: FnMut(&[u8]),
     {
@@ -547,7 +531,9 @@ impl Cloud {
                                     }
                                 }
                             }
-                            if payload.contains("\"finish_reason\":\"stop\"") || payload.contains("finish_reason\":\"stop") {
+                            if payload.contains("\"finish_reason\":\"stop\"")
+                                || payload.contains("finish_reason\":\"stop")
+                            {
                                 println!("[cloud] tts stream done, {total} bytes");
                                 // Do NOT return here: keep reading to EOF so the
                                 // connection is fully drained before reuse.
@@ -572,7 +558,12 @@ impl Cloud {
 impl Cloud {
     /// TTS with progressive download: the wav is read as it arrives and every
     /// PCM chunk goes straight to `sink` (the 44-byte header is skipped).
-    pub fn tts_progressive<F>(&mut self, text: &str, sample_rate: u32, sink: &mut F) -> Result<(), String>
+    pub fn tts_progressive<F>(
+        &mut self,
+        text: &str,
+        sample_rate: u32,
+        sink: &mut F,
+    ) -> Result<(), String>
     where
         F: FnMut(&[u8]),
     {
@@ -592,7 +583,8 @@ impl Cloud {
         self.with_conn(Host::Oss, |conn| {
             conn.initiate_request(Method::Get, &audio_url, &[])
                 .map_err(|e| format!("tts get: {e:?}"))?;
-            conn.initiate_response().map_err(|e| format!("tts resp: {e:?}"))?;
+            conn.initiate_response()
+                .map_err(|e| format!("tts resp: {e:?}"))?;
             let status = conn.status();
             if status != 200 {
                 return Err(format!("tts HTTP {status}"));
@@ -639,7 +631,8 @@ pub fn speed_test(url: &str) -> Result<(usize, u128), String> {
     let t0 = std::time::Instant::now();
     conn.initiate_request(Method::Get, url, &[])
         .map_err(|e| format!("req {e:?}"))?;
-    conn.initiate_response().map_err(|e| format!("resp {e:?}"))?;
+    conn.initiate_response()
+        .map_err(|e| format!("resp {e:?}"))?;
     let tls = t0.elapsed().as_millis();
     let mut total = 0usize;
     let mut buf = vec![0u8; 16384];
@@ -666,7 +659,8 @@ pub fn speed_test_noverify(url: &str) -> Result<(usize, u128), String> {
     let t0 = std::time::Instant::now();
     conn.initiate_request(Method::Get, url, &[])
         .map_err(|e| format!("req {e:?}"))?;
-    conn.initiate_response().map_err(|e| format!("resp {e:?}"))?;
+    conn.initiate_response()
+        .map_err(|e| format!("resp {e:?}"))?;
     let setup = t0.elapsed().as_millis();
     let mut total = 0usize;
     let mut buf = vec![0u8; 16384];

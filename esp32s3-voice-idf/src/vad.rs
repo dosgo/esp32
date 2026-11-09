@@ -15,13 +15,10 @@ pub struct Vad {
 }
 
 impl Vad {
-    /// `VAD_MODE_1` (balanced) - mode 2 was too eager to call speech "noise" in
-    /// a noisy room. 96 ms of speech before reporting speech, 450 ms of noise
-    /// before reporting silence again.
+    /// `VAD_MODE_2` with 96 ms speech onset and 450 ms silence hangover.
     pub fn new() -> Result<Self, String> {
-        let handle = unsafe {
-            sys::vad_create_with_param(sys::vad_mode_t_VAD_MODE_2, 16000, 30, 96, 450)
-        };
+        let handle =
+            unsafe { sys::vad_create_with_param(sys::vad_mode_t_VAD_MODE_2, 16000, 30, 96, 450) };
         if handle.is_null() {
             Err("vad_create_with_param() returned NULL".into())
         } else {
@@ -41,9 +38,7 @@ impl Vad {
             let mut frame = [0i16; FRAME];
             frame.copy_from_slice(&self.pending[..FRAME]);
             self.pending.drain(..FRAME);
-            let state = unsafe {
-                sys::vad_process_with_trigger(self.handle, frame.as_mut_ptr())
-            };
+            let state = unsafe { sys::vad_process_with_trigger(self.handle, frame.as_mut_ptr()) };
             if state == sys::vad_state_t_VAD_SPEECH {
                 voiced = true;
             }

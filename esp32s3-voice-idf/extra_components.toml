@@ -1,5 +1,5 @@
 [[extra_components]]
-bindings_header = "D:\\idf\\src\\esp_sr_bindings.h"
+bindings_header = "src/esp_sr_bindings.h"
 
 [[extra_components]]
 remote_component = { name = "espressif/esp-sr", version = "2.6.1" }

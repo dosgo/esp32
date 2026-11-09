@@ -131,14 +131,10 @@ where
             .map_err(|_| "建立时间: 0x0A")?;
 
         // 3. ADC1~4 的高通滤波器（去直流偏置）
-        self.write(REG_ADC12_HPF1, 0x2A)
-            .map_err(|_| "HPF: 0x23")?;
-        self.write(REG_ADC12_HPF2, 0x0A)
-            .map_err(|_| "HPF: 0x22")?;
-        self.write(REG_ADC34_HPF1, 0x2A)
-            .map_err(|_| "HPF: 0x21")?;
-        self.write(REG_ADC34_HPF2, 0x0A)
-            .map_err(|_| "HPF: 0x20")?;
+        self.write(REG_ADC12_HPF1, 0x2A).map_err(|_| "HPF: 0x23")?;
+        self.write(REG_ADC12_HPF2, 0x0A).map_err(|_| "HPF: 0x22")?;
+        self.write(REG_ADC34_HPF1, 0x2A).map_err(|_| "HPF: 0x21")?;
+        self.write(REG_ADC34_HPF2, 0x0A).map_err(|_| "HPF: 0x20")?;
 
         // 4. I2S 格式：16bit + 标准 I2S，关闭 TDM（走 2 声道，MIC1 左 / MIC2 右）
         self.write(REG_SDP_INTERFACE1, I2S_FMT_I2S | I2S_BITS_16B)
@@ -147,8 +143,7 @@ where
             .map_err(|_| "I2S 格式: 0x12")?;
 
         // 5. 模拟电源 + VMID 电压
-        self.write(REG_ANALOG, 0xC3)
-            .map_err(|_| "模拟电源: 0x40")?;
+        self.write(REG_ANALOG, 0xC3).map_err(|_| "模拟电源: 0x40")?;
 
         // 6. MIC1~4 偏置 2.87V
         self.write(REG_MIC12_BIAS, MIC_BIAS_2V87)
@@ -158,14 +153,10 @@ where
 
         // 7. MIC1~4 增益（bit4 必须置位，见厂商驱动 `mic_gain | 0x10`）
         let g = MIC_GAIN_DB_STEP | 0x10;
-        self.write(REG_MIC1_GAIN, g)
-            .map_err(|_| "MIC 增益: 0x43")?;
-        self.write(REG_MIC2_GAIN, g)
-            .map_err(|_| "MIC 增益: 0x44")?;
-        self.write(REG_MIC3_GAIN, g)
-            .map_err(|_| "MIC 增益: 0x45")?;
-        self.write(REG_MIC4_GAIN, g)
-            .map_err(|_| "MIC 增益: 0x46")?;
+        self.write(REG_MIC1_GAIN, g).map_err(|_| "MIC 增益: 0x43")?;
+        self.write(REG_MIC2_GAIN, g).map_err(|_| "MIC 增益: 0x44")?;
+        self.write(REG_MIC3_GAIN, g).map_err(|_| "MIC 增益: 0x45")?;
+        self.write(REG_MIC4_GAIN, g).map_err(|_| "MIC 增益: 0x46")?;
 
         // 8. 各 MIC 偏置供电
         self.write(REG_MIC1_POWER, 0x08)
@@ -182,12 +173,9 @@ where
         //    doubler=1, osr=0x20, mclk_src=0, lrck_h=1, lrck_l=0}`
         self.write(REG_OSR, 0x20).map_err(|_| "时钟: 0x07")?;
         // adc_div | doubler<<6 | dll<<7 = 0x01 | 0x40 | 0x80
-        self.write(REG_MAINCLK, 0xC1)
-            .map_err(|_| "时钟: 0x02")?;
-        self.write(REG_LRCK_DIVH, 0x01)
-            .map_err(|_| "时钟: 0x04")?;
-        self.write(REG_LRCK_DIVL, 0x00)
-            .map_err(|_| "时钟: 0x05")?;
+        self.write(REG_MAINCLK, 0xC1).map_err(|_| "时钟: 0x02")?;
+        self.write(REG_LRCK_DIVH, 0x01).map_err(|_| "时钟: 0x04")?;
+        self.write(REG_LRCK_DIVL, 0x00).map_err(|_| "时钟: 0x05")?;
 
         // 10. 关掉 DLL
         self.write(REG_POWER_DOWN, 0x04)

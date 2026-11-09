@@ -146,7 +146,8 @@ impl<I2C: I2c> Es8311<I2C> {
         self.write_reg(REG_RESET, RESET_RST_ALL)
             .map_err(|_| "软复位: 写 0x00=0x1F")?;
         esp_rom_delay_ms(20);
-        self.write_reg(REG_RESET, 0x00).map_err(|_| "软复位: 清 0x00")?;
+        self.write_reg(REG_RESET, 0x00)
+            .map_err(|_| "软复位: 清 0x00")?;
         esp_rom_delay_ms(10);
         // CSM 打开，进入工作态
         self.write_reg(REG_RESET, RESET_CSM_ON)
@@ -216,8 +217,7 @@ impl<I2C: I2c> Es8311<I2C> {
         self.write_reg(REG_ADC3, VOL_0DB)
             .map_err(|_| "麦克风: 0x17")?;
         // 关 ALC（自动增益在近场语音上会抽气），开高通滤掉直流
-        self.update(REG_ADC8, 0, 0x60)
-            .map_err(|_| "麦克风: 0x1C")?;
+        self.update(REG_ADC8, 0, 0x60).map_err(|_| "麦克风: 0x1C")?;
 
         // ---- 6. 播放通路 ----
         self.update(REG_SYS8, SYS8_PDN_DAC, 0)
@@ -256,13 +256,9 @@ impl<I2C: I2c> Es8311<I2C> {
     }
 }
 
-/// ROM 里的忙等延时。ES8311 上电序列里有几处必须等芯片内部稳定，
-/// 用 `embassy_time::Timer` 在同步上下文里不可用，这里直接空转。
+/// ROM 延时。ES8311 上电序列里有几处必须等芯片内部稳定。
+/// 使用 ESP-ROM 的时钟延时，避免空转次数随 CPU 频率和编译优化变化。
 #[inline]
 fn esp_rom_delay_ms(ms: u32) {
-    // 240MHz 下每秒约 240M 个周期，这里按「每毫秒 240k 次循环」估，
-    // 只用于 5~20ms 的粗延时，精度不重要
-    for _ in 0..(ms * 24_000) {
-        core::hint::spin_loop();
-    }
+    unsafe { esp_idf_sys::esp_rom_delay_us(ms.saturating_mul(1_000)) };
 }

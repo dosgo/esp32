@@ -13,3 +13,5 @@ build-std = ["std", "panic_abort"]
 [env]
 MCU = "esp32s3"
 ESP_IDF_VERSION = "v5.4.2"
+# `esp-idf-sys` cannot infer the workspace from an external target-dir.
+CARGO_WORKSPACE_DIR = { value = "", relative = true }

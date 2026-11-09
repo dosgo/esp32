@@ -70,6 +70,10 @@ const SPEECH_RMS: f64 = 150.0;
 /// the user experiences as "没听清".
 const ASR_GAIN: f32 = 3.0;
 
+/// At most four seconds of 16 kHz mono PCM may wait in the application queue.
+/// The bounded event channel then back-pressures the TTS downloader.
+const MAX_TTS_QUEUE_BYTES: usize = 16_000 * 2 * 4;
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum State {
     Idle,
@@ -245,6 +249,8 @@ fn main() {
     let mut turn_done = false;
     let mut net_pending = false;
     let mut net_since = Instant::now();
+    let mut turn_seq: net::TurnId = 0;
+    let mut current_turn: Option<net::TurnId> = None;
     let mut ui_voice = false;
     let mut ui_voice_until: Option<Instant> = None;
     // Consecutive frames the playback queue has been empty. Only when this
@@ -302,20 +308,31 @@ fn main() {
         // Safety valve for a network turn that never reports back.
         if net_pending && net_since.elapsed() > Duration::from_secs(30) {
             println!("[net] turn timeout, resetting");
+            if let Some(turn) = current_turn.take() {
+                let _ = net_cmd.send(net::Cmd::Cancel(turn));
+            }
             net_pending = false;
             turn_done = false;
+            tts_queue.clear();
             state = State::Idle;
             let _ = lcd.send("READY");
         }
 
         // ---- events from the network thread ----
-        while let Ok(ev) = net_ev.try_recv() {
+        while tts_queue.len() < MAX_TTS_QUEUE_BYTES {
+            let Ok(ev) = net_ev.try_recv() else {
+                break;
+            };
             match ev {
-                net::Ev::Text(t) => {
+                net::Ev::Text(turn, t) if current_turn == Some(turn) => {
                     println!("[net] text: {t}");
-                    let _ = lcd.send(if t.trim().is_empty() { "ASR EMPTY" } else { "ASR OK" });
+                    let _ = lcd.send(if t.trim().is_empty() {
+                        "ASR EMPTY"
+                    } else {
+                        "ASR OK"
+                    });
                 }
-                net::Ev::Pcm(pcm) => {
+                net::Ev::Pcm(turn, pcm) if current_turn == Some(turn) => {
                     if state == State::Thinking {
                         state = State::Speaking;
                         let _ = lcd.send("SPEAKING");
@@ -323,9 +340,12 @@ fn main() {
                     }
                     tts_queue.extend(pcm);
                 }
-                net::Ev::Done => {
+                net::Ev::Done(turn) if current_turn == Some(turn) => {
                     turn_done = true;
                     net_pending = false;
+                }
+                net::Ev::Text(turn, _) | net::Ev::Pcm(turn, _) | net::Ev::Done(turn) => {
+                    println!("[net] discard stale event for turn {turn}");
                 }
             }
         }
@@ -381,6 +401,7 @@ fn main() {
                 // own voice and produced the self-talking loop.
                 turn_done = false;
                 net_pending = false;
+                current_turn = None;
                 thinking_until = None;
                 state = State::Idle;
                 let _ = lcd.send("READY");
@@ -389,6 +410,7 @@ fn main() {
                 // Turn produced no audio (echo dropped, empty transcript).
                 state = State::Idle;
                 turn_done = false;
+                current_turn = None;
                 thinking_until = None;
                 let _ = lcd.send("READY");
             }
@@ -399,6 +421,9 @@ fn main() {
             if let Some(until) = thinking_until {
                 if Instant::now() >= until && !audio_busy {
                     println!("[state] thinking timeout");
+                    if let Some(turn) = current_turn.take() {
+                        let _ = net_cmd.send(net::Cmd::Cancel(turn));
+                    }
                     state = State::Idle;
                     turn_done = false;
                     net_pending = false;
@@ -478,11 +503,7 @@ fn main() {
                     ui_voice = true;
                 }
                 ui_voice_until = Some(Instant::now() + Duration::from_millis(800));
-            } else if ui_voice
-                && ui_voice_until
-                    .map(|t| Instant::now() >= t)
-                    .unwrap_or(true)
-            {
+            } else if ui_voice && ui_voice_until.map(|t| Instant::now() >= t).unwrap_or(true) {
                 let _ = lcd.send("READY");
                 ui_voice = false;
             }
@@ -530,7 +551,9 @@ fn main() {
                             // run-task handshake needs, so the mic is live the
                             // moment the prompt ends.
                             announce_only = false;
-                            let _ = net_cmd.send(net::Cmd::Wake);
+                            turn_seq = turn_seq.wrapping_add(1);
+                            current_turn = Some(turn_seq);
+                            let _ = net_cmd.send(net::Cmd::Wake(turn_seq));
                             tts_queue.extend(prompts::HERE.iter().copied());
                         } else {
                             // Say it out loud. Staying silent while offline is
@@ -549,7 +572,9 @@ fn main() {
                 if utt.len() < 200 * 1024 {
                     utt.extend_from_slice(&frame_pcm);
                 }
-                let _ = net_cmd.send(net::Cmd::Audio(frame_pcm));
+                if let Some(turn) = current_turn {
+                    let _ = net_cmd.send(net::Cmd::Audio(turn, frame_pcm));
+                }
                 // WebRTC VAD is a spectral classifier and the only trustworthy
                 // judge on this hardware: the mic's noise floor sits at rms
                 // 100-200 and a normal voice at 150-400, so *any* absolute
@@ -575,6 +600,9 @@ fn main() {
                     no_speech_frames += 1;
                     if no_speech_frames >= NO_SPEECH_FRAMES {
                         println!("[state] no speech, back to idle");
+                        if let Some(turn) = current_turn.take() {
+                            let _ = net_cmd.send(net::Cmd::Cancel(turn));
+                        }
                         state = State::Idle;
                         utt.clear();
                         drain_frames = 0;
@@ -601,8 +629,7 @@ fn main() {
                     // quiet too, which is a much shorter local wait than the
                     // blind SILENCE_FRAMES timer. Falls back to the timer when
                     // the socket never produced text.
-                    let srv_len =
-                        asr_ws::PARTIAL_LEN.load(std::sync::atomic::Ordering::Relaxed);
+                    let srv_len = asr_ws::PARTIAL_LEN.load(std::sync::atomic::Ordering::Relaxed);
                     let srv_quiet = asr_ws::partial_age_ms();
                     let server_done = srv_len > 0 && srv_quiet >= SERVER_SETTLE_MS;
                     let need_sil = if server_done {
@@ -622,7 +649,12 @@ fn main() {
                             "[vad] end speech={speech_frames} sil={silence_frames} srv={srv_len}/{}ms",
                             if srv_len > 0 { srv_quiet.min(99999) } else { 0 }
                         );
-                        let _ = net_cmd.send(net::Cmd::End(std::mem::take(&mut utt)));
+                        let Some(turn) = current_turn else {
+                            println!("[net] missing turn id, dropping utterance");
+                            state = State::Idle;
+                            continue;
+                        };
+                        let _ = net_cmd.send(net::Cmd::End(turn, std::mem::take(&mut utt)));
                         net_pending = true;
                         net_since = Instant::now();
                         utt.clear();
