@@ -18,7 +18,7 @@
         └──── Cmd::Wake/Audio/End ──→        ←──── Ev::Text/Pcm/Done ────┘
 ```
 
-状态机：`Idle → Greeting(播「我在」) → Listening → Thinking → Speaking → FollowUp`
+状态机：`Idle → Greeting(播「我在」) → Listening → Thinking → Speaking → Idle`（FollowUp 已移除：无 AEC 时追问只会收到设备自己的回声）
 
 每步都有兜底：唤醒播放期间不采集、播放后再等 0.3 s 静音才听；`net_pending` 30 s 超时自动复位，网络卡住不会导致设备“装死”。
 

@@ -6,7 +6,6 @@
 //! 一轮对话：唤醒 -> 应答 -> 收音 -> 思考 -> 播报 -> 结束。
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -224,7 +223,10 @@ fn main() {
     let mut raw = vec![0u8; chunk * 4];
     let mut mono = vec![0i16; chunk];
     let mut tx_buf = vec![0u8; chunk * 4];
-    let mut tts_queue: VecDeque<u8> = VecDeque::new();
+    // 播放队列 + 已消费偏移：用 Vec + 游标代替 VecDeque<u8>，
+    // 省掉逐字节 pop 的环绕逻辑，TX 路径按切片直接展开。
+    let mut tts_queue: Vec<u8> = Vec::new();
+    let mut tts_read: usize = 0;
     let mut utt: Vec<u8> = Vec::new();
 
     let mut state = State::Idle;
@@ -301,12 +303,13 @@ fn main() {
             net_pending = false;
             turn_done = false;
             tts_queue.clear();
+            tts_read = 0;
             state = State::Idle;
             let _ = lcd.send("READY");
         }
 
         // ---- 来自网络线程的事件 ----
-        while tts_queue.len() < MAX_TTS_QUEUE_BYTES {
+        while tts_queue.len() - tts_read < MAX_TTS_QUEUE_BYTES {
             let Ok(ev) = net_ev.try_recv() else {
                 break;
             };
@@ -326,6 +329,11 @@ fn main() {
                         thinking_until = None;
                     }
                     tts_queue.extend(pcm);
+                    // 已播放的头部攒多时压缩一次，防止 Vec 随播放无限增长。
+                    if tts_read > 32 * 1024 {
+                        tts_queue.drain(..tts_read);
+                        tts_read = 0;
+                    }
                 }
                 net::Ev::Done(turn) if current_turn == Some(turn) => {
                     turn_done = true;
@@ -338,7 +346,7 @@ fn main() {
         }
 
         // ---- 播放记账 ----
-        if tts_queue.is_empty() {
+        if tts_read >= tts_queue.len() {
             drain_frames += 1;
         } else {
             drain_frames = 0;
@@ -421,23 +429,20 @@ fn main() {
         }
 
         // ---- 音频输出 ----
-        if !tts_queue.is_empty() {
-            for pair in tx_buf.chunks_exact_mut(4) {
-                let s = if tts_queue.len() >= 2 {
-                    let lo = tts_queue.pop_front().unwrap();
-                    let hi = tts_queue.pop_front().unwrap();
-                    i16::from_le_bytes([lo, hi])
-                } else {
-                    0
-                };
-                let b = s.to_le_bytes();
-                pair[0] = b[0];
-                pair[1] = b[1];
-                pair[2] = b[0];
-                pair[3] = b[1];
+        tx_buf.fill(0);
+        if tts_read < tts_queue.len() {
+            let src = &tts_queue[tts_read..];
+            let n_samples = (src.len() / 2).min(chunk);
+            for (pair, s) in tx_buf
+                .chunks_exact_mut(4)
+                .zip(src.chunks_exact(2).take(n_samples))
+            {
+                pair[0] = s[0];
+                pair[1] = s[1];
+                pair[2] = s[0];
+                pair[3] = s[1];
             }
-        } else {
-            tx_buf.fill(0);
+            tts_read += n_samples * 2;
         }
         if i2s_tx.write(&tx_buf, BLOCK).is_err() {
             println!("[i2s] tx error");
@@ -460,21 +465,13 @@ fn main() {
             println!(
                 "[state] {:?} q={} rms={:.0} peak={:.0} det={}",
                 state,
-                tts_queue.len(),
+                tts_queue.len() - tts_read,
                 frame_rms,
                 peak_rms,
                 wake_dets
             );
             peak_rms = 0.0;
             wake_dets = 0;
-        }
-
-        let mut frame_pcm = Vec::with_capacity(chunk * 2);
-        // 只给识别端加增益；VAD 和语音判定继续用原始电平，
-        // 保证阈值的意义不变。
-        for s in &mono {
-            let v = (*s as f32 * ASR_GAIN).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-            frame_pcm.extend_from_slice(&v.to_le_bytes());
         }
 
         // 待机时的 LCD 提示。
@@ -517,6 +514,7 @@ fn main() {
                         println!("[kws] wake online={online}");
                         rebuild_wake = true;
                         tts_queue.clear();
+                        tts_read = 0;
                         drain_frames = 0;
                         state = State::Greeting;
                         speech_frames = 0;
@@ -546,6 +544,14 @@ fn main() {
             }
             State::Greeting | State::Thinking | State::Speaking => {}
             State::Listening => {
+                // 只给识别端加增益；VAD 和语音判定继续用原始电平，
+                // 保证阈值的意义不变。仅在收音时构建这个缓冲：待机或
+                // 播放时每帧白分配 1 KB（30 次/秒）会碎片化内部 RAM。
+                let mut frame_pcm = Vec::with_capacity(chunk * 2);
+                for s in &mono {
+                    let v = (*s as f32 * ASR_GAIN).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                    frame_pcm.extend_from_slice(&v.to_le_bytes());
+                }
                 // 限制 HTTP 兜底缓冲大小（约 6 秒）：再长就得整段重传，
                 // 在这条链路上要等很久。
                 if utt.len() < 200 * 1024 {
@@ -584,6 +590,7 @@ fn main() {
                         utt.clear();
                         drain_frames = 0;
                         tts_queue.clear();
+                        tts_read = 0;
                         tts_queue.extend(prompts::AGAIN.iter().copied());
                         let _ = lcd.send("READY");
                     }

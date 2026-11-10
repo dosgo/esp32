@@ -94,6 +94,11 @@ pub fn start() -> (NetSender, mpsc::Receiver<Ev>) {
             // 开头一秒的音频，识别结果为空。
             println!("[net] opening asr socket");
             let mut asr: Option<AsrStream> = AsrStream::connect();
+            // 预热 DNS 与 dash/deep 两台的 TLS keep-alive 连接，让开机
+            // 第一次对话的 LLM/TTS 请求不再付几秒的握手费。放在 socket
+            // 之后：即便网络异常导致重试阻塞，识别链路也已就绪，
+            // 期间唤醒命令只是在控制通道里排队。
+            cloud.warmup();
             // 看门狗记录：esp websocket 客户端可能进入一种死状态——
             // 既不发 Disconnected 也不自动重连（一次 DNS 失败后就
             // 观察到过），所以轮询并重建。
