@@ -80,7 +80,6 @@ enum State {
     Thinking,
     Speaking,
 }
-
 fn main() {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
@@ -148,10 +147,6 @@ fn main() {
         ip[2],
         ip[3]
     );
-    // CPE 路由器的 DNS 会对阿里云域名间歇性返回 202，
-    // 所以在首次 TLS 握手前固定使用公共 DNS。
-    set_public_dns();
-
     // ---- 网络线程 ----
     let (net_cmd, net_ev) = net::start();
 
@@ -647,45 +642,5 @@ fn main() {
             }
             State::Thinking | State::Speaking | State::Idle => {}
         }
-    }
-}
-
-/// 公共 DNS 兜底：某些热点的 DNS 解析不到阿里云的域名。
-pub(crate) fn set_public_dns() {
-    unsafe {
-        let netif =
-            esp_idf_sys::esp_netif_get_handle_from_ifkey(b"WIFI_STA_DEF\0".as_ptr() as *const _);
-        if netif.is_null() {
-            return;
-        }
-        for (idx, server) in [&b"223.5.5.5\0"[..], &b"119.29.29.29\0"[..]]
-            .iter()
-            .enumerate()
-        {
-            let mut info: esp_idf_sys::esp_netif_dns_info_t = core::mem::zeroed();
-            info.ip.type_ = esp_idf_sys::ESP_IPADDR_TYPE_V4 as _;
-            info.ip.u_addr.ip4.addr = esp_idf_sys::esp_ip4addr_aton(server.as_ptr() as *const _);
-            let kind = if idx == 0 {
-                esp_idf_sys::esp_netif_dns_type_t_ESP_NETIF_DNS_MAIN
-            } else {
-                esp_idf_sys::esp_netif_dns_type_t_ESP_NETIF_DNS_BACKUP
-            };
-            esp_idf_sys::esp_netif_set_dns_info(netif, kind, &mut info);
-        }
-        println!("[wifi] public dns set");
-    }
-}
-
-/// 网络线程建连前调用。
-pub(crate) fn ensure_dns() {
-    use std::net::ToSocketAddrs;
-    let host = "ws-ebekoepr6y8ojg9x.cn-beijing.maas.aliyuncs.com:443";
-    let ok = host
-        .to_socket_addrs()
-        .map(|mut it| it.next().is_some())
-        .unwrap_or(false);
-    if !ok {
-        println!("[dns] resolve failed, switching to public dns");
-        set_public_dns();
     }
 }

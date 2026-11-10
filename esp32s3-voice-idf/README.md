@@ -36,7 +36,7 @@
 
 - **esp-sr VAD 必须喂 10/20/30 ms 帧**：I2S 块是 32 ms（512 采样），`vad.rs` 里做缓冲后按 30 ms 连续投喂，否则判决漂移、断句不准；
 - **TLS 缓冲**：WebSocket 与 HTTPS 两条会话来争内部 RAM，`sdkconfig.defaults` 把大块分配推到 PSRAM（阈值 2 KB），TLS 输入缓冲 8 KB；
-- **DNS**：部分热点自带的解析器看不到阿里云域名，开机与重连前会检测并回退到公共 DNS；
+- **DNS**：使用 DHCP 下发的 DNS，建连前只做解析检查，不覆盖网络配置；
 - **本地提示音**：`assets/` 下 5 句 piper 预生成 PCM，断网、没听清时直接播放。
 
 ## 构建与烧录

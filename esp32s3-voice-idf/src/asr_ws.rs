@@ -16,6 +16,8 @@ use esp_idf_svc::ws::client::{
 
 use crate::cloud::{DASHSCOPE_KEY, DASHSCOPE_WS_URL};
 
+static AUTH_HEADER: OnceLock<String> = OnceLock::new();
+
 /// 服务端的"说完"信号，无锁发布，音频线程可以每 32 毫秒帧查询一次。
 ///
 /// 本地静音定时器只能猜句子在哪结束。识别端自己知道：用户还在说时
@@ -133,9 +135,11 @@ impl AsrStream {
         let inner = Arc::new(Mutex::new(Inner::default()));
         let inner_cb = inner.clone();
         let cfg = EspWebSocketClientConfig {
-            headers: Some(Box::leak(
-                format!("Authorization: Bearer {DASHSCOPE_KEY}\r\n").into_boxed_str(),
-            )),
+            headers: Some(
+                AUTH_HEADER
+                    .get_or_init(|| format!("Authorization: Bearer {DASHSCOPE_KEY}\r\n"))
+                    .as_str(),
+            ),
             crt_bundle_attach: Some(esp_idf_sys::esp_crt_bundle_attach),
             // 识别事件是很大的 JSON；默认 1 KB 会截断导致文本解析失败。
             // 8 KB 保证长识别事件不被截断；SPIRAM 阈值 2 KB，
